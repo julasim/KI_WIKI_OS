@@ -32,34 +32,67 @@ fi
 
 # ─── Credentials abfragen ───
 echo
-echo "──── Credentials ────"
-echo "Falls du noch keine hast:"
-echo "  • Telegram-Token    → @BotFather in Telegram"
-echo "  • Telegram User-ID  → optional, leer lassen → Bot meldet sie dir"
-echo "  • OpenRouter-Key    → openrouter.ai → Keys"
+echo "──── Telegram ────"
+echo "Falls du noch keinen Bot hast: @BotFather in Telegram → /newbot"
 echo
 
 read -rp "Telegram Bot Token                       : " TG_TOKEN
 read -rp "Telegram User-ID (Enter = Setup-Modus)   : " ALLOWED_USER_ID
-read -rp "OpenRouter API Key                       : " OPENROUTER_API_KEY
-
-# Default für User-ID: 0 (Setup-Modus)
 ALLOWED_USER_ID=${ALLOWED_USER_ID:-0}
 
-# Quick validation (User-ID darf 0 sein = Setup-Modus)
-if [[ -z "${TG_TOKEN}" || -z "${OPENROUTER_API_KEY}" ]]; then
-    echo "❌ TG_TOKEN oder OPENROUTER_API_KEY fehlt. Abbruch."
+if [[ -z "${TG_TOKEN}" ]]; then
+    echo "❌ TG_TOKEN fehlt. Abbruch."
     exit 1
 fi
 if ! [[ "${ALLOWED_USER_ID}" =~ ^[0-9]+$ ]]; then
     echo "❌ User-ID muss eine Zahl sein (oder leer für Setup-Modus)."
     exit 1
 fi
-
 if [ "${ALLOWED_USER_ID}" = "0" ]; then
-    echo
-    echo "ℹ️  Setup-Modus aktiviert. Schick dem Bot in Telegram irgendeine Nachricht,"
-    echo "   er antwortet mit deiner User-ID + Anleitung zum Aktivieren."
+    echo "ℹ️  Setup-Modus aktiv → Bot meldet User-ID beim ersten Senden."
+fi
+
+echo
+echo "──── LLM-Provider ────"
+echo "1) OpenRouter   (Pay-per-Token, große Modell-Auswahl)"
+echo "2) Ollama Cloud (Flat-Subscription, gpt-oss/qwen-Modelle)"
+echo "3) OpenAI       (Pay-per-Token, gpt-4o/gpt-4o-mini)"
+echo "4) Custom       (eigener OpenAI-API-kompatibler Endpoint)"
+echo
+read -rp "Wahl [1-4, default 1]                    : " PROVIDER_CHOICE
+PROVIDER_CHOICE=${PROVIDER_CHOICE:-1}
+
+case "$PROVIDER_CHOICE" in
+    1)
+        LLM_BASE_URL="https://openrouter.ai/api/v1"
+        DEFAULT_MODEL="anthropic/claude-sonnet-4-5"
+        echo "→ OpenRouter ausgewählt. Key holen: https://openrouter.ai → Keys"
+        ;;
+    2)
+        LLM_BASE_URL="https://ollama.com/v1"
+        DEFAULT_MODEL="gpt-oss:120b-cloud"
+        echo "→ Ollama Cloud ausgewählt. Key holen: https://ollama.com/settings/keys"
+        echo "  Hinweis: Vision ggf. separat über OpenRouter konfigurieren (per nano .env)"
+        ;;
+    3)
+        LLM_BASE_URL="https://api.openai.com/v1"
+        DEFAULT_MODEL="gpt-4o-mini"
+        echo "→ OpenAI ausgewählt. Key holen: https://platform.openai.com/api-keys"
+        ;;
+    4)
+        read -rp "Base URL                                 : " LLM_BASE_URL
+        read -rp "Default Modell-Name                      : " DEFAULT_MODEL
+        ;;
+    *)
+        echo "❌ Ungültige Wahl. Abbruch."
+        exit 1
+        ;;
+esac
+
+read -rp "API Key                                  : " LLM_API_KEY
+if [[ -z "${LLM_API_KEY}" ]]; then
+    echo "❌ API Key fehlt. Abbruch."
+    exit 1
 fi
 
 # ─── Optionale Config ───
@@ -68,8 +101,8 @@ echo "──── Optionale Konfiguration (Enter = Default) ────"
 read -rp "Vault-Pfad [/opt/vault/KI_WIKI_Vault]      : " VAULT_PATH
 VAULT_PATH=${VAULT_PATH:-/opt/vault/KI_WIKI_Vault}
 
-read -rp "LLM-Modell [anthropic/claude-sonnet-4-5]   : " LLM_MODEL
-LLM_MODEL=${LLM_MODEL:-anthropic/claude-sonnet-4-5}
+read -rp "LLM-Modell [${DEFAULT_MODEL}]              : " LLM_MODEL
+LLM_MODEL=${LLM_MODEL:-$DEFAULT_MODEL}
 
 read -rp "Vision-Modell [= LLM-Modell]               : " VISION_MODEL
 VISION_MODEL=${VISION_MODEL:-$LLM_MODEL}
@@ -87,11 +120,19 @@ fi
 
 # ─── .env schreiben ───
 cat > .env <<EOF
+# Telegram
 TG_TOKEN=$TG_TOKEN
 ALLOWED_USER_ID=$ALLOWED_USER_ID
-OPENROUTER_API_KEY=$OPENROUTER_API_KEY
+
+# LLM-Provider
+LLM_API_KEY=$LLM_API_KEY
+LLM_BASE_URL=$LLM_BASE_URL
 LLM_MODEL=$LLM_MODEL
+
+# Vision (Default: gleicher Provider wie LLM)
 VISION_MODEL=$VISION_MODEL
+
+# Whisper
 WHISPER_MODEL=$WHISPER_MODEL
 WHISPER_DEVICE=cpu
 WHISPER_LANG=de

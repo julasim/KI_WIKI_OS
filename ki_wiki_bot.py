@@ -46,9 +46,22 @@ VAULT = Path(os.environ.get("VAULT_PATH", "/vault"))
 #                  user editiert .env und startet neu.
 ALLOWED_USER_ID = int(os.environ.get("ALLOWED_USER_ID", "0") or "0")
 TG_TOKEN = os.environ["TG_TOKEN"]
-OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
+
+# LLM-Provider — beliebige OpenAI-API-kompatible Endpoints:
+#   OpenRouter      → https://openrouter.ai/api/v1
+#   Ollama Cloud    → https://ollama.com/v1
+#   OpenAI direkt   → https://api.openai.com/v1
+#   Lokales Ollama  → http://ollama:11434/v1
+# OPENROUTER_API_KEY bleibt als Fallback für bestehende Installs.
+LLM_API_KEY = os.environ.get("LLM_API_KEY") or os.environ.get("OPENROUTER_API_KEY")
+if not LLM_API_KEY:
+    raise RuntimeError("LLM_API_KEY (oder OPENROUTER_API_KEY) muss gesetzt sein.")
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://openrouter.ai/api/v1")
 LLM_MODEL = os.environ.get("LLM_MODEL", "anthropic/claude-sonnet-4-5")
-VISION_MODEL = os.environ.get("VISION_MODEL", "anthropic/claude-sonnet-4-5")
+# Vision kann optional ein anderer Provider sein (z.B. wenn Haupt-LLM kein Vision kann)
+VISION_API_KEY = os.environ.get("VISION_API_KEY", LLM_API_KEY)
+VISION_BASE_URL = os.environ.get("VISION_BASE_URL", LLM_BASE_URL)
+VISION_MODEL = os.environ.get("VISION_MODEL", LLM_MODEL)
 WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL", "small")
 WHISPER_DEVICE = os.environ.get("WHISPER_DEVICE", "cpu")
 WHISPER_LANG = os.environ.get("WHISPER_LANG", "de")
@@ -76,12 +89,17 @@ log = logging.getLogger("ki_wiki_bot")
 # ============================================================================
 
 llm = OpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=OPENROUTER_API_KEY,
+    base_url=LLM_BASE_URL,
+    api_key=LLM_API_KEY,
     default_headers={
-        "HTTP-Referer": "https://github.com/julius-sima/ki-wiki-bot",
+        "HTTP-Referer": "https://github.com/julasim/KI_WIKI_OS",
         "X-Title": "KI Wiki Bot",
     },
+)
+# Separater Vision-Client falls Vision via anderen Provider läuft
+vision_llm = (
+    llm if (VISION_BASE_URL == LLM_BASE_URL and VISION_API_KEY == LLM_API_KEY)
+    else OpenAI(base_url=VISION_BASE_URL, api_key=VISION_API_KEY)
 )
 
 # ============================================================================
@@ -711,7 +729,7 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "Beschreibe in 1-2 Sätzen knapp, was auf dem Bild ist."
         )
         vision_resp = await asyncio.to_thread(
-            llm.chat.completions.create,
+            vision_llm.chat.completions.create,
             model=VISION_MODEL,
             messages=[{
                 "role": "user",
@@ -772,8 +790,8 @@ def main():
         log.warning("⚠️  ALLOWED_USER_ID=0 → Setup-Modus aktiv. Erste Nachricht im Telegram triggert Anleitung.")
     else:
         log.info(f"Allowed user: {ALLOWED_USER_ID}")
-    log.info(f"LLM: {LLM_MODEL}")
-    log.info(f"Vision: {VISION_MODEL}")
+    log.info(f"LLM: {LLM_MODEL} @ {LLM_BASE_URL}")
+    log.info(f"Vision: {VISION_MODEL} @ {VISION_BASE_URL}")
     if not VAULT.exists():
         log.error(f"VAULT_PATH existiert nicht: {VAULT}")
         return
