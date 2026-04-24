@@ -35,7 +35,9 @@ cd /opt/bot
 bash install.sh
 ```
 
-Das Skript fragt nach den 3 Credentials, schreibt `.env`, baut & startet den Container.
+Das Skript fragt nach den Credentials, schreibt `.env`, baut & startet den Container.
+
+**Tipp**: Die Telegram-User-ID musst du nicht parat haben — leer lassen, dann startet der Bot im *Setup-Modus*. Beim ersten Senden an den Bot meldet er dir deine ID + Anleitung wie du sie in `.env` einträgst.
 
 ### Updates
 

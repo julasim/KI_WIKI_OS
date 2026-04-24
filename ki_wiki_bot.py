@@ -42,7 +42,9 @@ from telegram.ext import (
 # ============================================================================
 
 VAULT = Path(os.environ.get("VAULT_PATH", "/vault"))
-ALLOWED_USER_ID = int(os.environ["ALLOWED_USER_ID"])
+# 0 = Setup-Modus: Bot meldet beim ersten Kontakt die User-ID,
+#                  user editiert .env und startet neu.
+ALLOWED_USER_ID = int(os.environ.get("ALLOWED_USER_ID", "0") or "0")
 TG_TOKEN = os.environ["TG_TOKEN"]
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 LLM_MODEL = os.environ.get("LLM_MODEL", "anthropic/claude-sonnet-4-5")
@@ -587,6 +589,25 @@ async def llm_loop(user_text: str) -> str:
 def require_auth(handler):
     async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         uid = update.effective_user.id if update.effective_user else None
+        if uid is None:
+            return
+        # Setup-Modus: noch kein User gebunden → Bot meldet User-ID, sonst nichts
+        if ALLOWED_USER_ID == 0:
+            log.info(f"Setup mode: first contact from user_id={uid}")
+            await update.message.reply_text(
+                f"🔓 *Setup-Modus*\n\n"
+                f"Bot ist noch nicht an einen User gebunden.\n\n"
+                f"Deine Telegram-User-ID: `{uid}`\n\n"
+                f"Auf VPS:\n"
+                f"```\n"
+                f"nano /opt/bot/.env\n"
+                f"# ALLOWED_USER_ID={uid} setzen\n"
+                f"docker compose restart\n"
+                f"```\n"
+                f"Danach bin ich nur noch für dich da.",
+                parse_mode=constants.ParseMode.MARKDOWN,
+            )
+            return
         if uid != ALLOWED_USER_ID:
             log.warning(f"Unauthorized access attempt: user_id={uid}")
             return
@@ -747,7 +768,10 @@ async def handle_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 def main():
     log.info(f"Vault: {VAULT}")
-    log.info(f"Allowed user: {ALLOWED_USER_ID}")
+    if ALLOWED_USER_ID == 0:
+        log.warning("⚠️  ALLOWED_USER_ID=0 → Setup-Modus aktiv. Erste Nachricht im Telegram triggert Anleitung.")
+    else:
+        log.info(f"Allowed user: {ALLOWED_USER_ID}")
     log.info(f"LLM: {LLM_MODEL}")
     log.info(f"Vision: {VISION_MODEL}")
     if not VAULT.exists():

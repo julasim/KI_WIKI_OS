@@ -35,22 +35,31 @@ echo
 echo "──── Credentials ────"
 echo "Falls du noch keine hast:"
 echo "  • Telegram-Token    → @BotFather in Telegram"
-echo "  • Telegram User-ID  → @userinfobot in Telegram"
+echo "  • Telegram User-ID  → optional, leer lassen → Bot meldet sie dir"
 echo "  • OpenRouter-Key    → openrouter.ai → Keys"
 echo
 
-read -rp "Telegram Bot Token       : " TG_TOKEN
-read -rp "Telegram User-ID         : " ALLOWED_USER_ID
-read -rp "OpenRouter API Key       : " OPENROUTER_API_KEY
+read -rp "Telegram Bot Token                       : " TG_TOKEN
+read -rp "Telegram User-ID (Enter = Setup-Modus)   : " ALLOWED_USER_ID
+read -rp "OpenRouter API Key                       : " OPENROUTER_API_KEY
 
-# Quick validation
-if [[ -z "${TG_TOKEN}" || -z "${ALLOWED_USER_ID}" || -z "${OPENROUTER_API_KEY}" ]]; then
-    echo "❌ Mindestens ein Feld leer. Abbruch."
+# Default für User-ID: 0 (Setup-Modus)
+ALLOWED_USER_ID=${ALLOWED_USER_ID:-0}
+
+# Quick validation (User-ID darf 0 sein = Setup-Modus)
+if [[ -z "${TG_TOKEN}" || -z "${OPENROUTER_API_KEY}" ]]; then
+    echo "❌ TG_TOKEN oder OPENROUTER_API_KEY fehlt. Abbruch."
     exit 1
 fi
 if ! [[ "${ALLOWED_USER_ID}" =~ ^[0-9]+$ ]]; then
-    echo "❌ User-ID muss eine Zahl sein."
+    echo "❌ User-ID muss eine Zahl sein (oder leer für Setup-Modus)."
     exit 1
+fi
+
+if [ "${ALLOWED_USER_ID}" = "0" ]; then
+    echo
+    echo "ℹ️  Setup-Modus aktiviert. Schick dem Bot in Telegram irgendeine Nachricht,"
+    echo "   er antwortet mit deiner User-ID + Anleitung zum Aktivieren."
 fi
 
 # ─── Optionale Config ───
