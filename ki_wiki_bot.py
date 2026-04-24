@@ -613,17 +613,15 @@ def require_auth(handler):
         if ALLOWED_USER_ID == 0:
             log.info(f"Setup mode: first contact from user_id={uid}")
             await update.message.reply_text(
-                f"🔓 *Setup-Modus*\n\n"
+                f"🔓 <b>Setup-Modus</b>\n\n"
                 f"Bot ist noch nicht an einen User gebunden.\n\n"
-                f"Deine Telegram-User-ID: `{uid}`\n\n"
+                f"Deine Telegram-User-ID: <code>{uid}</code>\n\n"
                 f"Auf VPS:\n"
-                f"```\n"
-                f"nano /opt/bot/.env\n"
+                f"<pre><code>nano /opt/bot/.env\n"
                 f"# ALLOWED_USER_ID={uid} setzen\n"
-                f"docker compose restart\n"
-                f"```\n"
+                f"docker compose restart</code></pre>\n"
                 f"Danach bin ich nur noch für dich da.",
-                parse_mode=constants.ParseMode.MARKDOWN,
+                parse_mode=constants.ParseMode.HTML,
             )
             return
         if uid != ALLOWED_USER_ID:
@@ -633,28 +631,106 @@ def require_auth(handler):
     return wrapper
 
 
+def md_to_telegram_html(text: str) -> str:
+    """Konvertiere Markdown → Telegram-kompatibles HTML.
+
+    Telegram unterstützt: <b>, <i>, <u>, <s>, <code>, <pre>, <a>, <blockquote>.
+    Block-Tags wie <p>, <h1>, <ul>, <li> werden NICHT akzeptiert →
+    wir wandeln sie in Inline-Format (Bold + Bullets via Unicode).
+    """
+    # 1) HTML-Sonderzeichen escapen (BEVOR wir HTML-Tags einfügen)
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    # 2) Code-Blöcke zuerst rausnehmen (Inhalt soll roh bleiben)
+    code_blocks = []
+    def _stash_codeblock(m):
+        code_blocks.append(m.group(2))
+        return f"\x00CODE{len(code_blocks)-1}\x00"
+    text = re.sub(r"```(\w+)?\n?(.*?)```", _stash_codeblock, text, flags=re.DOTALL)
+
+    inline_codes = []
+    def _stash_inline(m):
+        inline_codes.append(m.group(1))
+        return f"\x00INLINE{len(inline_codes)-1}\x00"
+    text = re.sub(r"`([^`\n]+)`", _stash_inline, text)
+
+    # 3) Headings → Bold + Linebreak
+    text = re.sub(r"^#{1,6}\s+(.+?)$", r"<b>\1</b>", text, flags=re.MULTILINE)
+
+    # 4) Bold/Italic/Strike
+    text = re.sub(r"\*\*([^*\n]+?)\*\*", r"<b>\1</b>", text)
+    text = re.sub(r"__([^_\n]+?)__", r"<b>\1</b>", text)
+    text = re.sub(r"(?<![*\w])\*([^*\n]+?)\*(?!\w)", r"<i>\1</i>", text)
+    text = re.sub(r"~~([^~\n]+?)~~", r"<s>\1</s>", text)
+
+    # 5) Links [text](url)
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', text)
+
+    # 6) Wikilinks [[id]] → kursive Markierung (sichtbar als Referenz)
+    text = re.sub(r"\[\[([^\]]+)\]\]", r"<i>[[\1]]</i>", text)
+
+    # 7) Bullet-Listen → Unicode-Bullets
+    text = re.sub(r"^[ \t]*[-*+]\s+(.+)$", r"• \1", text, flags=re.MULTILINE)
+
+    # 8) Code-Blöcke + Inline-Code restoren (mit erneutem Escape!)
+    def _restore_codeblock(m):
+        idx = int(m.group(1))
+        content = code_blocks[idx]
+        return f"<pre><code>{content}</code></pre>"
+    text = re.sub(r"\x00CODE(\d+)\x00", _restore_codeblock, text)
+
+    def _restore_inline(m):
+        idx = int(m.group(1))
+        return f"<code>{inline_codes[idx]}</code>"
+    text = re.sub(r"\x00INLINE(\d+)\x00", _restore_inline, text)
+
+    return text
+
+
+def _strip_html(text: str) -> str:
+    """Fallback: entferne HTML-Tags für Plain-Text-Send."""
+    text = re.sub(r"<[^>]+>", "", text)
+    text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+    return text
+
+
 async def safe_reply(update: Update, text: str) -> None:
-    """Split at TG_MAX_MESSAGE chars with smart breaks."""
+    """Split + send. HTML-Format mit Plain-Fallback bei Parse-Fehler."""
     if not text:
         await update.message.reply_text("(leer)")
         return
+
+    # Erst Markdown→HTML, dann splitten
+    html = md_to_telegram_html(text)
+
+    # Splitten an Newlines wo möglich (Smart-Breaks)
     chunks = []
-    while text:
-        if len(text) <= TG_MAX_MESSAGE:
-            chunks.append(text)
+    remaining = html
+    while remaining:
+        if len(remaining) <= TG_MAX_MESSAGE:
+            chunks.append(remaining)
             break
-        cut = text.rfind("\n\n", 0, TG_MAX_MESSAGE)
+        cut = remaining.rfind("\n\n", 0, TG_MAX_MESSAGE)
         if cut < 1000:
-            cut = text.rfind("\n", 0, TG_MAX_MESSAGE)
+            cut = remaining.rfind("\n", 0, TG_MAX_MESSAGE)
         if cut < 1000:
-            cut = text.rfind(" ", 0, TG_MAX_MESSAGE)
+            cut = remaining.rfind(" ", 0, TG_MAX_MESSAGE)
         if cut < 1:
             cut = TG_MAX_MESSAGE
-        chunks.append(text[:cut])
-        text = text[cut:].lstrip()
+        chunks.append(remaining[:cut])
+        remaining = remaining[cut:].lstrip()
+
     for i, chunk in enumerate(chunks, 1):
         prefix = f"({i}/{len(chunks)})\n" if len(chunks) > 1 else ""
-        await update.message.reply_text(prefix + chunk)
+        try:
+            await update.message.reply_text(
+                prefix + chunk,
+                parse_mode=constants.ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        except Exception as e:
+            log.warning(f"HTML-Send fehlgeschlagen, Fallback Plain: {e}")
+            await update.message.reply_text(prefix + _strip_html(chunk))
 
 
 @require_auth
