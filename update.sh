@@ -30,13 +30,19 @@ echo
 echo "──── Änderungen ────"
 git log --oneline "$BEFORE..$AFTER"
 
-# ─── .env-Schema-Drift check ───
-if ! diff -q <(grep -oE '^[A-Z_]+=' .env.example | sort) <(grep -oE '^[A-Z_]+=' .env | sort) >/dev/null 2>&1; then
-    echo
-    echo "⚠️  .env.example hat sich geändert. Prüfe ob neue Variablen nötig sind:"
-    diff <(grep -oE '^[A-Z_]+' .env.example | sort) <(grep -oE '^[A-Z_]+' .env | sort) || true
-    read -rp "Trotzdem starten? [Y/n] " cont
-    [[ ! "${cont,,}" =~ ^n ]] || exit 1
+# ─── .env-Schema-Drift check (nur fehlende Pflicht-Felder warnen) ───
+if [ -f .env ] && [ -f .env.example ]; then
+    missing=$(comm -23 \
+        <(grep -oE '^[A-Z_]+=' .env.example | sed 's/=$//' | sort -u) \
+        <(grep -oE '^[A-Z_]+=' .env | sed 's/=$//' | sort -u))
+    if [ -n "$missing" ]; then
+        echo
+        echo "⚠️  In deiner .env fehlen folgende Felder (laut .env.example):"
+        echo "$missing" | sed 's/^/    /'
+        echo
+        read -rp "Trotzdem starten? [Y/n] " cont
+        [[ ! "${cont,,}" =~ ^n ]] || exit 1
+    fi
 fi
 
 # ─── Rebuild + Restart ───
