@@ -15,6 +15,7 @@ ENV:
 import os
 import re
 import json
+import time
 import base64
 import asyncio
 import logging
@@ -380,6 +381,71 @@ def clip_url(url: str) -> str:
         return f"Clip-Fehler: {e}"
 
 
+# ─── Pending Deletions ──────────────────────────────────────────────────────
+# Two-Step-Delete: request_delete() merkt sich was, confirm_delete() führt aus.
+# State überlebt zwischen Telegram-Nachrichten solange Container läuft.
+PENDING_DELETIONS: dict[int, tuple[str, float]] = {}
+DELETE_CONFIRM_TIMEOUT = 120  # Sekunden
+
+
+def request_delete(rel_path: str) -> str:
+    """Merkt sich eine Lösch-Anfrage. Antwort fordert Bestätigung."""
+    try:
+        path = safe_path(rel_path)
+    except Exception as e:
+        return f"Pfad-Fehler: {e}"
+    if not path.exists():
+        return f"Datei nicht gefunden: {rel_path}"
+    PENDING_DELETIONS[ALLOWED_USER_ID] = (rel_path, time.time())
+    log.info(f"Pending delete requested: {rel_path}")
+    return (
+        f"⚠️ Bestätigung nötig: soll [[{path.stem}]] (`{rel_path}`) "
+        f"ins Archiv verschoben werden? Antworte innerhalb {DELETE_CONFIRM_TIMEOUT}s "
+        f"mit 'ja löschen' oder 'bestätigt'."
+    )
+
+
+def confirm_delete() -> str:
+    """Führt die letzte angeforderte Löschung aus (move → 99_Archive/)."""
+    pending = PENDING_DELETIONS.get(ALLOWED_USER_ID)
+    if not pending:
+        return "Keine Löschung pending — gibts nichts zu bestätigen."
+    rel_path, ts = pending
+    age = time.time() - ts
+    if age > DELETE_CONFIRM_TIMEOUT:
+        del PENDING_DELETIONS[ALLOWED_USER_ID]
+        return f"Bestätigung zu spät ({int(age)}s > {DELETE_CONFIRM_TIMEOUT}s). Bitte nochmal anfordern."
+    try:
+        src = safe_path(rel_path)
+        if not src.exists():
+            del PENDING_DELETIONS[ALLOWED_USER_ID]
+            return f"Quelldatei verschwunden: {rel_path}"
+        # Ziel im Archiv mit erhaltener Pfad-Struktur
+        archive_root = VAULT / "99_Archive"
+        rel_inside = src.relative_to(VAULT)
+        dst = archive_root / rel_inside
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        # Bei Konflikt: Timestamp anhängen
+        if dst.exists():
+            ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+            dst = dst.with_name(f"{dst.stem}_{ts_str}{dst.suffix}")
+        os.rename(src, dst)
+        del PENDING_DELETIONS[ALLOWED_USER_ID]
+        log.info(f"Deleted (archived): {rel_path} → {dst.relative_to(VAULT)}")
+        return f"✓ Verschoben nach `{dst.relative_to(VAULT)}`. Wiederherstellbar via `mv` oder erneutem read_file → write."
+    except Exception as e:
+        log.exception("confirm_delete failed")
+        return f"Lösch-Fehler: {e}"
+
+
+def cancel_delete() -> str:
+    """Bricht eine pending Löschung ab."""
+    if ALLOWED_USER_ID in PENDING_DELETIONS:
+        rel_path, _ = PENDING_DELETIONS.pop(ALLOWED_USER_ID)
+        return f"Löschanfrage für `{rel_path}` abgebrochen."
+    return "Keine pending Löschung."
+
+
 # ============================================================================
 # Tool definitions (OpenAI function-calling format)
 # ============================================================================
@@ -492,6 +558,35 @@ TOOLS = [
             "required": ["url"],
         },
     }},
+    {"type": "function", "function": {
+        "name": "request_delete",
+        "description": (
+            "Schritt 1 von 2 für sicheres Löschen: meldet eine Löschanfrage an den User "
+            "und FORDERT BESTÄTIGUNG. Nutze IMMER diese Funktion für Löschwünsche, NIEMALS "
+            "direkt confirm_delete ohne vorherige User-Bestätigung. "
+            "Pfad relativ zu Vault-Root (z.B. '10_Life/tasks/foo.md')."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"rel_path": {"type": "string"}},
+            "required": ["rel_path"],
+        },
+    }},
+    {"type": "function", "function": {
+        "name": "confirm_delete",
+        "description": (
+            "Schritt 2 von 2: führt die zuletzt angeforderte Löschung aus (Datei wird ins "
+            "99_Archive/ verschoben, NICHT hart gelöscht — reversibel). "
+            "Nur aufrufen NACHDEM der User explizit bestätigt hat ('ja', 'bestätigt', "
+            "'ja löschen', 'jo machs' o.ä.). Hat keine Parameter."
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    }},
+    {"type": "function", "function": {
+        "name": "cancel_delete",
+        "description": "Bricht eine pending Löschung ab. Nutze wenn User 'nein', 'doch nicht', 'abbrechen' o.ä. sagt.",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    }},
 ]
 
 TOOL_HANDLERS = {
@@ -504,6 +599,9 @@ TOOL_HANDLERS = {
     "read_file": read_file,
     "edit_file": edit_file,
     "clip_url": clip_url,
+    "request_delete": request_delete,
+    "confirm_delete": confirm_delete,
+    "cancel_delete": cancel_delete,
 }
 
 # ============================================================================
@@ -537,6 +635,14 @@ DATUMSANGABEN:
 - "übermorgen" → +2 Tage
 - "nächsten Montag" → ISO-Datum berechnen
 - Alle `due`-Felder als YYYY-MM-DD
+
+LÖSCHEN (zwei-stufig, NIE einstufig):
+- User sagt "lösche X" / "weg mit X" / "delete X" → IMMER request_delete (NIEMALS direkt confirm_delete)
+- Antwort enthält dann automatisch die Bestätigungs-Frage
+- User antwortet danach mit "ja", "ja löschen", "bestätigt", "machs", "jo" etc. → JETZT confirm_delete
+- User antwortet mit "nein", "doch nicht", "abbrechen" → cancel_delete
+- "lösche X" und "ja" sind getrennte Nachrichten — Pending-State überlebt zwischen ihnen via Bot-intern.
+- Datei wird bei confirm_delete ins 99_Archive/ verschoben, NICHT hart gelöscht.
 
 ANTWORT-STIL:
 - Kurz und konkret (1-3 Sätze).
@@ -631,58 +737,128 @@ def require_auth(handler):
     return wrapper
 
 
+def _esc_html(s: str) -> str:
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _render_md_table(table_text: str) -> str:
+    """Markdown-Tabelle → monospaced ASCII mit Unicode-Box-Zeichen."""
+    lines = [l for l in table_text.strip().split("\n") if l.strip()]
+    if len(lines) < 3:
+        return table_text  # zu kurz für Tabelle, unverändert lassen
+
+    def cells(line: str) -> list:
+        return [c.strip() for c in line.strip().strip("|").split("|")]
+
+    header = cells(lines[0])
+    rows = [cells(l) for l in lines[2:]]  # lines[1] ist die Separator-Linie
+    n = len(header)
+    rows = [r[:n] + [""] * max(0, n - len(r)) for r in rows]
+
+    widths = [len(c) for c in header]
+    for r in rows:
+        for i in range(n):
+            widths[i] = max(widths[i], len(r[i]))
+
+    def fmt_row(cells_):
+        return " │ ".join(c.ljust(widths[i]) for i, c in enumerate(cells_))
+
+    sep = "─┼─".join("─" * w for w in widths)
+    out = [fmt_row(header), sep]
+    for r in rows:
+        out.append(fmt_row(r))
+    return "\n".join(out)
+
+
+# Markdown-Tabelle: Header-Zeile + Separator-Zeile (nur -:| und Spaces) + 1+ Datenzeilen
+TABLE_RE = re.compile(
+    r"(^\|[^\n]+\|[ \t]*\n"            # Header
+    r"\|[ \t]*[-:][\-:| \t]*\|[ \t]*\n"  # Separator
+    r"(?:\|[^\n]+\|[ \t]*\n?)+)",      # Daten (1 oder mehr)
+    re.MULTILINE,
+)
+
+
 def md_to_telegram_html(text: str) -> str:
     """Konvertiere Markdown → Telegram-kompatibles HTML.
 
-    Telegram unterstützt: <b>, <i>, <u>, <s>, <code>, <pre>, <a>, <blockquote>.
-    Block-Tags wie <p>, <h1>, <ul>, <li> werden NICHT akzeptiert →
-    wir wandeln sie in Inline-Format (Bold + Bullets via Unicode).
+    Telegram-Subset: <b>, <i>, <u>, <s>, <a>, <code>, <pre>, <blockquote>.
+    Block-Konstrukte (Tabellen, Listen, Headings) werden zu Inline-Formaten:
+    - Tabellen → monospaced <pre> mit Box-Drawing-Chars
+    - Headings → <b>
+    - Bullets → Unicode •
+    - Numbered Lists → bleiben "1. text"
+    - Horizontale Linien → ━━━━━━━━━━━━
     """
-    # 1) HTML-Sonderzeichen escapen (BEVOR wir HTML-Tags einfügen)
-    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    # Stash für bereits-fertiges HTML, das nicht weiter verarbeitet werden soll
+    stash = []
 
-    # 2) Code-Blöcke zuerst rausnehmen (Inhalt soll roh bleiben)
-    code_blocks = []
-    def _stash_codeblock(m):
-        code_blocks.append(m.group(2))
-        return f"\x00CODE{len(code_blocks)-1}\x00"
-    text = re.sub(r"```(\w+)?\n?(.*?)```", _stash_codeblock, text, flags=re.DOTALL)
+    def add_stash(html_fragment: str) -> str:
+        stash.append(html_fragment)
+        return f"\x00S{len(stash)-1}\x00"
 
-    inline_codes = []
-    def _stash_inline(m):
-        inline_codes.append(m.group(1))
-        return f"\x00INLINE{len(inline_codes)-1}\x00"
-    text = re.sub(r"`([^`\n]+)`", _stash_inline, text)
+    # 1) TABELLEN — als monospaced Pre-Block stashen
+    def _table_repl(m):
+        rendered = _render_md_table(m.group(1))
+        return add_stash(f"<pre><code>{_esc_html(rendered)}</code></pre>")
+    text = TABLE_RE.sub(_table_repl, text)
 
-    # 3) Headings → Bold + Linebreak
+    # 2) FENCED CODE BLOCKS (```...```)
+    def _fenced_repl(m):
+        return add_stash(f"<pre><code>{_esc_html(m.group(2))}</code></pre>")
+    text = re.sub(r"```(\w+)?\n?(.*?)```", _fenced_repl, text, flags=re.DOTALL)
+
+    # 3) INLINE CODE (`...`)
+    def _inline_repl(m):
+        return add_stash(f"<code>{_esc_html(m.group(1))}</code>")
+    text = re.sub(r"`([^`\n]+)`", _inline_repl, text)
+
+    # 4) Restlichen Text HTML-escapen
+    text = _esc_html(text)
+
+    # 5) Headings (# bis ######) → <b> + Newline davor für visuelle Trennung
     text = re.sub(r"^#{1,6}\s+(.+?)$", r"<b>\1</b>", text, flags=re.MULTILINE)
 
-    # 4) Bold/Italic/Strike
+    # 6) Bold/Italic/Strike
     text = re.sub(r"\*\*([^*\n]+?)\*\*", r"<b>\1</b>", text)
     text = re.sub(r"__([^_\n]+?)__", r"<b>\1</b>", text)
     text = re.sub(r"(?<![*\w])\*([^*\n]+?)\*(?!\w)", r"<i>\1</i>", text)
     text = re.sub(r"~~([^~\n]+?)~~", r"<s>\1</s>", text)
 
-    # 5) Links [text](url)
+    # 7) Blockquotes (> text)  — beachte: > wurde zu &gt; escaped
+    text = re.sub(
+        r"(?:^&gt;\s?.+(?:\n|$))+",
+        lambda m: "<blockquote>" + re.sub(r"^&gt;\s?", "", m.group(0), flags=re.MULTILINE).rstrip() + "</blockquote>\n",
+        text,
+        flags=re.MULTILINE,
+    )
+
+    # 8) Horizontale Linie (--- oder *** allein auf Zeile)
+    text = re.sub(r"^[-*_]{3,}\s*$", "━" * 24, text, flags=re.MULTILINE)
+
+    # 9) Links [text](url)
     text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', text)
 
-    # 6) Wikilinks [[id]] → kursive Markierung (sichtbar als Referenz)
+    # 10) Wikilinks [[id]] → kursive Referenz
     text = re.sub(r"\[\[([^\]]+)\]\]", r"<i>[[\1]]</i>", text)
 
-    # 7) Bullet-Listen → Unicode-Bullets
-    text = re.sub(r"^[ \t]*[-*+]\s+(.+)$", r"• \1", text, flags=re.MULTILINE)
+    # 11) Bullet-Listen mit Indentation → Unicode • mit erhaltener Einrückung
+    def _bullet_repl(m):
+        indent = m.group(1)
+        content = m.group(2)
+        # Verschachtelte Bullets: 2 Leerzeichen pro Ebene → ◦ statt •
+        depth = len(indent) // 2
+        marker = "•" if depth == 0 else ("◦" if depth == 1 else "▪")
+        return f"{indent}{marker} {content}"
+    text = re.sub(r"^([ \t]*)[-*+]\s+(.+)$", _bullet_repl, text, flags=re.MULTILINE)
 
-    # 8) Code-Blöcke + Inline-Code restoren (mit erneutem Escape!)
-    def _restore_codeblock(m):
-        idx = int(m.group(1))
-        content = code_blocks[idx]
-        return f"<pre><code>{content}</code></pre>"
-    text = re.sub(r"\x00CODE(\d+)\x00", _restore_codeblock, text)
+    # 12) Numbered Lists — bleiben als "1. text", aber Spaces normalisieren
+    text = re.sub(r"^([ \t]*)(\d+)\.\s+(.+)$", r"\1\2. \3", text, flags=re.MULTILINE)
 
-    def _restore_inline(m):
-        idx = int(m.group(1))
-        return f"<code>{inline_codes[idx]}</code>"
-    text = re.sub(r"\x00INLINE(\d+)\x00", _restore_inline, text)
+    # 13) Stashed HTML restoren
+    def _restore(m):
+        return stash[int(m.group(1))]
+    text = re.sub(r"\x00S(\d+)\x00", _restore, text)
 
     return text
 
