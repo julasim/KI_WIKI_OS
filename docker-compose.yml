@@ -1,0 +1,24 @@
+services:
+  bot:
+    build: .
+    container_name: ki-wiki-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - VAULT_PATH=/vault
+    volumes:
+      # Vault wird vom Host gemountet — Bot schreibt direkt rein,
+      # PC sieht's via SSHFS-Mount.
+      - /opt/vault/KI_WIKI_Vault:/vault
+      # Whisper-Modell-Cache überlebt Container-Rebuilds
+      - whisper-cache:/root/.cache/huggingface
+    # Logs an Docker streamen, mit Rotation
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  whisper-cache:

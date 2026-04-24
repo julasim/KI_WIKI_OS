@@ -1,0 +1,7 @@
+# Erzwinge LF für alle Text-Files (sonst fallen Bash-Scripts auf Linux um)
+* text=auto eol=lf
+
+# Binär-Sicherheit (für später)
+*.png binary
+*.jpg binary
+*.pdf binary
