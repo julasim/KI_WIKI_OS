@@ -295,10 +295,38 @@ def append_to_daily(section: str, text: str) -> str:
     return f"In Daily ({section}) eingetragen: {path.name}"
 
 
+VALID_PRIORITIES = {"low", "medium", "high", "urgent"}
+VALID_TASK_CONTEXTS = {"home", "work", "errand", "phone", "computer"}
+
+
 def create_task(title: str, priority: str = "medium",
                 due: Optional[str] = None, area: Optional[str] = None,
                 project: Optional[str] = None, context: Optional[str] = None) -> str:
-    """Create a new task file in 10_Life/tasks/."""
+    """Create a new task file in 10_Life/tasks/.
+
+    Body wird dynamisch gebaut (nicht Template-Substitution) damit
+    Status/Priorität/Fälligkeit korrekt im Body erscheinen.
+    """
+    if not title or not title.strip():
+        return "Fehler: Task-Titel darf nicht leer sein."
+
+    # Priority normalisieren — LLM schickt manchmal Abkürzungen wie "M", "high prio" etc.
+    p_lower = (priority or "").lower().strip()
+    p_map = {
+        "u": "urgent", "urgent": "urgent",
+        "h": "high", "high": "high",
+        "m": "medium", "medium": "medium", "med": "medium", "normal": "medium",
+        "l": "low", "low": "low",
+    }
+    priority = p_map.get(p_lower, "medium")
+
+    # Due nur akzeptieren wenn ISO-Format
+    if due:
+        due = due.strip()
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", due):
+            log.warning(f"create_task: ungültiges due-Format '{due}', ignoriert")
+            due = None
+
     slug = slugify(title)
     path = TASKS_DIR / f"{slug}.md"
     n = 2
@@ -306,28 +334,58 @@ def create_task(title: str, priority: str = "medium",
         path = TASKS_DIR / f"{slug}-{n}.md"
         n += 1
     today = today_iso()
-    template = load_template("task")
-    content = template.replace("{{title}}", title).replace("{{date:YYYY-MM-DD}}", today)
-    post = frontmatter.loads(content)
-    post["id"] = f"t-{path.stem}"
-    post["title"] = title
-    post["priority"] = priority
-    post["status"] = "open"
+    task_id = f"t-{path.stem}"
+
+    # Body dynamisch bauen (statt Template mit Hardcoded-Defaults)
+    body = (
+        f"# {title}\n\n"
+        f"**Status**: open · **Priorität**: {priority} · **Fällig**: {due or '—'}\n\n"
+        f"## Was\n\n"
+        f"## Warum\n\n"
+        f"## Subschritte\n- [ ]\n\n"
+        f"## Notizen\n\n"
+        f"## Log\n- {today}: angelegt\n"
+    )
+
+    fm_data = {
+        "id": task_id,
+        "title": title,
+        "type": "task",
+        "created": today,
+        "updated": today,
+        "tags": [],
+        "status": "open",
+        "priority": priority,
+    }
     if due:
-        post["due"] = due
+        fm_data["due"] = due
     if area:
-        post["area"] = area
+        fm_data["area"] = area
     if project:
-        post["project"] = project
+        fm_data["project"] = project
     if context:
-        post["context"] = context
+        ctx_lower = context.lower().strip()
+        if ctx_lower in VALID_TASK_CONTEXTS:
+            fm_data["context"] = ctx_lower
+
+    post = frontmatter.Post(body, **fm_data)
     atomic_write(path, frontmatter.dumps(post) + "\n")
+
     # Link in heutige Daily
     try:
-        append_to_daily("Heute", f"- [ ] [[t-{path.stem}]] {title}")
+        append_to_daily("Heute", f"- [ ] [[{task_id}]] {title}")
     except Exception as e:
         log.warning(f"Daily-Link für Task fehlgeschlagen: {e}")
-    return f"Task angelegt: [[t-{path.stem}]]"
+
+    extras = []
+    if due:
+        extras.append(f"fällig {due}")
+    if project:
+        extras.append(f"projekt {project}")
+    if priority != "medium":
+        extras.append(f"prio {priority}")
+    extra_str = f" ({', '.join(extras)})" if extras else ""
+    return f"Task angelegt: [[{task_id}]]{extra_str}"
 
 
 def mark_task_done(slug: str) -> str:
@@ -873,15 +931,20 @@ TOOLS = [
     }},
     {"type": "function", "function": {
         "name": "create_task",
-        "description": "Legt einen neuen Task in 10_Life/tasks/ an und verlinkt ihn unter 'Heute' in der heutigen Daily.",
+        "description": (
+            "Legt neuen Task in 10_Life/tasks/ an, verlinkt unter 'Heute' in heutiger Daily. "
+            "WICHTIG: Optionale Parameter NUR setzen wenn explizit aus User-Input ableitbar — "
+            "NIE raten/defaulten. Z.B. due nur wenn User wirklich ein Datum nennt; "
+            "project nur wenn User Projekt nennt oder es klar aus Conversation-Memory hervorgeht."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
-                "title": {"type": "string"},
-                "priority": {"type": "string", "enum": ["low", "medium", "high", "urgent"]},
-                "due": {"type": "string", "description": "ISO-Datum YYYY-MM-DD"},
-                "area": {"type": "string", "description": "Wikilink-ID einer Area, z.B. 'dachboden-umbau'"},
-                "project": {"type": "string"},
+                "title": {"type": "string", "description": "Vollständiger Task-Titel (deutsch ok)"},
+                "priority": {"type": "string", "enum": ["low", "medium", "high", "urgent"], "description": "Default medium falls User keine Prio nennt"},
+                "due": {"type": "string", "description": "ISO YYYY-MM-DD. NUR setzen wenn User explizit ein Datum nennt!"},
+                "area": {"type": "string", "description": "Area-ID, NUR wenn User Area nennt"},
+                "project": {"type": "string", "description": "Projekt-Slug (z.B. 'sanierung-kiosk'), NUR wenn aus User-Input oder Memory klar"},
                 "context": {"type": "string", "enum": ["home", "work", "errand", "phone", "computer"]},
             },
             "required": ["title"],
