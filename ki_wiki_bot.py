@@ -1216,6 +1216,14 @@ du zu?"-Schleifen führen. Default-Pfade aus dem Schema sind klar definiert.
 - Datum: ISO `YYYY-MM-DD`. "morgen" = +1 Tag, "übermorgen" = +2, "nächsten Montag" → berechnen.
 - **Tasks ohne explizit genanntes Datum → `due` LEER lassen, NICHT 'heute' raten!**
   "Schränke aufbauen" hat KEIN due. "Schränke aufbauen morgen" hat due=morgen.
+- **Priorität aus Sprache erkennen** (statt default medium):
+  - "dringend", "urgent", "asap", "sofort", "eilt" → `priority=urgent`
+  - "wichtig", "hochpriorisiert", "high prio" → `priority=high`
+  - "irgendwann", "nice to have", "low prio" → `priority=low`
+  - Sonst → `priority=medium`
+  Wenn ein Prio-Wort am Titel-Anfang steht, ENTFERNE es aus dem Titel
+  (z.B. "dringend Server-Backup einrichten" → title="Server-Backup einrichten",
+  priority="urgent")
 
 # KONTEXT-NUTZUNG (Conversation-Memory)
 - Wenn du im Verlauf der letzten paar Turns ein Projekt erstellt hast (z.B. `sanierung-kiosk`)
