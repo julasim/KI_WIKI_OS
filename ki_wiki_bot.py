@@ -762,21 +762,60 @@ SORT date DESC
             f"Tipp: Tasks/Notes mit `project: {slug}` werden automatisch im Projekt-README gelistet.")
 
 
-def list_files(rel_dir: str = "") -> str:
+# Noise-Verzeichnisse die in list_files-Output rausgefiltert werden
+# (System-Internals, Templates, Meta-Reports, Tooling — nicht User-Content)
+LIST_FILES_NOISE_DIRS = {
+    ".obsidian", ".trash", "99_Archive",
+    "08_Templates", "06_Meta", "07_Tools",
+}
+LIST_FILES_NOISE_FILES = {
+    "README.md", "_index.md",
+    "CLAUDE.md", "COMMANDS.md", "MOC.md",
+    "PIPELINES.md", "SCHEMA.md",
+}
+
+
+def list_files(rel_dir: str = "", include_system: bool = False) -> str:
     """Liste alle .md-Files in einem Vault-Unterordner.
 
-    Nützlich vor Batch-Löschungen ('alle daily logs') um vorher zu wissen was kommt.
+    Standardmäßig werden System-Verzeichnisse (Templates, Meta, Tools, Trash, Archive)
+    und System-Docs (CLAUDE.md etc.) ausgefiltert — User sieht nur eigenen Content.
+    Mit include_system=True wird alles gezeigt (für Debug).
     """
     try:
         base = safe_path(rel_dir) if rel_dir else VAULT
         if not base.exists() or not base.is_dir():
             return f"Verzeichnis nicht gefunden: {rel_dir}"
-        files = sorted(p for p in base.rglob("*.md")
-                       if p.name not in ("README.md", "_index.md")
-                       and not any(part in (".obsidian", "99_Archive") for part in p.parts))
+
+        def is_visible(p: Path) -> bool:
+            if include_system:
+                return True
+            if p.name in LIST_FILES_NOISE_FILES:
+                return False
+            return not any(part in LIST_FILES_NOISE_DIRS for part in p.parts)
+
+        files = sorted(p for p in base.rglob("*.md") if is_visible(p))
         if not files:
-            return f"Keine Markdown-Files in {rel_dir or 'Vault-Root'}"
+            return f"Keine User-Files in {rel_dir or 'Vault-Root'} (System-Files via include_system=true sichtbar)."
+
         rels = [str(f.relative_to(VAULT)).replace("\\", "/") for f in files]
+
+        # Bei vielen Files: nach Top-Level-Ordner gruppieren für lesbare Ausgabe
+        if len(rels) > 12:
+            from collections import defaultdict
+            grouped = defaultdict(list)
+            for r in rels:
+                top = r.split("/", 1)[0]
+                grouped[top].append(r)
+            lines = [f"{len(rels)} Files in {rel_dir or 'Vault-Root'}, gruppiert:"]
+            for top in sorted(grouped):
+                lines.append(f"\n**{top}/** ({len(grouped[top])})")
+                for r in grouped[top][:8]:
+                    lines.append(f"• `{r}`")
+                if len(grouped[top]) > 8:
+                    lines.append(f"  _… {len(grouped[top])-8} weitere_")
+            return "\n".join(lines)
+
         return f"{len(rels)} Files in {rel_dir or 'Vault-Root'}:\n" + "\n".join(f"• `{r}`" for r in rels)
     except Exception as e:
         return f"List-Fehler: {e}"
@@ -975,17 +1014,21 @@ TOOLS = [
     {"type": "function", "function": {
         "name": "list_files",
         "description": (
-            "Listet alle .md-Files in einem Vault-Unterordner. "
-            "Nutze vor Batch-Operationen ('alle daily logs', 'alle Tasks im Projekt X') "
-            "um die Liste der betroffenen Files zu bekommen, die du dann z.B. in "
-            "request_delete übergeben kannst."
+            "Listet User-Content-Files (.md) im Vault. System-Krempel (Templates, Meta, "
+            "Tools, Trash, Archive, CLAUDE.md etc.) wird automatisch rausgefiltert. "
+            "Bei >12 Files wird nach Top-Level-Ordner gruppiert."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "rel_dir": {
                     "type": "string",
-                    "description": "Verzeichnis relativ zu Vault-Root, z.B. '10_Life/daily'. Leer = ganzer Vault.",
+                    "description": "Verzeichnis relativ zu Vault-Root, z.B. '10_Life/tasks'. Leer = ganzer Vault.",
+                },
+                "include_system": {
+                    "type": "boolean",
+                    "description": "True = auch Templates/Meta/Tools/Archive zeigen (Debug). Default false.",
+                    "default": False,
                 },
             },
             "required": [],
@@ -1108,6 +1151,21 @@ du zu?"-Schleifen führen. Default-Pfade aus dem Schema sind klar definiert.
 
 # DATEN
 - Datum: ISO `YYYY-MM-DD`. "morgen" = +1 Tag, "übermorgen" = +2, "nächsten Montag" → berechnen.
+- **Tasks ohne explizit genanntes Datum → `due` LEER lassen, NICHT 'heute' raten!**
+  "Schränke aufbauen" hat KEIN due. "Schränke aufbauen morgen" hat due=morgen.
+
+# KONTEXT-NUTZUNG (Conversation-Memory)
+- Wenn du im Verlauf der letzten paar Turns ein Projekt erstellt hast (z.B. `sanierung-kiosk`)
+  und der User danach Tasks anlegt die offensichtlich dazu gehören (z.B. "Kalkulation
+  für Schiemer-Angebot" — Schiemer war im Projekt-Kontext erwähnt), dann setze
+  AUTOMATISCH `project=sanierung-kiosk` im Task-Frontmatter. Frag nicht nach.
+
+# LESENDE ANFRAGEN
+- "Was steht im Vault?" / "Zeig mir alles" → DIREKT antworten mit Vault-Übersicht
+  (call list_files() ohne Args, oder gib quick stats: Anzahl Tasks/Notes/Projekte).
+  NICHT 3× nachfragen "welcher Bereich?".
+- Wenn User klar einen Überblick will → liefere ihn. Erst nachfragen wenn die Anfrage
+  WIRKLICH mehrdeutig ist (z.B. "show me X" wo X ein Ein-Wort-Code ist).
 """
 
 # ============================================================================
