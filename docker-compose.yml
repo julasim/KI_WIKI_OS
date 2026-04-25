@@ -13,6 +13,8 @@ services:
       - /opt/vault/KI_WIKI_Vault:/vault
       # Whisper-Modell-Cache überlebt Container-Rebuilds
       - whisper-cache:/root/.cache/huggingface
+      # Lokaler Clone des GitHub-Backup-Repos (überlebt Container-Restarts)
+      - vault-backup:/vault-backup
     # Logs an Docker streamen, mit Rotation
     logging:
       driver: "json-file"
@@ -22,3 +24,4 @@ services:
 
 volumes:
   whisper-cache:
+  vault-backup:

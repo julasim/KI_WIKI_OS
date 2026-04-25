@@ -1,8 +1,10 @@
 FROM python:3.12-slim
 
-# ffmpeg für Whisper (Audio-Decoding), curl für Healthchecks falls nötig
+# ffmpeg für Whisper, git+rsync für Backup-Tool
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
+    git \
+    rsync \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

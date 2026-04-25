@@ -520,6 +520,101 @@ def cancel_delete() -> str:
     return f"Löschanfrage für {len(pending[0])} Datei(en) abgebrochen."
 
 
+def backup_vault() -> str:
+    """Manuelles Backup: Vault in privates GitHub-Repo pushen.
+
+    Voraussetzung: GITHUB_BACKUP_REPO (z.B. 'julasim/KI_WIKI_Vault_Backup') und
+    GITHUB_BACKUP_TOKEN (PAT mit Repo-Schreibrechten) in .env.
+
+    Workflow: clone-on-first-use → rsync vault-content → commit → push
+    """
+    repo = os.environ.get("GITHUB_BACKUP_REPO", "").strip()
+    token = os.environ.get("GITHUB_BACKUP_TOKEN", "").strip()
+    if not repo or not token:
+        return ("Backup nicht konfiguriert. Setze GITHUB_BACKUP_REPO und "
+                "GITHUB_BACKUP_TOKEN in /opt/bot/.env, dann docker compose restart.")
+
+    backup_dir = Path("/vault-backup")
+    repo_url = f"https://x-access-token:{token}@github.com/{repo}.git"
+
+    def _run(cmd, cwd=None, env_extra=None):
+        env = os.environ.copy()
+        if env_extra:
+            env.update(env_extra)
+        return subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=60)
+
+    try:
+        # Clone-on-first-use oder Pull
+        if not (backup_dir / ".git").exists():
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            log.info(f"Cloning backup repo: {repo}")
+            r = _run(["git", "clone", repo_url, str(backup_dir)])
+            if r.returncode != 0:
+                # Sanitize: Token aus Fehler entfernen falls drin
+                err = r.stderr.replace(token, "***")
+                return f"Clone-Fehler: {err}"
+        else:
+            r = _run(["git", "pull", "--rebase"], cwd=backup_dir)
+            if r.returncode != 0 and "no upstream" not in r.stderr.lower():
+                err = r.stderr.replace(token, "***")
+                # Pull-Fehler nicht fatal — wir pushen trotzdem
+                log.warning(f"Pull warning: {err}")
+
+        # Git-Identity setzen (idempotent, lokal zum Repo)
+        _run(["git", "config", "user.email", "bot@ki-wiki.local"], cwd=backup_dir)
+        _run(["git", "config", "user.name", "KI Wiki Bot"], cwd=backup_dir)
+
+        # Vault-Content rüber
+        target = backup_dir / "vault"
+        target.mkdir(exist_ok=True)
+        r = _run([
+            "rsync", "-a", "--delete",
+            "--exclude=.obsidian/workspace*",
+            "--exclude=.obsidian/cache",
+            "--exclude=*.tmp",
+            "--exclude=__pycache__",
+            f"{VAULT}/", f"{target}/",
+        ])
+        if r.returncode != 0:
+            return f"Rsync-Fehler: {r.stderr}"
+
+        # Stage + Commit (nur wenn Änderungen)
+        _run(["git", "add", "-A"], cwd=backup_dir)
+        diff = _run(["git", "diff", "--cached", "--quiet"], cwd=backup_dir)
+        if diff.returncode == 0:
+            return "✓ Keine Änderungen seit letztem Backup."
+
+        # Commit
+        commit_msg = f"Backup {datetime.now().isoformat(timespec='seconds')}"
+        r = _run(["git", "commit", "-m", commit_msg], cwd=backup_dir)
+        if r.returncode != 0:
+            return f"Commit-Fehler: {r.stderr}"
+
+        # Push
+        r = _run(["git", "push"], cwd=backup_dir)
+        if r.returncode != 0:
+            err = r.stderr.replace(token, "***")
+            return f"Push-Fehler: {err}"
+
+        # Stats
+        hash_r = _run(["git", "rev-parse", "--short", "HEAD"], cwd=backup_dir)
+        commit_hash = hash_r.stdout.strip()
+        # Datei-Anzahl im Backup
+        count_r = _run(["bash", "-c", f"find '{target}' -type f -name '*.md' | wc -l"])
+        file_count = count_r.stdout.strip() or "?"
+
+        return (f"✓ Backup gepusht\n"
+                f"Repo: {repo}@{commit_hash}\n"
+                f"Files: {file_count} .md\n"
+                f"Zeit: {datetime.now().strftime('%H:%M:%S')}")
+
+    except subprocess.TimeoutExpired:
+        return "Backup-Fehler: Timeout (>60s). Repo zu groß oder Netz langsam?"
+    except Exception as e:
+        log.exception("backup_vault failed")
+        return f"Backup-Fehler: {e}"
+
+
 def list_files(rel_dir: str = "") -> str:
     """Liste alle .md-Files in einem Vault-Unterordner.
 
@@ -749,6 +844,16 @@ TOOLS = [
             "required": [],
         },
     }},
+    {"type": "function", "function": {
+        "name": "backup_vault",
+        "description": (
+            "Manuelles Backup: pusht das gesamte Vault in das konfigurierte private "
+            "GitHub-Repo. Nutze wenn der User 'mach backup', 'sicher das vault', "
+            "'git push' o.ä. sagt. Idempotent — wenn nichts geändert, kommt entsprechende "
+            "Meldung. Hat keine Parameter."
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    }},
 ]
 
 TOOL_HANDLERS = {
@@ -765,6 +870,7 @@ TOOL_HANDLERS = {
     "confirm_delete": confirm_delete,
     "cancel_delete": cancel_delete,
     "list_files": list_files,
+    "backup_vault": backup_vault,
 }
 
 # ============================================================================
@@ -798,6 +904,7 @@ Tool nur aufrufen wenn Julius EXPLIZIT Speicher-Intent zeigt:
 | "lösche alle X" / "leere Y" | erst `list_files` für Verzeichnis, dann `request_delete` mit ALLEN Pfaden als Liste |
 | "ja / bestätigt / machs" nach request_delete | `confirm_delete` |
 | "nein / abbrechen" nach request_delete | `cancel_delete` |
+| "mach backup" / "sicher das vault" / "git push" | `backup_vault` |
 
 Begrüßung, Smalltalk, Fragen, Statements ohne Speicher-Verb → antworten, **nichts speichern**.
 Mehrdeutiger Input ("Diese", "ja" out-of-context) → **IMMER nachfragen**, nie raten.
@@ -1295,6 +1402,15 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 @require_auth
+async def handle_backup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/backup — manueller Push des Vaults ins konfigurierte GitHub-Repo."""
+    await update.message.chat.send_action(constants.ChatAction.TYPING)
+    await update.message.reply_text("⏳ Backup läuft...")
+    result = await asyncio.to_thread(backup_vault)
+    await safe_reply(update, result)
+
+
+@require_auth
 async def handle_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Setzt Conversation-Memory + pending Deletes zurück."""
     uid = update.effective_user.id
@@ -1334,6 +1450,7 @@ async def handle_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "🔗 URL allein → fragt ob clippen\n\n"
         "<b>Commands:</b>\n"
         "/today — heutige Daily anzeigen\n"
+        "/backup — Vault in GitHub-Repo pushen\n"
         "/reset — Conversation-Memory leeren\n\n"
         "<i>Conversation-Memory aktiv: ich erinnere mich an die letzten ~12 Turns "
         "(30 Min Timeout). Follow-ups wie 'ja' oder 'und füg X dazu' funktionieren.</i>",
@@ -1363,6 +1480,7 @@ def main():
     app.add_handler(CommandHandler("start", handle_start))
     app.add_handler(CommandHandler("today", handle_today))
     app.add_handler(CommandHandler("reset", handle_reset))
+    app.add_handler(CommandHandler("backup", handle_backup))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
