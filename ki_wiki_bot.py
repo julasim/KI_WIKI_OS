@@ -491,7 +491,10 @@ def edit_file(rel_path: str, find: str, replace: str, regex: bool = False) -> st
             return f"Datei nicht gefunden: {rel_path}"
         content = path.read_text(encoding="utf-8")
         if regex:
-            new, n = re.subn(find, replace, content)
+            try:
+                new, n = re.subn(find, replace, content)
+            except re.error as e:
+                return f"Regex-Syntax-Fehler in '{find[:50]}': {e}"
         else:
             n = content.count(find)
             new = content.replace(find, replace)
@@ -688,7 +691,13 @@ def backup_vault() -> str:
         _run(["git", "config", "user.email", "bot@ki-wiki.local"], cwd=backup_dir)
         _run(["git", "config", "user.name", "KI Wiki Bot"], cwd=backup_dir)
 
-        # Vault-Content rüber
+        # Vault-Content rüber — Pre-Flight: Source muss existieren + Files haben,
+        # sonst würde rsync --delete uns das Backup-Repo leeren
+        if not VAULT.exists() or not VAULT.is_dir():
+            return f"Backup-Abbruch: Vault-Source {VAULT} nicht erreichbar (Mount kaputt?)"
+        if not any(VAULT.iterdir()):
+            return f"Backup-Abbruch: Vault-Source {VAULT} ist leer — nichts zu sichern, schütze gegen Daten-Verlust im Backup."
+
         target = backup_dir / "vault"
         target.mkdir(exist_ok=True)
         r = _run([
@@ -1182,15 +1191,19 @@ Tool nur aufrufen wenn Julius EXPLIZIT Speicher-Intent zeigt:
 | "mach backup" / "sicher das vault" / "git push" | `backup_vault` |
 
 Begrüßung, Smalltalk, Fragen, Statements ohne Speicher-Verb → antworten, **nichts speichern**.
-Mehrdeutiger Input ("Diese", "ja" out-of-context) → **IMMER nachfragen**, nie raten.
 
-# FRAGEN BEANTWORTEN
-- "Was weiß ich über X?" → `search_vault`, antworten mit `[[wikilinks]]`
-- "Was steht heute an?" → `read_file` Daily + Liste offener Tasks
-- File-Inhalt zeigen → `read_file` (Default strip_frontmatter=true), Original-Markdown direkt ausgeben
+**Nachfragen vs. Direkt-Machen** (klare Regel):
+- Mini-Input ohne Kontext ("Diese", "ja", "?", einzelne Wörter) → **nachfragen**, nicht raten.
+- Vollständiger Auftrag mit klarem Speicher-Intent ("speicher: ...", "task: morgen X") → **direkt machen**, kein "wo soll ich das anlegen?"-Loop. Default-Pfade sind im Schema definiert.
+
+# LESEN / FRAGEN BEANTWORTEN
+- "Was weiß ich über X?" → `search_vault`, antworten mit echten `[[id]]` aus Treffern
+- "Was steht heute an?" → `read_file` Daily + offene Tasks aus `list_files`/Frontmatter
+- "Was ist im Vault?" → `list_files()` direkt aufrufen, NICHT 3× zurückfragen "welcher Bereich"
+- File-Inhalt zeigen → `read_file` (Default strip_frontmatter=true), Original-Markdown direkt
   - KEINE Meta-Tabelle "Sektion | Inhalt | (leer)"
-  - Leere Sektionen weglassen, nicht "(leer)" reinschreiben
-  - Navigation-Footer (→ Life-Index) NICHT zeigen
+  - Leere Sektionen weglassen, kein "(leer)" reinschreiben
+  - Kein Navigation-Footer (→ Life-Index) zeigen
 - Lange Files (>2000 Zeichen) zusammenfassen statt roh dumpen
 
 # AUSGABE
@@ -1206,11 +1219,6 @@ Mehrdeutiger Input ("Diese", "ja" out-of-context) → **IMMER nachfragen**, nie 
   - NUR IDs verwenden die du tatsächlich aus search_vault/read_file/list_files kennst.
     Wenn du keine IDs zur Hand hast → KEINE Wikilinks setzen, lieber Klartext.
 - **NIE** HTML-Tags (`<br>`, `<p>`, `<span>`). NIE Frontmatter ausgeben.
-
-**Endlos-Nachfragen vermeiden**: Wenn der User dich beauftragt etwas anzulegen
-(Projekt, Task, Notiz) und keine wesentliche Info fehlt → DIREKT machen + kurz
-bestätigen. Nicht "wo soll ich das anlegen?", "soll ich es so nennen?", "stimmst
-du zu?"-Schleifen führen. Default-Pfade aus dem Schema sind klar definiert.
 
 # DATEN
 - Datum: ISO `YYYY-MM-DD`. "morgen" = +1 Tag, "übermorgen" = +2, "nächsten Montag" → berechnen.
@@ -1230,13 +1238,6 @@ du zu?"-Schleifen führen. Default-Pfade aus dem Schema sind klar definiert.
   und der User danach Tasks anlegt die offensichtlich dazu gehören (z.B. "Kalkulation
   für Schiemer-Angebot" — Schiemer war im Projekt-Kontext erwähnt), dann setze
   AUTOMATISCH `project=sanierung-kiosk` im Task-Frontmatter. Frag nicht nach.
-
-# LESENDE ANFRAGEN
-- "Was steht im Vault?" / "Zeig mir alles" → DIREKT antworten mit Vault-Übersicht
-  (call list_files() ohne Args, oder gib quick stats: Anzahl Tasks/Notes/Projekte).
-  NICHT 3× nachfragen "welcher Bereich?".
-- Wenn User klar einen Überblick will → liefere ihn. Erst nachfragen wenn die Anfrage
-  WIRKLICH mehrdeutig ist (z.B. "show me X" wo X ein Ein-Wort-Code ist).
 """
 
 # ============================================================================
@@ -1905,9 +1906,9 @@ async def handle_backup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 @require_auth
 async def handle_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Setzt Conversation-Memory + pending Deletes zurück."""
-    uid = update.effective_user.id
-    reset_history(uid)
-    PENDING_DELETIONS.pop(uid, None)
+    # Konsistent ALLOWED_USER_ID nutzen — ist single-user-bot
+    reset_history(ALLOWED_USER_ID)
+    PENDING_DELETIONS.pop(ALLOWED_USER_ID, None)
     await update.message.reply_text("🔄 Memory + pending Deletes geleert. Frischer Anfang.")
 
 
