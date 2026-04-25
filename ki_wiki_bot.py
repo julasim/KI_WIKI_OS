@@ -171,24 +171,61 @@ def ensure_daily() -> Path:
 
 VALID_SECTIONS = {"Heute", "Notizen & Gedanken", "Offen / Einsortieren", "Abends"}
 
+# Platzhalter aus dem daily_template, die beim ersten Append entfernt werden sollen
+EMPTY_PLACEHOLDERS = {"- [ ]", "- [x]", "-", "•", "- Was lief gut?", "- Was nehme ich mit?"}
+
+
+def _clean_section_body(body: str) -> str:
+    """Entfernt nur-Platzhalter-Zeilen wenn die Sektion sonst leer wäre."""
+    lines = body.split("\n")
+    real_content = [l for l in lines if l.strip() and l.strip() not in EMPTY_PLACEHOLDERS]
+    if not real_content:
+        return ""  # Sektion war komplett leer (nur Template-Platzhalter)
+    return "\n".join(l for l in lines if l.strip())  # Auch leere Zeilen weg
+
 
 def append_to_daily(section: str, text: str) -> str:
-    """Append text to today's daily under the given section."""
+    """Append text to today's daily under the given section.
+
+    Spezielle Logik: wenn Sektion nur Template-Platzhalter enthält (z.B. '- [ ]'
+    aus daily_template), wird der Platzhalter ersetzt statt zusätzlich gestapelt.
+    """
     if section not in VALID_SECTIONS:
         section = "Notizen & Gedanken"
     path = ensure_daily()
     content = path.read_text(encoding="utf-8")
-    pattern = rf"(^|\n)## {re.escape(section)}\s*\n"
+
+    pattern = rf"(?m)^## {re.escape(section)}\s*$"
     match = re.search(pattern, content)
     if not match:
+        # Sektion existiert nicht → am Ende anhängen
         new_content = content.rstrip() + f"\n\n## {section}\n{text}\n"
     else:
         start = match.end()
-        next_h2 = re.search(r"\n## ", content[start:])
-        insert_at = start + next_h2.start() if next_h2 else len(content.rstrip())
+        next_h2 = re.search(r"^## ", content[start:], re.MULTILINE)
+        end = start + next_h2.start() if next_h2 else len(content)
+
+        # Aktueller Body der Sektion (ohne Header)
+        body_before_h = content[:start]
+        body_section = content[start:end].strip("\n")
+        body_after = content[end:]
+
+        # Body von Platzhaltern bereinigen
+        cleaned = _clean_section_body(body_section)
+
+        # Neuen Text anfügen
+        if cleaned:
+            new_section_body = cleaned + "\n" + text
+        else:
+            new_section_body = text
+
         new_content = (
-            content[:insert_at].rstrip() + f"\n{text}\n\n" + content[insert_at:].lstrip()
+            body_before_h.rstrip("\n")
+            + "\n" + new_section_body
+            + "\n\n"
+            + body_after.lstrip("\n")
         )
+
     post = frontmatter.loads(new_content)
     post["updated"] = today_iso()
     atomic_write(path, frontmatter.dumps(post) + "\n")
@@ -306,13 +343,21 @@ def search_vault(query: str, limit: int = 5) -> str:
         return f"Suche-Fehler: {e}"
 
 
-def read_file(rel_path: str) -> str:
-    """Read a file (relative to vault root). Capped at 8KB."""
+def read_file(rel_path: str, strip_frontmatter: bool = True) -> str:
+    """Read a file (relative to vault root). Capped at 8KB.
+
+    strip_frontmatter=True (default): YAML-Frontmatter wird entfernt für
+    saubere Anzeige. Auf False setzen wenn du Metadaten brauchst.
+    """
     try:
         path = safe_path(rel_path)
         if not path.exists():
             return f"Datei nicht gefunden: {rel_path}"
-        return path.read_text(encoding="utf-8")[:8000]
+        content = path.read_text(encoding="utf-8")
+        if strip_frontmatter:
+            # Frontmatter zwischen --- ... --- am Anfang entfernen
+            content = re.sub(r"^---\n.*?\n---\n+", "", content, count=1, flags=re.DOTALL)
+        return content[:8000]
     except Exception as e:
         return f"Lese-Fehler: {e}"
 
@@ -528,10 +573,18 @@ TOOLS = [
     }},
     {"type": "function", "function": {
         "name": "read_file",
-        "description": "Liest eine Vault-Datei (Pfad relativ zu Vault-Root, z.B. '10_Life/daily/2026-04-22.md').",
+        "description": (
+            "Liest eine Vault-Datei (Pfad relativ zu Vault-Root). "
+            "strip_frontmatter=true (default): YAML-Header wird entfernt — nimm das wenn du "
+            "dem User den Inhalt zeigst. strip_frontmatter=false: kompletter Inhalt inkl. "
+            "Metadaten — nimm das wenn du Frontmatter-Felder brauchst (status, due, etc.)."
+        ),
         "parameters": {
             "type": "object",
-            "properties": {"rel_path": {"type": "string"}},
+            "properties": {
+                "rel_path": {"type": "string"},
+                "strip_frontmatter": {"type": "boolean", "default": True},
+            },
             "required": ["rel_path"],
         },
     }},
@@ -620,15 +673,41 @@ VAULT-STRUKTUR:
 - 01_Raw/articles/              → Externe Quellen (URLs, Artikel)
 
 KLASSIFIZIERUNG VON FREIEM TEXT (wähle GENAU EIN Tool):
-- Klare Aufgabe / Imperativ ("X anrufen", "morgen Y machen") → create_task
-- Reflexion über den Tag / Bewertung → append_to_daily section="Abends"
-- Halbgare Idee, Link, "merken" → append_to_daily section="Offen / Einsortieren"
-- Kurze Notiz/Gedanke (<3 Sätze) → append_to_daily section="Notizen & Gedanken"
-- Längere strukturierte Notiz (>3 Sätze, eigenes Thema) → create_note
-- "X erledigt" / "X ist fertig" → mark_task_done (notfalls erst search_vault)
-- Meeting-Inhalt ("Termin mit X", "Besprechung über Y") → create_meeting
-- URL allein → clip_url
-- Frage nach gespeichertem Wissen → search_vault, dann antworten mit [[wikilinks]]
+
+1. Wenn Input KLAR mehrdeutig ist ("Diese", "Ja", "Hä?", einzelnes Wort ohne Kontext)
+   → ZUERST nachfragen, was gemeint ist. NIE Müll speichern!
+
+2. Klare Aufgabe / Imperativ ("X anrufen", "morgen Y machen", "muss noch Z besorgen")
+   → create_task
+
+3. Reflexion über den Tag / Bewertung ("war ein guter Tag, weil...", "habe gelernt dass...",
+   "Erkenntnis: ...", "rückblickend...")
+   → append_to_daily section="Abends"
+
+4. URL alleinstehend (nur ein Link) → clip_url
+
+5. Längere strukturierte Notiz (>3 Sätze, eigenes Thema, "Idee für …", "Konzept zu …")
+   → create_note
+
+6. Meeting-Inhalt ("Termin mit X war gut, wir haben besprochen...", "Notes vom Meeting")
+   → create_meeting
+
+7. "X erledigt" / "X ist fertig" / "habe X gemacht" → mark_task_done
+   (notfalls vorher search_vault um den richtigen Slug zu finden)
+
+8. Frage nach gespeichertem Wissen ("Was weiß ich über X?", "Zeig mir Y") → search_vault
+   und/oder read_file, dann antworten mit [[wikilinks]] zu den Quellen
+
+9. ALLES ANDERE (kurze Gedanken, Beobachtungen, "heute war/ist/wird...", Notizen ohne klare
+   Kategorie) → append_to_daily section="Notizen & Gedanken"
+   ⚠️ "Offen / Einsortieren" NUR für Sachen die wirklich noch unklar sind ("muss ich mir merken",
+   halbgare Idee, Link mit fragezeichen). Im Zweifel: "Notizen & Gedanken".
+
+WENN DU FILE-INHALT ANZEIGST (z.B. "was steht heute in meiner daily"):
+- read_file mit strip_frontmatter=true (Default) → kein YAML-Header sichtbar
+- Zeige NUR den relevanten Body, nicht den ganzen Footer/Navigation-Kram
+- Bei Daily-Notes: nur die nicht-leeren Sektionen rendern
+- Bei langen Files: Zusammenfassen, nicht roh dumpen
 
 DATUMSANGABEN:
 - "morgen" → +1 Tag ab heute
@@ -878,8 +957,15 @@ def md_to_telegram_html(text: str) -> str:
     # 8) Horizontale Linie (--- oder *** allein auf Zeile)
     text = re.sub(r"^[-*_]{3,}\s*$", "━" * 24, text, flags=re.MULTILINE)
 
-    # 9) Links [text](url)
-    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', text)
+    # 9) Links — Telegram akzeptiert nur absolute URLs in <a href>.
+    # Echte http/https-Links → klickbar. Relative Pfade (../foo.md) → nur Text kursiv,
+    # damit kein doppelter Markdown-Salat in Telegram entsteht.
+    text = re.sub(
+        r"\[([^\]]+)\]\((https?://[^)]+)\)",
+        r'<a href="\2">\1</a>',
+        text,
+    )
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"<i>\1</i>", text)
 
     # 10) Wikilinks [[id]] → kursive Referenz
     text = re.sub(r"\[\[([^\]]+)\]\]", r"<i>[[\1]]</i>", text)
