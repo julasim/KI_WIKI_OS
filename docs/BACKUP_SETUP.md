@@ -1,209 +1,198 @@
 # Backup-Setup
 
-Zwei Optionen, je nach Anspruch. **Default-Empfehlung: Option A (manuell via Telegram).**
+Drei Optionen, von simpel zu robust. Du kannst auch mehrere parallel nutzen.
 
 ---
 
-## Option A — Manueller Backup via `/backup`-Command (empfohlen)
+## Option A — PC-lokal per Script (am einfachsten, empfohlen)
 
-**Du tippst `/backup` in Telegram → Bot pusht Vault in privates GitHub-Repo. Fertig.**
+**Ein PowerShell-Script auf deinem PC zieht das Vault als datierten Ordner runter.**
 
 ### Vorteile
-- ✅ Gratis (GitHub privates Repo)
-- ✅ Du entscheidest wann
-- ✅ Restore: `git clone <repo>` — kannst du schon
-- ✅ Browsing & Diff in der GitHub-Web-UI
-- ✅ Versionierung gratis (jede Push = Snapshot mit Datum)
+- ✅ Maximal simpel: ein Doppelklick = Backup
+- ✅ Auf deiner eigenen Festplatte → keine Cloud, kein Account, keine Kosten
+- ✅ Du entscheidest wann (kein Cron)
+- ✅ Datierte Snapshots → "wie sah's letzten Mittwoch aus?" geht in 5 Sek
+- ✅ Optional .zip + Auto-Cleanup (behält letzte N)
 
 ### Trade-offs
-- ⚠️ **Plain-Text** auf Microsoft-Servern. Wenn du dort sehr persönliche Tagebuch-Inhalte ablegst, Datenschutz-Trade-off (gleicher wie für Code).
-- ⚠️ GitHub empfiehlt <1 GB pro Repo. Bei viel Foto-Anhängen evtl. eng. → dann Option B.
-- ⚠️ Du musst dran denken `/backup` zu drücken (kein Cron). Empfehlung: nach jeder größeren Session.
+- ⚠️ Lokal = wenn dein PC stirbt, Backup auch weg. Kombinier mit Option B/C für off-site.
+- ⚠️ Du musst dran denken zu drücken.
+
+### Setup (Voraussetzung: rclone-Mount läuft, siehe `RCLONE_MOUNT_SETUP.md`)
+
+#### 1. Code auf PC aktualisieren
+
+In PowerShell:
+```powershell
+cd "C:\Users\juliu\OneDrive - Mag. Georg Sima\3_Unternehmen\KI-OS\KI_WIKI_Bot"
+git pull
+```
+
+#### 2. Backup auslösen
+
+**Variante A — Doppelklick:**
+- In `scripts\backup-to-pc.bat` doppelklicken
+- Default: speichert nach `%USERPROFILE%\Documents\Vault-Backups\KI_WIKI_Vault_<timestamp>\`
+
+**Variante B — PowerShell mit Optionen:**
+```powershell
+# Standard (Ordner-Snapshot, behält letzte 10)
+.\scripts\backup-to-pc.ps1
+
+# Komprimiert als .zip
+.\scripts\backup-to-pc.ps1 -Zip
+
+# Eigenes Ziel-Verzeichnis
+.\scripts\backup-to-pc.ps1 -Dest "D:\MyBrain"
+
+# Nur letzte 5 behalten
+.\scripts\backup-to-pc.ps1 -KeepN 5
+
+# Alles kombiniert
+.\scripts\backup-to-pc.ps1 -Dest "D:\Backups" -KeepN 20 -Zip
+```
+
+#### 3. Was du siehst
+
+```
+═══════════════════════════════════════════════
+  Vault-Backup → PC
+═══════════════════════════════════════════════
+Quelle:  vps:/opt/vault/KI_WIKI_Vault
+Ziel:    C:\Users\juliu\Documents\Vault-Backups\KI_WIKI_Vault_2026-04-25_193045
+
+Transferred:    2.3 MiB / 2.3 MiB, 100%, 1.2 MiB/s, ETA 0s
+Transferred:           42 / 42, 100%
+
+✓ Backup fertig
+  Pfad:  C:\Users\juliu\Documents\Vault-Backups\KI_WIKI_Vault_2026-04-25_193045
+  Größe: 2.34 MB
+  MD-Files: 23
+
+Alle Backups in:  C:\Users\juliu\Documents\Vault-Backups
+Name                                   Datum
+----                                   -----
+KI_WIKI_Vault_2026-04-25_193045        2026-04-25 19:30
+KI_WIKI_Vault_2026-04-24_211200        2026-04-24 21:12
+...
+```
+
+### Restore
+
+Backup-Ordner auf machen, Files rauskopieren wohin du willst.
+Oder bei `.zip`: entpacken und Files manuell zurückpacken.
+
+Wenn du ein **komplettes Vault-Restore** auf den VPS machen willst: rsync den Backup-Ordner via SSH zurück nach `/opt/vault/`.
+
+### Verbessern (optional)
+
+**Auto-Backup täglich**: Windows Task Scheduler einrichten, der `backup-to-pc.bat` täglich ausführt. Anleitung wie für rclone-Mount in `RCLONE_MOUNT_SETUP.md`.
+
+---
+
+## Option B — `/backup` in Telegram (off-site, gratis)
+
+**Telegram `/backup` → Bot pusht Vault in privates GitHub-Repo.**
+
+### Vorteile
+- ✅ Off-site (überlebt Hausbrand, Festplatten-Crash etc.)
+- ✅ Gratis (privates GitHub-Repo)
+- ✅ Versionierung gratis (jeder Push = Commit mit Datum)
+- ✅ Browsing in GitHub-UI
+- ✅ Restore: `git clone <repo>`
+
+### Trade-offs
+- ⚠️ Plain-Text auf Microsoft-Servern
+- ⚠️ <1 GB empfohlen, problematisch wenn Vault sehr groß wird
 
 ### Setup (~5 Min)
 
 #### 1. Privates GitHub-Repo erstellen
-
 - github.com → "+" → "New repository"
 - Name: z.B. `KI_WIKI_Vault_Backup`
 - **Private** ✓
-- "Initialize this repository" → **NICHTS ankreuzen** (leer lassen)
-- → "Create repository"
+- Initialize → NICHTS ankreuzen
+- Create
 
-#### 2. Personal Access Token (Fine-grained) erzeugen
+#### 2. Fine-grained PAT erzeugen
+- github.com → Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate
+- Name: `ki-wiki-bot-backup`
+- Repository access: **Only select repositories** → wähle dein Backup-Repo
+- Permissions → **Contents: Read and write**
+- Generate → 🔑 Token sofort kopieren (1× sichtbar)
 
-- github.com → Settings → Developer settings → Personal access tokens → **Fine-grained tokens** → "Generate new token"
-- **Name**: z.B. `ki-wiki-bot-backup`
-- **Resource owner**: dein User
-- **Repository access**: "Only select repositories" → wähle **nur dein Backup-Repo**
-- **Repository permissions** → **Contents**: "Read and write"
-- → "Generate token"
-- 🔑 **Token jetzt kopieren** (wird nur 1× gezeigt — beginnt mit `github_pat_...`)
-
-#### 3. In `.env` auf VPS eintragen
-
+#### 3. .env auf VPS ergänzen
 ```bash
 ssh -i ~/.ssh/vps_ki_wiki root@76.13.10.79
-cd /opt/bot
-nano .env
+cd /opt/bot && nano .env
 ```
 
-Folgendes ergänzen / einfügen:
-
+Ergänzen:
 ```
 GITHUB_BACKUP_REPO=julasim/KI_WIKI_Vault_Backup
 GITHUB_BACKUP_TOKEN=github_pat_xxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ```
 
-Speichern (Ctrl+O, Enter, Ctrl+X). Dann:
-
 ```bash
-docker compose up -d --build   # Container muss neu gebaut werden (git+rsync wurden zur Image hinzugefügt)
+docker compose up -d --build   # Container braucht git+rsync (im Dockerfile drin)
 ```
 
-#### 4. Erstes Backup auslösen
-
-In Telegram:
-
+#### 4. In Telegram triggern
 ```
 /backup
 ```
+oder natürlich-sprachlich: *"mach ein backup"*
 
-Bot antwortet mit:
-- `⏳ Backup läuft...`
-- Dann nach ~10-30 Sek: `✓ Backup gepusht\nRepo: julasim/KI_WIKI_Vault_Backup@a1b2c3d\nFiles: 23 .md\nZeit: 14:32:05`
-
-Auf github.com im Repo siehst du jetzt einen ersten Commit mit dem Vault-Inhalt unter `vault/`.
-
-### Restore
-
-#### Komplett neu auf VPS oder anderem Rechner
-
+### Restore via Git
 ```bash
 git clone https://github.com/julasim/KI_WIKI_Vault_Backup.git ~/restored
 ls ~/restored/vault/
-# alles da
 ```
 
-#### Einzelne Datei zurückholen
-
-GitHub-Web-UI → Repo → File browsen → "..." → "Download" oder "Raw" → kopieren.
-
-Oder via History: jeder Commit ist ein Snapshot. → "Commits" anklicken → gewünschten Stand wählen → "Browse files at this point".
-
-### Wartung
-
-- **Vergessen ist okay**: Wenn du eine Woche lang nicht `/backup` machst, ist nichts kaputt — beim nächsten Push landet einfach alles aktuelle drin.
-- **Nichts geändert seit letztem Backup?** Bot meldet "Keine Änderungen seit letztem Backup."
-- **Token rotieren**: GitHub PAT alle paar Monate neu erstellen, in `.env` ändern, `docker compose restart`.
-
-### Troubleshooting
-
-| Fehler | Ursache | Fix |
-|---|---|---|
-| "Backup nicht konfiguriert" | `.env` Felder fehlen | GITHUB_BACKUP_REPO + GITHUB_BACKUP_TOKEN setzen + restart |
-| "Push-Fehler: Permission denied" | PAT-Permissions falsch | Fine-grained PAT mit Contents=R/W für genau dieses Repo erstellen |
-| "Push-Fehler: Repository not found" | REPO-String falsch | Format ist `username/reponame` ohne `https://` und `.git` |
-| Bot antwortet gar nicht auf `/backup` | Container nicht neu gebaut nach Dockerfile-Update | `docker compose up -d --build` |
-| Push lange & timeout | Repo wurde sehr groß (Bilder etc.) | Migrate zu Option B |
-
 ---
 
-## Option B — Automatischer verschlüsselter Backup via restic + Backblaze B2
+## Option C — Automatisch verschlüsselt (restic + Backblaze B2)
 
-**Für wenn**: dein Vault wächst, du Verschlüsselung willst, oder Cron statt manuell.
+**Cron-basiert, client-seitig verschlüsselt, dedupliziert. Für wenn's ernst wird.**
 
-Setup-Skripte liegen im Repo unter `scripts/install-backup.sh` und `scripts/backup-vault.sh`. Komplette Setup-Anleitung am Ende dieser Datei (siehe Sektion "Option B — Detail").
+Setup-Skripte: `scripts/install-backup.sh` + `scripts/backup-vault.sh`.
 
-Kurzform:
-- ~5 Cent/Monat bei Backblaze B2 für <10 GB
-- Client-seitig AES-256 verschlüsselt (Backblaze sieht nur Blobs)
-- Dedup + Snapshots + Retention-Policy
-- Cron läuft nightly 03:00 UTC
+### Vorteile
+- ✅ Voll automatisch (täglich 03:00 UTC)
+- ✅ AES-256 verschlüsselt (Backblaze sieht nur Blobs)
+- ✅ Dedup + Retention-Policy (7d/4w/6m)
+- ✅ Skaliert auf beliebige Größe (~5 Cent/Mo bei <10 GB)
 
-→ Für die volle Anleitung: `bash scripts/install-backup.sh` ausführen, das Skript führt durch.
+### Trade-offs
+- ⚠️ Setup ~10 Min, B2-Account, Restic-Password im Manager halten
 
----
-
-## Beide kombinieren?
-
-Geht. Manueller Push für "ich will jetzt einen Save-Point" + Restic-Cron für "automatische Versicherung im Hintergrund". Doppelter Boden.
-
----
-
-## Option B — Detail-Anleitung
-
-(Nur lesen wenn du Option B nutzen willst.)
-
-### Was wird gesichert
-- `/opt/vault/` — komplettes Vault inkl. `.obsidian/`
-- `/opt/bot/.env` — Bot-Credentials (verschlüsselt im Backup)
-
-### Setup
-
-#### 1. Backblaze-B2-Account
-- [backblaze.com/cloud-storage](https://www.backblaze.com/cloud-storage)
-- Sign up (10 GB Free Tier ohne Credit Card)
-- Bucket erstellen (Private, kein Encryption, kein Object Lock)
-- Application Key erstellen, Read+Write, restricted to bucket
-- 3 Werte notieren: keyID, applicationKey, Bucket-Name
-
-#### 2. Auf VPS
-
+### Setup-Kurzform
 ```bash
 ssh -i ~/.ssh/vps_ki_wiki root@76.13.10.79
 cd /opt/bot
 bash scripts/install-backup.sh
 ```
+Das Skript fragt B2-Credentials + generiert Restic-Password. Anleitung im Skript-Output.
 
-Skript fragt B2-Credentials + Restic-Password (generiert eins, **JETZT in Passwort-Manager**).
-
-Installiert: restic via apt, /etc/restic.env, /usr/local/bin/backup-vault.sh, Cron-Eintrag.
-
-Macht direkt einen Test-Backup.
-
-#### 3. Verifizieren
-
-```bash
-source /etc/restic.env && restic snapshots
-```
-
-### Restore mit restic
-
+### Restore
 ```bash
 source /etc/restic.env
-
-# Komplett restoren
-restic restore latest --target /tmp/restored
-
-# Einzelne Datei
-restic restore latest --target /tmp/r --include /opt/vault/KI_WIKI_Vault/10_Life/daily/2026-04-22.md
-
-# Browse-Modus (mount)
-restic mount /tmp/restic-browse
-ls /tmp/restic-browse/snapshots/
-# Ctrl+C zum Beenden
-
-# Auf neuem VPS recovern
-apt install restic
-cat > /etc/restic.env <<EOF
-export B2_ACCOUNT_ID="<deine keyID>"
-export B2_ACCOUNT_KEY="<dein appKey>"
-export RESTIC_REPOSITORY="b2:<dein-bucket>:vault"
-export RESTIC_PASSWORD="<dein password aus dem manager>"
-EOF
-chmod 600 /etc/restic.env && source /etc/restic.env
-restic restore latest --target /
+restic snapshots                                  # alle anzeigen
+restic restore latest --target /tmp/restored      # latest restoren
+restic mount /tmp/browse                          # snapshots als Mount durchstöbern
 ```
 
-### Sicherheit
-- **Restic-Password** ist alleinige Schlüssel zur Entschlüsselung. Verlust = Backups nutzlos.
-- Application Key restricted-to-bucket, kein Master-Key.
-- `/etc/restic.env` chmod 600.
+Disaster Recovery auf neuem VPS: siehe Vorgängerversion dieser Doku im Git-History.
 
-### Kosten
-| Vault-Größe | B2-Kosten/Monat |
+---
+
+## Welche soll ich nehmen?
+
+| Szenario | Empfehlung |
 |---|---|
-| 1 GB | ~$0.005 |
-| 10 GB | ~$0.05 (Free Tier) |
-| 50 GB | ~$0.25 |
+| **Erstmal "irgendwas haben"** | Option A (PC-lokal) — 5 Min, kein Account, fertig |
+| **Off-site dazu** | Option A + B parallel — PC-lokal regelmäßig, GitHub gelegentlich |
+| **"Production-Grade"** | Option C (restic) — wenn das Vault wirklich kritisch wird |
+
+Doppelter Boden ist immer gut: ein **lokales Backup** + ein **off-site Backup**. Die einfachste Kombi: A + B, Aufwand insgesamt 10 Min.
