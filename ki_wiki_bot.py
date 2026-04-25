@@ -597,7 +597,11 @@ def backup_vault() -> str:
                 "GITHUB_BACKUP_TOKEN in /opt/bot/.env, dann docker compose restart.")
 
     backup_dir = Path("/vault-backup")
-    repo_url = f"https://x-access-token:{token}@github.com/{repo}.git"
+    # Token URL-encodieren falls Sonderzeichen drin (defensive — GitHub-PATs sind
+    # zwar normalerweise ASCII-alphanumerisch, aber sicher ist sicher)
+    from urllib.parse import quote
+    safe_token = quote(token, safe="")
+    repo_url = f"https://x-access-token:{safe_token}@github.com/{repo}.git"
 
     def _run(cmd, cwd=None, env_extra=None):
         env = os.environ.copy()
@@ -1531,7 +1535,12 @@ def compute_briefing() -> str:
 
     Inhalt: Datum, überfällige Tasks, heute geplant (aus Daily 'Heute'),
     offene Tasks (sortiert nach Prio), gestern Abends-Reflexion.
+    Bei fundamentalen Problemen (Vault nicht erreichbar) → klare Fehlermeldung.
     """
+    # Vault-Reachability-Check
+    if not VAULT.exists() or not VAULT.is_dir():
+        return f"❌ <b>Briefing fehlgeschlagen</b>\nVault unter <code>{VAULT}</code> nicht erreichbar.\nMount oder Container-Volume prüfen."
+
     today = today_iso()
     yesterday = (date.today() - timedelta(days=1)).isoformat()
 
@@ -1626,6 +1635,15 @@ async def daily_briefing_job(ctx: ContextTypes.DEFAULT_TYPE):
         log.info(f"Daily briefing sent to {ALLOWED_USER_ID}")
     except Exception as e:
         log.exception(f"daily_briefing_job failed: {e}")
+        # Versuche zumindest eine Fehler-Notification zu schicken
+        try:
+            await ctx.bot.send_message(
+                chat_id=ALLOWED_USER_ID,
+                text=f"⚠️ Daily-Briefing-Fehler: {type(e).__name__}\n<code>{_esc_html(str(e))[:300]}</code>",
+                parse_mode=constants.ParseMode.HTML,
+            )
+        except Exception:
+            pass
 
 
 @require_auth

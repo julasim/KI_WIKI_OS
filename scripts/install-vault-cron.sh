@@ -29,7 +29,7 @@ fi
 # Cron-Eintrag: nightly 02:30 UTC
 cat > "$CRON_FILE" <<EOF
 # Vault-Toolkit Health-Check — nightly 02:30
-30 2 * * * root cd $VAULT_PATH && python3 07_Tools/vault_toolkit.py health >> $LOG_FILE 2>&1
+30 2 * * * root cd "$VAULT_PATH" && python3 07_Tools/vault_toolkit.py health >> "$LOG_FILE" 2>&1
 EOF
 chmod 644 "$CRON_FILE"
 echo "✓ Cron-Eintrag: $CRON_FILE"

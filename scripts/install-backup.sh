@@ -21,12 +21,17 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-# ─── Check restic ───
+# ─── Check restic + openssl ───
 if ! command -v restic >/dev/null 2>&1; then
     echo "Installiere restic..."
     apt-get update -qq && apt-get install -y -qq restic
 fi
 echo "✓ restic: $(restic version | head -1)"
+
+if ! command -v openssl >/dev/null 2>&1; then
+    echo "Installiere openssl (für Password-Generierung)..."
+    apt-get update -qq && apt-get install -y -qq openssl
+fi
 
 # ─── Existierende Config? ───
 if [ -f "$ENV_FILE" ]; then
