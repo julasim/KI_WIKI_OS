@@ -721,9 +721,38 @@ MEHRDEUTIG: NIEMALS RATEN
 
 WENN DU FILE-INHALT ANZEIGST:
 - read_file (default strip_frontmatter=true) → kein YAML-Header
-- Zeige nur den relevanten Body, nicht Footer/Navigation
-- Bei Daily-Notes: nur nicht-leere Sektionen rendern
-- Bei langen Files: zusammenfassen, nicht roh dumpen
+- ZEIGE DEN INHALT DIREKT IM ORIGINAL-MARKDOWN. Keine Meta-Tabelle bauen!
+- Wenn Daily komplett leer: einfach sagen "Heutige Daily ist leer" + 1 Satz, KEIN
+  Inhalts-Dump erzwingen.
+- Wenn Sektionen leer sind: weglassen statt "(leer)" reinschreiben.
+- Bei langen Files (>2000 Zeichen): zusammenfassen statt roh dumpen.
+- KEIN Navigation-Footer (→ [Life-Index]...) zeigen.
+
+WIKILINK-REGELN:
+- Format: [[id]] — wobei id der `id`-Wert aus dem Frontmatter ist, NICHT der Pfad.
+- Daily: [[daily-2026-04-25]], NICHT [[10_Life/daily/2026-04-25.md]]
+- Task:  [[t-dachboden-saugen]], NICHT [[10_Life/tasks/dachboden-saugen.md]]
+- Wenn du den ID nicht kennst: weglassen ODER read_file um ihn zu lesen.
+
+NIEMALS:
+- HTML-Tags wie <br>, <p>, <span> in deinen Antworten. Nur Markdown.
+- Frontmatter (--- ... ---) ausgeben.
+- Lange Wikilinks mit Pfaden + Endung (.md).
+- Meta-Beschreibungen statt Originalinhalt ("Liste von offenen Tasks, momentan leer").
+
+BEISPIEL — User fragt "Was steht im heutigen Daily?":
+SCHLECHT:
+| Sektion | Inhalt |
+| Heute   | (leer) |
+GUT:
+"Heutige Daily ist noch leer — keine Einträge in Heute, Notizen, Offen oder Abends."
+
+ODER wenn was drin ist:
+"### Heute
+- [ ] Schreibtisch zeichnen
+
+### Notizen & Gedanken
+War heute am Dachboden, viel geschafft."
 
 DATUMSANGABEN:
 - "morgen" → +1 Tag ab heute
@@ -983,8 +1012,9 @@ def md_to_telegram_html(text: str) -> str:
     )
     text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"<i>\1</i>", text)
 
-    # 10) Wikilinks [[id]] → kursive Referenz
-    text = re.sub(r"\[\[([^\]]+)\]\]", r"<i>[[\1]]</i>", text)
+    # 10) Wikilinks [[id]] → in <code> einpacken damit Telegram nicht auto-linkt
+    # (z.B. wenn id "2026-04-25.md" enthält, würde Telegram .md → URL machen)
+    text = re.sub(r"\[\[([^\]]+)\]\]", r"<code>[[\1]]</code>", text)
 
     # 11) Bullet-Listen mit Indentation → Unicode • mit erhaltener Einrückung
     def _bullet_repl(m):
