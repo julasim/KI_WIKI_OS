@@ -150,6 +150,22 @@ def load_template(name: str) -> str:
     return (TEMPLATES_DIR / f"{name}_template.md").read_text(encoding="utf-8")
 
 
+def ocr_image(image_path: Path) -> str:
+    """OCR via Tesseract (deutsch+englisch). Leerer String wenn nichts erkennbar."""
+    try:
+        import pytesseract  # type: ignore
+        from PIL import Image  # type: ignore
+    except ImportError:
+        return ""
+    try:
+        img = Image.open(str(image_path))
+        text = pytesseract.image_to_string(img, lang="deu+eng").strip()
+        return text
+    except Exception as e:
+        log.warning(f"OCR failed for {image_path}: {e}")
+        return ""
+
+
 def extract_pdf_text(pdf_path: Path, max_pages: int = 200) -> tuple:
     """Extrahiert Text + Metadaten aus PDF via pymupdf.
 
@@ -1338,15 +1354,32 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             max_tokens=300,
         )
         vision_caption = (vision_resp.choices[0].message.content or "(keine Beschreibung)").strip()
-        # Link in Daily
-        link_block = f"![[{filename}]] — {vision_caption}"
+
+        # OCR (Tesseract) — parallel zur Vision-Caption, macht Bild-Text suchbar
+        ocr_text = await asyncio.to_thread(ocr_image, save_path)
+        ocr_text = ocr_text.strip()
+        # Sehr kurze OCR-Ergebnisse (<10 Zeichen) sind meist Rauschen
+        ocr_block = ""
+        if len(ocr_text) >= 10:
+            # Auf 800 Zeichen begrenzen für Daily-Eintrag, voller Text bleibt im File-Namen referenzierbar
+            ocr_truncated = ocr_text[:800] + ("..." if len(ocr_text) > 800 else "")
+            ocr_block = f"\n  *OCR*:\n  > {ocr_truncated}"
+
+        # Link in Daily — mit Vision-Caption + OCR (falls was erkannt)
         if user_caption:
-            link_block = f"![[{filename}]] — {user_caption}\n  *Vision*: {vision_caption}"
+            link_block = f"![[{filename}]] — {user_caption}\n  *Vision*: {vision_caption}{ocr_block}"
+        else:
+            link_block = f"![[{filename}]] — {vision_caption}{ocr_block}"
         try:
             append_to_daily("Notizen & Gedanken", link_block)
         except Exception as e:
             log.warning(f"Daily-Link für Photo fehlgeschlagen: {e}")
-        await update.message.reply_text(f"🖼 {filename}\n{vision_caption}")
+
+        # Reply
+        reply = f"🖼 {filename}\n\n<b>Vision</b>: {_esc_html(vision_caption)}"
+        if ocr_text:
+            reply += f"\n\n<b>OCR</b> ({len(ocr_text)} Zeichen):\n<pre><code>{_esc_html(ocr_text[:1500])}</code></pre>"
+        await update.message.reply_text(reply, parse_mode=constants.ParseMode.HTML)
     except Exception as e:
         log.exception("photo handler failed")
         await update.message.reply_text(f"Photo-Fehler: {e}")
@@ -1529,7 +1562,7 @@ async def handle_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "• \"lösche X\" → fragt nach Bestätigung\n\n"
         "<b>Multimedia:</b>\n"
         "🎤 Sprachnachricht → transkribiert + sortiert\n"
-        "🖼 Foto → in 09_Attachments + Vision-Caption\n"
+        "🖼 Foto → in 09_Attachments + Vision-Caption + OCR (Tesseract de+en)\n"
         "📄 .md/.txt → in 01_Raw/uploads/\n"
         "📑 .pdf → in 01_Raw/papers/ + Volltext-Extraktion + .md-Wrapper für Suche\n"
         "📎 sonstige Files → in 09_Attachments\n"

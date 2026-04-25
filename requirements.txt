@@ -4,3 +4,5 @@ faster-whisper>=1.0
 trafilatura>=1.6
 python-frontmatter>=1.1
 pymupdf>=1.24
+pytesseract>=0.3.10
+Pillow>=10.0

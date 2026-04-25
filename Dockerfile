@@ -1,10 +1,14 @@
 FROM python:3.12-slim
 
-# ffmpeg für Whisper, git+rsync für Backup-Tool
+# ffmpeg für Whisper, git+rsync für Backup-Tool,
+# tesseract+deutsch+englisch für OCR auf Fotos
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     git \
     rsync \
+    tesseract-ocr \
+    tesseract-ocr-deu \
+    tesseract-ocr-eng \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
