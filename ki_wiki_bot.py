@@ -681,6 +681,87 @@ def backup_vault() -> str:
         return f"Backup-Fehler: {e}"
 
 
+def create_project(name: str, description: str = "", area: Optional[str] = None) -> str:
+    """Legt einen neuen Projekt-Ordner unter 10_Life/projects/<slug>/ an.
+
+    Erzeugt Ordner + README.md mit Dataview-Queries die alle Tasks/Notes mit
+    'project: <slug>' im Frontmatter sammeln. So können Files weiterhin in den
+    Standard-Ordnern (10_Life/tasks/, /notes/) liegen, sind aber im Projekt-
+    Container automatisch gelistet.
+    """
+    if not name or not name.strip():
+        return "Fehler: Projekt-Name darf nicht leer sein."
+    slug = slugify(name)
+    if not slug or slug == "untitled":
+        return f"Fehler: Slug aus '{name}' nicht ableitbar — bitte aussagekräftigeren Namen wählen."
+
+    projects_root = LIFE / "projects"
+    projects_root.mkdir(parents=True, exist_ok=True)
+    proj_dir = projects_root / slug
+
+    if proj_dir.exists():
+        return f"Projekt existiert bereits: [[project-{slug}]] (10_Life/projects/{slug}/)"
+
+    proj_dir.mkdir(parents=True, exist_ok=False)
+    readme_path = proj_dir / "README.md"
+    today = today_iso()
+
+    desc_block = description.strip() if description else f"Projekt-Container für **{name}**. Tasks/Notes mit `project: {slug}` im Frontmatter werden hier automatisch gelistet."
+
+    body = f"""# {name}
+
+{desc_block}
+
+## Status
+- **Status**: active
+- **Gestartet**: {today}{chr(10) + f"- **Area**: [[{area}]]" if area else ""}
+
+## Offene Tasks
+```dataview
+TABLE WITHOUT ID file.link AS Task, priority AS Prio, due AS Fällig
+FROM "10_Life/tasks"
+WHERE project = "{slug}" AND status != "done" AND status != "cancelled"
+SORT priority DESC, due ASC
+```
+
+## Notizen
+```dataview
+LIST
+FROM "10_Life/notes"
+WHERE project = "{slug}"
+SORT file.ctime DESC
+```
+
+## Meetings
+```dataview
+TABLE WITHOUT ID file.link AS Meeting, date AS Datum
+FROM "10_Life/meetings"
+WHERE project = "{slug}"
+SORT date DESC
+```
+
+## Log
+- {today}: Projekt angelegt
+"""
+
+    post_data = {
+        "id": f"project-{slug}",
+        "title": name,
+        "type": "project",
+        "started": today,
+        "status": "active",
+        "tags": [],
+    }
+    if area:
+        post_data["area"] = area
+    post = frontmatter.Post(body, **post_data)
+    atomic_write(readme_path, frontmatter.dumps(post) + "\n")
+
+    return (f"✓ Projekt angelegt: [[project-{slug}]]\n"
+            f"Ordner: `10_Life/projects/{slug}/`\n"
+            f"Tipp: Tasks/Notes mit `project: {slug}` werden automatisch im Projekt-README gelistet.")
+
+
 def list_files(rel_dir: str = "") -> str:
     """Liste alle .md-Files in einem Vault-Unterordner.
 
@@ -911,6 +992,26 @@ TOOLS = [
         },
     }},
     {"type": "function", "function": {
+        "name": "create_project",
+        "description": (
+            "Legt einen neuen Projekt-Ordner unter 10_Life/projects/<slug>/ an. "
+            "Erzeugt Folder + README.md mit Dataview-Queries für zugehörige "
+            "Tasks/Notes/Meetings (gefiltert via project=<slug> Frontmatter). "
+            "Nutze wenn User 'lege ein Projekt an', 'neues Projekt: ...' o.ä. sagt. "
+            "WICHTIG: dieses Tool legt den Ordner UND die README-Datei direkt an — "
+            "nicht erst fragen, dann ankündigen, dann nochmal fragen. Direkt machen."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Projekt-Name, wird zu Slug umgewandelt"},
+                "description": {"type": "string", "description": "Optional: kurze Beschreibung fürs README"},
+                "area": {"type": "string", "description": "Optional: zugehörige Area-ID"},
+            },
+            "required": ["name"],
+        },
+    }},
+    {"type": "function", "function": {
         "name": "backup_vault",
         "description": (
             "Manuelles Backup: pusht das gesamte Vault in das konfigurierte private "
@@ -936,6 +1037,7 @@ TOOL_HANDLERS = {
     "confirm_delete": confirm_delete,
     "cancel_delete": cancel_delete,
     "list_files": list_files,
+    "create_project": create_project,
     "backup_vault": backup_vault,
 }
 
@@ -970,6 +1072,7 @@ Tool nur aufrufen wenn Julius EXPLIZIT Speicher-Intent zeigt:
 | "lösche alle X" / "leere Y" | erst `list_files` für Verzeichnis, dann `request_delete` mit ALLEN Pfaden als Liste |
 | "ja / bestätigt / machs" nach request_delete | `confirm_delete` |
 | "nein / abbrechen" nach request_delete | `cancel_delete` |
+| "lege ein Projekt an" / "neues Projekt: ..." | `create_project` (legt Ordner + README direkt an, NICHT erst nachfragen wo) |
 | "mach backup" / "sicher das vault" / "git push" | `backup_vault` |
 
 Begrüßung, Smalltalk, Fragen, Statements ohne Speicher-Verb → antworten, **nichts speichern**.
@@ -992,8 +1095,16 @@ Mehrdeutiger Input ("Diese", "ja" out-of-context) → **IMMER nachfragen**, nie 
 - Format frei wählen — Tabellen für Vergleiche, Bullets für Listen, Code-Blöcke für Code/Pfade,
   **bold** für Schlüsselbegriffe, *italic* für Betonung, ## Headings nur bei langen Antworten.
 - **Wikilinks**: `[[id]]` mit `id` aus dem Frontmatter (z.B. `[[daily-2026-04-25]]`, `[[t-foo]]`).
-  NIE Filepath wie `[[10_Life/daily/2026-04-25.md]]`.
+  - NIE Filepath wie `[[10_Life/daily/2026-04-25.md]]`
+  - NIE Beispiel-Platzhalter wie `[[t-example]]`, `[[wiki-example]]`, `[[id]]`, `[[file-name]]`
+  - NUR IDs verwenden die du tatsächlich aus search_vault/read_file/list_files kennst.
+    Wenn du keine IDs zur Hand hast → KEINE Wikilinks setzen, lieber Klartext.
 - **NIE** HTML-Tags (`<br>`, `<p>`, `<span>`). NIE Frontmatter ausgeben.
+
+**Endlos-Nachfragen vermeiden**: Wenn der User dich beauftragt etwas anzulegen
+(Projekt, Task, Notiz) und keine wesentliche Info fehlt → DIREKT machen + kurz
+bestätigen. Nicht "wo soll ich das anlegen?", "soll ich es so nennen?", "stimmst
+du zu?"-Schleifen führen. Default-Pfade aus dem Schema sind klar definiert.
 
 # DATEN
 - Datum: ISO `YYYY-MM-DD`. "morgen" = +1 Tag, "übermorgen" = +2, "nächsten Montag" → berechnen.
