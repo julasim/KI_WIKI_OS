@@ -150,6 +150,44 @@ def load_template(name: str) -> str:
     return (TEMPLATES_DIR / f"{name}_template.md").read_text(encoding="utf-8")
 
 
+def extract_pdf_text(pdf_path: Path, max_pages: int = 200) -> tuple:
+    """Extrahiert Text + Metadaten aus PDF via pymupdf.
+
+    Returns: (text, metadata_dict, total_pages)
+    metadata_dict hat title, author, subject, keywords (alle optional).
+    Bei sehr großen PDFs werden nur die ersten max_pages extrahiert.
+    """
+    try:
+        import pymupdf  # type: ignore
+    except ImportError:
+        return "(pymupdf nicht installiert)", {}, 0
+
+    try:
+        doc = pymupdf.open(str(pdf_path))
+        total = doc.page_count
+        pages_to_read = min(total, max_pages)
+
+        text_parts = []
+        for i in range(pages_to_read):
+            page_text = doc[i].get_text("text")
+            if page_text.strip():
+                text_parts.append(f"\n## Seite {i+1}\n\n{page_text.strip()}")
+
+        if total > max_pages:
+            text_parts.append(
+                f"\n\n_(PDF hat {total} Seiten, nur die ersten {max_pages} extrahiert)_"
+            )
+
+        meta_raw = doc.metadata or {}
+        meta = {k: (meta_raw.get(k) or "").strip() for k in ("title", "author", "subject", "keywords")}
+        doc.close()
+
+        return ("\n".join(text_parts).strip() or "(kein Text extrahiert)", meta, total)
+    except Exception as e:
+        log.exception(f"PDF extract failed for {pdf_path}")
+        return f"(Extraktions-Fehler: {e})", {}, 0
+
+
 # ============================================================================
 # Tool implementations
 # ============================================================================
@@ -1370,18 +1408,64 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 body_preview = "(Inhalt nicht lesbar)"
 
+        # PDF-Sonderfall: Text extrahieren + .md-Wrapper anlegen
+        wrapper_link = None
+        pdf_extra = ""
+        if ext == ".pdf":
+            await update.message.chat.send_action(constants.ChatAction.TYPING)
+            pdf_text, pdf_meta, total_pages = await asyncio.to_thread(extract_pdf_text, dest)
+            pdf_title = pdf_meta.get("title") or Path(filename).stem
+            pdf_author = pdf_meta.get("author") or "unknown"
+
+            # .md-Sibling anlegen → wird volltext-suchbar via vault_search.py
+            md_path = dest.with_suffix(".md")
+            n = 1
+            while md_path.exists():
+                md_path = dest.with_name(f"{dest.stem}-{n}.md")
+                n += 1
+
+            md_id = slugify(f"paper-{pdf_title}")
+            md_body = (
+                f"# {pdf_title}\n\n"
+                f"📎 [Original PDF: {dest.name}](./{dest.name})\n\n"
+                f"**Autor**: {pdf_author} · **Seiten**: {total_pages}"
+                + (f" · **Subject**: {pdf_meta['subject']}" if pdf_meta.get('subject') else "")
+                + "\n\n---\n\n"
+                + (pdf_text or "(Text-Extraktion ergab keinen Inhalt)")
+            )
+            md_post = frontmatter.Post(
+                md_body,
+                id=md_id,
+                title=pdf_title,
+                type="paper",
+                source=str(dest.relative_to(VAULT)),
+                author=pdf_author,
+                captured=today_iso(),
+                pages=total_pages,
+                tags=[],
+            )
+            atomic_write(md_path, frontmatter.dumps(md_post) + "\n")
+
+            wrapper_link = md_path.relative_to(VAULT)
+            body_preview = pdf_text[:1500] if pdf_text else ""
+            pdf_extra = f"\n📑 Wrapper: <code>{wrapper_link}</code> ({total_pages} S., id <code>{md_id}</code>)"
+
         # Eintrag in heutige Daily
         try:
-            link_text = (
-                f"📄 Datei hochgeladen: <code>{rel}</code>"
-                + (f" — {user_caption}" if user_caption else "")
-            )
+            if wrapper_link:
+                link_text = f"📄 PDF hochgeladen: <code>{rel}</code> → durchsuchbar als [[{md_id}]]"
+            else:
+                link_text = f"📄 Datei hochgeladen: <code>{rel}</code>"
+            if user_caption:
+                link_text += f" — {user_caption}"
             append_to_daily("Notizen & Gedanken", link_text)
         except Exception as e:
             log.warning(f"Daily-Link fuer Document fehlgeschlagen: {e}")
 
         # Antwort an User
         reply = f"📄 <b>{kind}</b> gespeichert: <code>{rel}</code>"
+        if pdf_extra:
+            reply += pdf_extra
         if user_caption:
             reply += f"\n<i>{user_caption}</i>"
         if body_preview:
@@ -1446,7 +1530,9 @@ async def handle_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "<b>Multimedia:</b>\n"
         "🎤 Sprachnachricht → transkribiert + sortiert\n"
         "🖼 Foto → in 09_Attachments + Vision-Caption\n"
-        "📄 Datei (.md/.txt/.pdf/...) → in 01_Raw bzw. 09_Attachments\n"
+        "📄 .md/.txt → in 01_Raw/uploads/\n"
+        "📑 .pdf → in 01_Raw/papers/ + Volltext-Extraktion + .md-Wrapper für Suche\n"
+        "📎 sonstige Files → in 09_Attachments\n"
         "🔗 URL allein → fragt ob clippen\n\n"
         "<b>Commands:</b>\n"
         "/today — heutige Daily anzeigen\n"
