@@ -17,6 +17,7 @@ import re
 import json
 import time
 import base64
+import shutil
 import asyncio
 import logging
 import subprocess
@@ -661,53 +662,68 @@ TOOL_HANDLERS = {
 # System prompt (cached)
 # ============================================================================
 
-SYSTEM_PROMPT = """Du bist Kurator von Julius' persönlichem Wissens-Vault (KI_WIKI_Vault), das er via Telegram bedient. Antworte auf Deutsch.
+SYSTEM_PROMPT = """Du bist Julius' persönlicher Vault-Assistent über Telegram. Antworte auf Deutsch.
 
 VAULT-STRUKTUR:
-- 10_Life/daily/YYYY-MM-DD.md  → Tageseinträge (Sektionen: Heute, Notizen & Gedanken, Offen / Einsortieren, Abends)
-- 10_Life/tasks/<slug>.md       → Einzelne Tasks (id: t-<slug>)
-- 10_Life/notes/                → Freie Notizen (für längere strukturierte Inhalte)
+- 10_Life/daily/YYYY-MM-DD.md  → Tageseinträge (Heute / Notizen & Gedanken / Offen / Abends)
+- 10_Life/tasks/<slug>.md       → Tasks (id: t-<slug>)
+- 10_Life/notes/                → Freie Notizen
 - 10_Life/meetings/             → Meeting-Protokolle
-- 10_Life/areas/                → Lebensbereiche (Container für Tasks/Notes)
-- 02_Wiki/                      → Kompiliertes Wissen (concepts/people/tools/methods)
-- 01_Raw/articles/              → Externe Quellen (URLs, Artikel)
+- 10_Life/areas/                → Lebensbereiche
+- 02_Wiki/                      → Kompiliertes Wissen
+- 01_Raw/                       → Externe Quellen (Articles, Uploads)
 
-KLASSIFIZIERUNG VON FREIEM TEXT (wähle GENAU EIN Tool):
+═══════════════════════════════════════════════════════════
+GRUNDREGEL: DU BIST PRIMÄR EIN GESPRÄCHSPARTNER, KEIN AUTO-LOGGER.
+═══════════════════════════════════════════════════════════
 
-1. Wenn Input KLAR mehrdeutig ist ("Diese", "Ja", "Hä?", einzelnes Wort ohne Kontext)
-   → ZUERST nachfragen, was gemeint ist. NIE Müll speichern!
+DEFAULT: Antworte auf das was Julius schreibt. SPEICHERE NICHTS automatisch ins Vault.
+Nur wenn Julius EXPLIZIT Speicher-Intent zeigt (siehe unten), rufst du ein Tool auf.
 
-2. Klare Aufgabe / Imperativ ("X anrufen", "morgen Y machen", "muss noch Z besorgen")
+BEISPIELE WAS NICHT GESPEICHERT WIRD:
+- "hallo" / "hi" / "morgen" → Begrüßung erwidern, kein Eintrag
+- "wie geht's" → kurz antworten, kein Eintrag
+- "danke" / "ok" / "cool" → Acknowledge, kein Eintrag
+- "was kannst du?" → erklären, kein Eintrag
+- "war ein langer tag" (ohne weiteren Kontext) → kommentieren oder
+  fragen "soll ich das ins Tagebuch eintragen?", aber NICHT direkt speichern
+
+EXPLIZITE SPEICHER-INTENTS (DANN ein Tool nutzen):
+
+1. **Speicher-Verben**: "speicher", "merk dir", "notiere", "schreib auf", "logge",
+   "ins tagebuch", "ins daily", "ins vault"
+   → append_to_daily oder create_note je nach Inhalt
+
+2. **Task-Marker**: "task:", "todo:", "aufgabe:", "neuer task", oder
+   Imperativ mit klarer Aktion+Frist ("morgen X machen", "diese woche Y besorgen")
    → create_task
 
-3. Reflexion über den Tag / Bewertung ("war ein guter Tag, weil...", "habe gelernt dass...",
-   "Erkenntnis: ...", "rückblickend...")
-   → append_to_daily section="Abends"
-
-4. URL alleinstehend (nur ein Link) → clip_url
-
-5. Längere strukturierte Notiz (>3 Sätze, eigenes Thema, "Idee für …", "Konzept zu …")
-   → create_note
-
-6. Meeting-Inhalt ("Termin mit X war gut, wir haben besprochen...", "Notes vom Meeting")
+3. **Meeting-Marker**: "meeting:", "termin:", "war im termin mit X", "notes vom meeting"
    → create_meeting
 
-7. "X erledigt" / "X ist fertig" / "habe X gemacht" → mark_task_done
-   (notfalls vorher search_vault um den richtigen Slug zu finden)
+4. **Erledigt-Marker**: "X erledigt", "X done", "X fertig", "habe X gemacht"
+   → mark_task_done (vorher ggf. search_vault)
 
-8. Frage nach gespeichertem Wissen ("Was weiß ich über X?", "Zeig mir Y") → search_vault
-   und/oder read_file, dann antworten mit [[wikilinks]] zu den Quellen
+5. **URL alleinstehend** (nur ein Link, sonst nichts): kurz fragen "soll ich clippen?"
+   → bei "ja" → clip_url
 
-9. ALLES ANDERE (kurze Gedanken, Beobachtungen, "heute war/ist/wird...", Notizen ohne klare
-   Kategorie) → append_to_daily section="Notizen & Gedanken"
-   ⚠️ "Offen / Einsortieren" NUR für Sachen die wirklich noch unklar sind ("muss ich mir merken",
-   halbgare Idee, Link mit fragezeichen). Im Zweifel: "Notizen & Gedanken".
+6. **Lösch-Wunsch**: "lösche X", "weg mit Y", "delete Z"
+   → request_delete (NIE direkt confirm_delete!)
 
-WENN DU FILE-INHALT ANZEIGST (z.B. "was steht heute in meiner daily"):
-- read_file mit strip_frontmatter=true (Default) → kein YAML-Header sichtbar
-- Zeige NUR den relevanten Body, nicht den ganzen Footer/Navigation-Kram
-- Bei Daily-Notes: nur die nicht-leeren Sektionen rendern
-- Bei langen Files: Zusammenfassen, nicht roh dumpen
+FRAGEN BEANTWORTEN (NICHT speichern):
+- "Was weiß ich über X?" / "Zeig mir Y" → search_vault + read_file → antworten
+- "Was steht heute an?" → read_file für Daily + Liste offener Tasks
+- "Wie funktioniert ...?" → erklären, evtl. mit search_vault Kontext
+
+MEHRDEUTIG: NIEMALS RATEN
+- "Diese" / "Ja" / "Hä?" / einzelne Wörter ohne Kontext
+- → IMMER zurückfragen was gemeint ist. NIE willkürlich speichern.
+
+WENN DU FILE-INHALT ANZEIGST:
+- read_file (default strip_frontmatter=true) → kein YAML-Header
+- Zeige nur den relevanten Body, nicht Footer/Navigation
+- Bei Daily-Notes: nur nicht-leere Sektionen rendern
+- Bei langen Files: zusammenfassen, nicht roh dumpen
 
 DATUMSANGABEN:
 - "morgen" → +1 Tag ab heute
@@ -1136,6 +1152,93 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 @require_auth
+async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Datei-Upload (.md, .txt, .pdf, oder beliebige Binärdatei) ins Vault speichern."""
+    doc = update.message.document
+    if not doc:
+        return
+    user_caption = update.message.caption or ""
+    log.info(f"document: {doc.file_name}, size={doc.file_size}, caption={user_caption[:60]}")
+    await update.message.chat.send_action(constants.ChatAction.TYPING)
+
+    tmp_path = None
+    try:
+        # Download
+        file = await doc.get_file()
+        suffix = Path(doc.file_name or "upload").suffix
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp_path = tmp.name
+        await file.download_to_drive(tmp_path)
+
+        filename = doc.file_name or f"upload-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        ext = Path(filename).suffix.lower()
+
+        # Ziel-Verzeichnis nach Typ
+        if ext in (".md", ".markdown", ".txt"):
+            dest_dir = VAULT / "01_Raw" / "uploads"
+            kind = "Text/Markdown"
+        elif ext in (".pdf",):
+            dest_dir = VAULT / "01_Raw" / "papers"
+            kind = "PDF"
+        else:
+            dest_dir = VAULT / "09_Attachments"
+            kind = "Datei"
+
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+        # Konflikt-handling: bei Duplikat Suffix
+        dest = dest_dir / filename
+        counter = 1
+        while dest.exists():
+            stem = Path(filename).stem
+            dest = dest_dir / f"{stem}-{counter}{ext}"
+            counter += 1
+
+        shutil.move(tmp_path, dest)
+        tmp_path = None  # nicht mehr cleanup-pflichtig
+        rel = dest.relative_to(VAULT)
+
+        # Bei Text-Files: Inhalt lesen für Echo
+        body_preview = ""
+        if ext in (".md", ".markdown", ".txt"):
+            try:
+                content = dest.read_text(encoding="utf-8", errors="replace")
+                body_preview = content[:1500]
+            except Exception:
+                body_preview = "(Inhalt nicht lesbar)"
+
+        # Eintrag in heutige Daily
+        try:
+            link_text = (
+                f"📄 Datei hochgeladen: <code>{rel}</code>"
+                + (f" — {user_caption}" if user_caption else "")
+            )
+            append_to_daily("Notizen & Gedanken", link_text)
+        except Exception as e:
+            log.warning(f"Daily-Link fuer Document fehlgeschlagen: {e}")
+
+        # Antwort an User
+        reply = f"📄 <b>{kind}</b> gespeichert: <code>{rel}</code>"
+        if user_caption:
+            reply += f"\n<i>{user_caption}</i>"
+        if body_preview:
+            preview_html = _esc_html(body_preview)
+            reply += f"\n\n<b>Inhalt (Vorschau):</b>\n<pre><code>{preview_html}</code></pre>"
+        await update.message.reply_text(
+            reply,
+            parse_mode=constants.ParseMode.HTML,
+        )
+
+    except Exception as e:
+        log.exception("document handler failed")
+        await update.message.reply_text(f"Document-Fehler: {e}")
+    finally:
+        if tmp_path:
+            try: os.unlink(tmp_path)
+            except Exception: pass
+
+
+@require_auth
 async def handle_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Show today's daily note (without frontmatter)."""
     path = DAILY_DIR / f"{today_iso()}.md"
@@ -1150,13 +1253,23 @@ async def handle_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 @require_auth
 async def handle_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 KI Wiki Bot bereit.\n\n"
-        "Schreib einfach Text — ich sortier's ins Vault.\n"
-        "🎤 Sprachnachrichten werden transkribiert.\n"
-        "🖼 Fotos werden gespeichert + beschrieben.\n"
-        "🔗 Links werden geclipt.\n\n"
-        "Commands:\n"
-        "/today — heutige Daily anzeigen\n"
+        "👋 <b>Vault-Assistent bereit</b>\n\n"
+        "Standardmäßig <b>antworte ich nur</b> — speichere nichts ins Vault, "
+        "außer du sagst's mir explizit.\n\n"
+        "<b>Speicher-Verben</b> die ich erkenne:\n"
+        "• \"speicher / merk dir / notiere / schreib auf …\"\n"
+        "• \"task: …\" / \"todo: …\" / \"morgen X machen\"\n"
+        "• \"meeting: …\" / \"war im termin mit …\"\n"
+        "• \"X erledigt\" → markiert Task als done\n"
+        "• \"lösche X\" → fragt nach Bestätigung\n\n"
+        "<b>Multimedia:</b>\n"
+        "🎤 Sprachnachricht → transkribiert + sortiert\n"
+        "🖼 Foto → in 09_Attachments + Vision-Caption\n"
+        "📄 Datei (.md/.txt/.pdf/...) → in 01_Raw bzw. 09_Attachments\n"
+        "🔗 URL allein → fragt ob clippen\n\n"
+        "<b>Commands:</b>\n"
+        "/today — heutige Daily anzeigen",
+        parse_mode=constants.ParseMode.HTML,
     )
 
 
@@ -1183,6 +1296,7 @@ def main():
     app.add_handler(CommandHandler("today", handle_today))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     log.info("Polling started.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
