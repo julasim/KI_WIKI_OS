@@ -427,69 +427,150 @@ def clip_url(url: str) -> str:
         return f"Clip-Fehler: {e}"
 
 
-# ─── Pending Deletions ──────────────────────────────────────────────────────
-# Two-Step-Delete: request_delete() merkt sich was, confirm_delete() führt aus.
-# State überlebt zwischen Telegram-Nachrichten solange Container läuft.
-PENDING_DELETIONS: dict[int, tuple[str, float]] = {}
-DELETE_CONFIRM_TIMEOUT = 120  # Sekunden
+# ─── Pending Deletions (Multi-File-fähig) ───────────────────────────────────
+# Two-Step-Delete: request_delete() merkt sich Pfad(e), confirm_delete() führt aus.
+# Mehrere Files können angefragt werden, alle werden bei einer Bestätigung gelöscht.
+PENDING_DELETIONS: dict[int, tuple[list[str], float]] = {}
+DELETE_CONFIRM_TIMEOUT = 300  # Sekunden
 
 
-def request_delete(rel_path: str) -> str:
-    """Merkt sich eine Lösch-Anfrage. Antwort fordert Bestätigung."""
-    try:
-        path = safe_path(rel_path)
-    except Exception as e:
-        return f"Pfad-Fehler: {e}"
-    if not path.exists():
-        return f"Datei nicht gefunden: {rel_path}"
-    PENDING_DELETIONS[ALLOWED_USER_ID] = (rel_path, time.time())
-    log.info(f"Pending delete requested: {rel_path}")
-    return (
-        f"⚠️ Bestätigung nötig: soll [[{path.stem}]] (`{rel_path}`) "
-        f"ins Archiv verschoben werden? Antworte innerhalb {DELETE_CONFIRM_TIMEOUT}s "
-        f"mit 'ja löschen' oder 'bestätigt'."
-    )
+def request_delete(rel_paths) -> str:
+    """Merkt sich eine Lösch-Anfrage (1 oder mehrere Files). Akkumuliert.
+
+    rel_paths: str (einzelne Datei) oder list[str] (mehrere)
+    """
+    # Input normalisieren
+    if isinstance(rel_paths, str):
+        paths_in = [rel_paths]
+    elif isinstance(rel_paths, list):
+        paths_in = rel_paths
+    else:
+        return f"request_delete: ungültiger Input-Typ {type(rel_paths)}"
+
+    # Pfade validieren + sammeln
+    valid = []
+    errors = []
+    for rp in paths_in:
+        try:
+            p = safe_path(rp)
+            if not p.exists():
+                errors.append(f"nicht gefunden: {rp}")
+            else:
+                valid.append(rp)
+        except Exception as e:
+            errors.append(f"{rp} ({e})")
+
+    if not valid:
+        return "Keine gültigen Pfade. " + "; ".join(errors)
+
+    # Akkumulieren (existierende pending Liste erweitern)
+    existing = PENDING_DELETIONS.get(ALLOWED_USER_ID, ([], 0.0))[0]
+    combined = list(dict.fromkeys(existing + valid))  # dedupliziert, Reihenfolge erhält
+    PENDING_DELETIONS[ALLOWED_USER_ID] = (combined, time.time())
+    log.info(f"Pending delete: {combined}")
+
+    msg = f"⚠️ Bestätigung: soll(en) {len(combined)} Datei(en) ins Archiv verschoben werden?\n\n"
+    msg += "\n".join(f"• `{p}`" for p in combined)
+    if errors:
+        msg += "\n\n_(übersprungen: " + ", ".join(errors) + ")_"
+    msg += f"\n\nAntworte mit 'ja' / 'bestätigt' / 'machs' (innerhalb {DELETE_CONFIRM_TIMEOUT//60} Min)."
+    return msg
 
 
 def confirm_delete() -> str:
-    """Führt die letzte angeforderte Löschung aus (move → 99_Archive/)."""
+    """Führt alle pending Löschungen aus."""
     pending = PENDING_DELETIONS.get(ALLOWED_USER_ID)
-    if not pending:
+    if not pending or not pending[0]:
         return "Keine Löschung pending — gibts nichts zu bestätigen."
-    rel_path, ts = pending
+    paths, ts = pending
     age = time.time() - ts
     if age > DELETE_CONFIRM_TIMEOUT:
-        del PENDING_DELETIONS[ALLOWED_USER_ID]
+        PENDING_DELETIONS.pop(ALLOWED_USER_ID, None)
         return f"Bestätigung zu spät ({int(age)}s > {DELETE_CONFIRM_TIMEOUT}s). Bitte nochmal anfordern."
-    try:
-        src = safe_path(rel_path)
-        if not src.exists():
-            del PENDING_DELETIONS[ALLOWED_USER_ID]
-            return f"Quelldatei verschwunden: {rel_path}"
-        # Ziel im Archiv mit erhaltener Pfad-Struktur
-        archive_root = VAULT / "99_Archive"
-        rel_inside = src.relative_to(VAULT)
-        dst = archive_root / rel_inside
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        # Bei Konflikt: Timestamp anhängen
-        if dst.exists():
-            ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-            dst = dst.with_name(f"{dst.stem}_{ts_str}{dst.suffix}")
-        os.rename(src, dst)
-        del PENDING_DELETIONS[ALLOWED_USER_ID]
-        log.info(f"Deleted (archived): {rel_path} → {dst.relative_to(VAULT)}")
-        return f"✓ Verschoben nach `{dst.relative_to(VAULT)}`. Wiederherstellbar via `mv` oder erneutem read_file → write."
-    except Exception as e:
-        log.exception("confirm_delete failed")
-        return f"Lösch-Fehler: {e}"
+
+    archive_root = VAULT / "99_Archive"
+    results = []
+    for rel_path in paths:
+        try:
+            src = safe_path(rel_path)
+            if not src.exists():
+                results.append(f"✗ {rel_path} verschwunden")
+                continue
+            dst = archive_root / src.relative_to(VAULT)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if dst.exists():
+                ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+                dst = dst.with_name(f"{dst.stem}_{ts_str}{dst.suffix}")
+            os.rename(src, dst)
+            results.append(f"✓ {rel_path}")
+            log.info(f"Archived: {rel_path} → {dst.relative_to(VAULT)}")
+        except Exception as e:
+            log.exception(f"delete {rel_path} failed")
+            results.append(f"✗ {rel_path} ({e})")
+
+    PENDING_DELETIONS.pop(ALLOWED_USER_ID, None)
+    return f"Verschoben nach 99_Archive/ ({len(paths)} Datei(en)):\n" + "\n".join(results)
 
 
 def cancel_delete() -> str:
-    """Bricht eine pending Löschung ab."""
-    if ALLOWED_USER_ID in PENDING_DELETIONS:
-        rel_path, _ = PENDING_DELETIONS.pop(ALLOWED_USER_ID)
-        return f"Löschanfrage für `{rel_path}` abgebrochen."
-    return "Keine pending Löschung."
+    """Bricht alle pending Löschungen ab."""
+    pending = PENDING_DELETIONS.pop(ALLOWED_USER_ID, None)
+    if not pending or not pending[0]:
+        return "Keine pending Löschung."
+    return f"Löschanfrage für {len(pending[0])} Datei(en) abgebrochen."
+
+
+def list_files(rel_dir: str = "") -> str:
+    """Liste alle .md-Files in einem Vault-Unterordner.
+
+    Nützlich vor Batch-Löschungen ('alle daily logs') um vorher zu wissen was kommt.
+    """
+    try:
+        base = safe_path(rel_dir) if rel_dir else VAULT
+        if not base.exists() or not base.is_dir():
+            return f"Verzeichnis nicht gefunden: {rel_dir}"
+        files = sorted(p for p in base.rglob("*.md")
+                       if p.name not in ("README.md", "_index.md")
+                       and not any(part in (".obsidian", "99_Archive") for part in p.parts))
+        if not files:
+            return f"Keine Markdown-Files in {rel_dir or 'Vault-Root'}"
+        rels = [str(f.relative_to(VAULT)).replace("\\", "/") for f in files]
+        return f"{len(rels)} Files in {rel_dir or 'Vault-Root'}:\n" + "\n".join(f"• `{r}`" for r in rels)
+    except Exception as e:
+        return f"List-Fehler: {e}"
+
+
+# ─── Conversation Memory ─────────────────────────────────────────────────────
+# Letzte N Turns pro User. Lebt im RAM solange Container läuft.
+# Reset nach 30 Min Inaktivität.
+CONVERSATION_HISTORY: dict[int, list] = {}
+CONVERSATION_TIMESTAMPS: dict[int, float] = {}
+HISTORY_MAX_MESSAGES = 24       # ca. 12 User+Assistant-Turns
+HISTORY_TIMEOUT = 30 * 60       # 30 Minuten
+
+
+def get_history(user_id: int) -> list:
+    """History für User holen, expirieren wenn zu alt."""
+    last = CONVERSATION_TIMESTAMPS.get(user_id, 0.0)
+    if time.time() - last > HISTORY_TIMEOUT:
+        CONVERSATION_HISTORY[user_id] = []
+    return CONVERSATION_HISTORY.get(user_id, [])
+
+
+def update_history(user_id: int, new_messages: list) -> None:
+    """History anhängen + auf Max-Länge trimmen."""
+    history = get_history(user_id)
+    history.extend(new_messages)
+    if len(history) > HISTORY_MAX_MESSAGES:
+        history = history[-HISTORY_MAX_MESSAGES:]
+    CONVERSATION_HISTORY[user_id] = history
+    CONVERSATION_TIMESTAMPS[user_id] = time.time()
+
+
+def reset_history(user_id: int) -> None:
+    """History komplett resetten (z.B. via /reset Command)."""
+    CONVERSATION_HISTORY.pop(user_id, None)
+    CONVERSATION_TIMESTAMPS.pop(user_id, None)
 
 
 # ============================================================================
@@ -615,31 +696,58 @@ TOOLS = [
     {"type": "function", "function": {
         "name": "request_delete",
         "description": (
-            "Schritt 1 von 2 für sicheres Löschen: meldet eine Löschanfrage an den User "
-            "und FORDERT BESTÄTIGUNG. Nutze IMMER diese Funktion für Löschwünsche, NIEMALS "
-            "direkt confirm_delete ohne vorherige User-Bestätigung. "
-            "Pfad relativ zu Vault-Root (z.B. '10_Life/tasks/foo.md')."
+            "Schritt 1 von 2 für sicheres Löschen: meldet Löschanfrage an User. "
+            "Akzeptiert eine ODER mehrere Pfade (Batch-Delete). Bei 'lösche alle X' "
+            "erst list_files aufrufen, dann ALLE Pfade in einem request_delete-Call "
+            "übergeben. NIEMALS direkt confirm_delete ohne vorherige User-Bestätigung. "
+            "Pfade relativ zu Vault-Root."
         ),
         "parameters": {
             "type": "object",
-            "properties": {"rel_path": {"type": "string"}},
-            "required": ["rel_path"],
+            "properties": {
+                "rel_paths": {
+                    "oneOf": [
+                        {"type": "string"},
+                        {"type": "array", "items": {"type": "string"}},
+                    ],
+                    "description": "Einzelner Pfad oder Liste von Pfaden",
+                },
+            },
+            "required": ["rel_paths"],
         },
     }},
     {"type": "function", "function": {
         "name": "confirm_delete",
         "description": (
-            "Schritt 2 von 2: führt die zuletzt angeforderte Löschung aus (Datei wird ins "
+            "Schritt 2 von 2: führt ALLE pending Löschungen aus (Files werden ins "
             "99_Archive/ verschoben, NICHT hart gelöscht — reversibel). "
-            "Nur aufrufen NACHDEM der User explizit bestätigt hat ('ja', 'bestätigt', "
-            "'ja löschen', 'jo machs' o.ä.). Hat keine Parameter."
+            "Nur aufrufen NACHDEM User explizit bestätigt hat ('ja', 'bestätigt', 'machs')."
         ),
         "parameters": {"type": "object", "properties": {}, "required": []},
     }},
     {"type": "function", "function": {
         "name": "cancel_delete",
-        "description": "Bricht eine pending Löschung ab. Nutze wenn User 'nein', 'doch nicht', 'abbrechen' o.ä. sagt.",
+        "description": "Bricht alle pending Löschungen ab. Bei 'nein', 'abbrechen', 'doch nicht'.",
         "parameters": {"type": "object", "properties": {}, "required": []},
+    }},
+    {"type": "function", "function": {
+        "name": "list_files",
+        "description": (
+            "Listet alle .md-Files in einem Vault-Unterordner. "
+            "Nutze vor Batch-Operationen ('alle daily logs', 'alle Tasks im Projekt X') "
+            "um die Liste der betroffenen Files zu bekommen, die du dann z.B. in "
+            "request_delete übergeben kannst."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "rel_dir": {
+                    "type": "string",
+                    "description": "Verzeichnis relativ zu Vault-Root, z.B. '10_Life/daily'. Leer = ganzer Vault.",
+                },
+            },
+            "required": [],
+        },
     }},
 ]
 
@@ -656,6 +764,7 @@ TOOL_HANDLERS = {
     "request_delete": request_delete,
     "confirm_delete": confirm_delete,
     "cancel_delete": cancel_delete,
+    "list_files": list_files,
 }
 
 # ============================================================================
@@ -686,6 +795,7 @@ Tool nur aufrufen wenn Julius EXPLIZIT Speicher-Intent zeigt:
 | "X erledigt / fertig / done" | `mark_task_done` (ggf. erst `search_vault`) |
 | URL allein, sonst nichts | erst fragen, dann `clip_url` |
 | "lösche X / weg mit X" | `request_delete` (NIE direkt confirm!) |
+| "lösche alle X" / "leere Y" | erst `list_files` für Verzeichnis, dann `request_delete` mit ALLEN Pfaden als Liste |
 | "ja / bestätigt / machs" nach request_delete | `confirm_delete` |
 | "nein / abbrechen" nach request_delete | `cancel_delete` |
 
@@ -720,9 +830,16 @@ Mehrdeutiger Input ("Diese", "ja" out-of-context) → **IMMER nachfragen**, nie 
 # LLM tool-use loop
 # ============================================================================
 
-async def llm_loop(user_text: str) -> str:
-    """Run tool-use loop until final answer or limit reached."""
+async def llm_loop(user_text: str, user_id: int) -> str:
+    """Run tool-use loop until final answer or limit reached.
+
+    Mit Conversation-Memory: letzte ~12 Turns werden als Context übergeben.
+    """
     sys_text = SYSTEM_PROMPT.replace("{today}", today_iso())
+
+    # System-Prompt + History + neue User-Message
+    history = get_history(user_id)
+    new_user_msg = {"role": "user", "content": user_text}
     messages = [
         {
             "role": "system",
@@ -734,8 +851,11 @@ async def llm_loop(user_text: str) -> str:
                 }
             ],
         },
-        {"role": "user", "content": user_text},
-    ]
+    ] + history + [new_user_msg]
+
+    # Diese Messages werden am Ende zur History dazugefügt
+    new_history_msgs = [new_user_msg]
+
     for _ in range(8):
         resp = await asyncio.to_thread(
             llm.chat.completions.create,
@@ -746,9 +866,14 @@ async def llm_loop(user_text: str) -> str:
             max_tokens=2048,
         )
         msg = resp.choices[0].message
-        messages.append(msg.model_dump(exclude_none=True))
+        msg_dict = msg.model_dump(exclude_none=True)
+        messages.append(msg_dict)
+        new_history_msgs.append(msg_dict)
+
         if not msg.tool_calls:
+            update_history(user_id, new_history_msgs)
             return msg.content or "(keine Antwort)"
+
         for tc in msg.tool_calls:
             try:
                 args = json.loads(tc.function.arguments) if tc.function.arguments else {}
@@ -761,11 +886,15 @@ async def llm_loop(user_text: str) -> str:
             except Exception as e:
                 log.exception(f"Tool {tc.function.name} failed")
                 result = f"Tool-Fehler: {e}"
-            messages.append({
+            tool_msg = {
                 "role": "tool",
                 "tool_call_id": tc.id,
                 "content": str(result),
-            })
+            }
+            messages.append(tool_msg)
+            new_history_msgs.append(tool_msg)
+
+    update_history(user_id, new_history_msgs)
     return "(Tool-Loop-Limit erreicht — bitte präziser fragen.)"
 
 
@@ -986,7 +1115,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     log.info(f"text: {text[:120]}")
     await update.message.chat.send_action(constants.ChatAction.TYPING)
     try:
-        reply = await llm_loop(text)
+        reply = await llm_loop(text, update.effective_user.id)
     except Exception as e:
         log.exception("llm_loop failed")
         reply = f"Fehler: {e}"
@@ -1018,7 +1147,7 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         log.info(f"transcript: {transcript[:120]}")
         await update.message.reply_text(f"📝 {transcript}")
-        reply = await llm_loop(transcript)
+        reply = await llm_loop(transcript, update.effective_user.id)
     except Exception as e:
         log.exception("voice handler failed")
         reply = f"Voice-Fehler: {e}"
@@ -1166,6 +1295,15 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 @require_auth
+async def handle_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Setzt Conversation-Memory + pending Deletes zurück."""
+    uid = update.effective_user.id
+    reset_history(uid)
+    PENDING_DELETIONS.pop(uid, None)
+    await update.message.reply_text("🔄 Memory + pending Deletes geleert. Frischer Anfang.")
+
+
+@require_auth
 async def handle_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Show today's daily note (without frontmatter)."""
     path = DAILY_DIR / f"{today_iso()}.md"
@@ -1195,7 +1333,10 @@ async def handle_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "📄 Datei (.md/.txt/.pdf/...) → in 01_Raw bzw. 09_Attachments\n"
         "🔗 URL allein → fragt ob clippen\n\n"
         "<b>Commands:</b>\n"
-        "/today — heutige Daily anzeigen",
+        "/today — heutige Daily anzeigen\n"
+        "/reset — Conversation-Memory leeren\n\n"
+        "<i>Conversation-Memory aktiv: ich erinnere mich an die letzten ~12 Turns "
+        "(30 Min Timeout). Follow-ups wie 'ja' oder 'und füg X dazu' funktionieren.</i>",
         parse_mode=constants.ParseMode.HTML,
     )
 
@@ -1221,6 +1362,7 @@ def main():
     app = Application.builder().token(TG_TOKEN).build()
     app.add_handler(CommandHandler("start", handle_start))
     app.add_handler(CommandHandler("today", handle_today))
+    app.add_handler(CommandHandler("reset", handle_reset))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
