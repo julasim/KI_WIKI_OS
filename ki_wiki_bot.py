@@ -22,9 +22,10 @@ import asyncio
 import logging
 import subprocess
 import tempfile
-from datetime import date, datetime
+from datetime import date, datetime, time as dtime, timedelta
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import frontmatter
 import trafilatura
@@ -67,6 +68,13 @@ VISION_MODEL = os.environ.get("VISION_MODEL", LLM_MODEL)
 WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL", "small")
 WHISPER_DEVICE = os.environ.get("WHISPER_DEVICE", "cpu")
 WHISPER_LANG = os.environ.get("WHISPER_LANG", "de")
+
+# Daily-Briefing
+try:
+    BRIEFING_HOUR = int(os.environ.get("BRIEFING_HOUR", "0") or "0")
+except ValueError:
+    BRIEFING_HOUR = 0
+TIMEZONE = ZoneInfo(os.environ.get("TIMEZONE", "Europe/Vienna"))
 
 TG_MAX_MESSAGE = 3800
 
@@ -1518,6 +1526,115 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             except Exception: pass
 
 
+def compute_briefing() -> str:
+    """Generiere die morgendliche Zusammenfassung als HTML-String.
+
+    Inhalt: Datum, überfällige Tasks, heute geplant (aus Daily 'Heute'),
+    offene Tasks (sortiert nach Prio), gestern Abends-Reflexion.
+    """
+    today = today_iso()
+    yesterday = (date.today() - timedelta(days=1)).isoformat()
+
+    parts = [f"☀️ <b>Guten Morgen — {today}</b>"]
+
+    # ─── Today's Daily: was steht für heute geplant? ───
+    today_path = DAILY_DIR / f"{today}.md"
+    if today_path.exists():
+        try:
+            post = frontmatter.load(today_path)
+            body = post.content or ""
+            m = re.search(r"## Heute\s*\n(.*?)(?=\n## |\Z)", body, re.DOTALL)
+            if m and m.group(1).strip() and m.group(1).strip() != "- [ ]":
+                heute_text = m.group(1).strip()[:600]
+                parts.append(f"\n📋 <b>Heute geplant</b>\n<pre>{_esc_html(heute_text)}</pre>")
+        except Exception as e:
+            log.warning(f"briefing: today daily parse failed: {e}")
+
+    # ─── Tasks-Scan: überfällig + offen ───
+    open_tasks = []
+    overdue = []
+    if TASKS_DIR.exists():
+        for tp in TASKS_DIR.glob("*.md"):
+            try:
+                tpost = frontmatter.load(tp)
+                status = str(tpost.get("status", "")).lower()
+                if status in ("done", "cancelled"):
+                    continue
+                title = str(tpost.get("title", tp.stem))
+                tid = str(tpost.get("id", f"t-{tp.stem}"))
+                prio = str(tpost.get("priority", "medium"))
+                due = str(tpost.get("due", "")).strip()
+                entry = (tid, title, prio, due)
+                if due and due < today:
+                    overdue.append(entry)
+                else:
+                    open_tasks.append(entry)
+            except Exception:
+                continue
+
+    if overdue:
+        overdue.sort(key=lambda x: x[3])
+        parts.append("\n⚠️ <b>Überfällig</b>")
+        for tid, title, prio, due in overdue[:8]:
+            parts.append(f"• {_esc_html(title)} <i>(seit {due})</i>")
+
+    if open_tasks:
+        prio_order = {"urgent": 0, "high": 1, "medium": 2, "low": 3}
+        open_tasks.sort(key=lambda x: (prio_order.get(x[2], 9), x[3] or "9999"))
+        parts.append("\n✏️ <b>Offene Tasks</b>")
+        for tid, title, prio, due in open_tasks[:8]:
+            due_str = f" <i>(bis {due})</i>" if due else ""
+            prio_emoji = {"urgent": "🔴", "high": "🟠", "medium": "•", "low": "·"}.get(prio, "•")
+            parts.append(f"{prio_emoji} {_esc_html(title)}{due_str}")
+        if len(open_tasks) > 8:
+            parts.append(f"<i>… und {len(open_tasks)-8} weitere</i>")
+
+    # ─── Gestern: Abends-Reflexion ───
+    yest_path = DAILY_DIR / f"{yesterday}.md"
+    if yest_path.exists():
+        try:
+            ypost = frontmatter.load(yest_path)
+            ybody = ypost.content or ""
+            m = re.search(r"## Abends\s*\n(.*?)(?=\n## |\Z)", ybody, re.DOTALL)
+            if m and m.group(1).strip():
+                abends = m.group(1).strip()
+                # Template-Standardtext rausfiltern
+                template_lines = ("- Was lief gut?", "- Was nehme ich mit?")
+                non_template = [l for l in abends.split("\n") if l.strip() and l.strip() not in template_lines]
+                if non_template:
+                    abends_clean = "\n".join(non_template)[:400]
+                    parts.append(f"\n🌙 <b>Gestern Abends</b>\n<i>{_esc_html(abends_clean)}</i>")
+        except Exception:
+            pass
+
+    # ─── Wenn nichts da: gentle morning ───
+    if not overdue and not open_tasks and not today_path.exists():
+        parts.append("\n<i>Heute steht noch nichts an. Schreib mir was du heute vorhast oder genieß den freien Kopf.</i>")
+
+    return "\n".join(parts)
+
+
+async def daily_briefing_job(ctx: ContextTypes.DEFAULT_TYPE):
+    """JobQueue-Callback — wird täglich um BRIEFING_HOUR ausgeführt."""
+    try:
+        text = await asyncio.to_thread(compute_briefing)
+        await ctx.bot.send_message(
+            chat_id=ALLOWED_USER_ID,
+            text=text,
+            parse_mode=constants.ParseMode.HTML,
+        )
+        log.info(f"Daily briefing sent to {ALLOWED_USER_ID}")
+    except Exception as e:
+        log.exception(f"daily_briefing_job failed: {e}")
+
+
+@require_auth
+async def handle_briefing(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/briefing — manueller Trigger für das Morgens-Briefing."""
+    text = await asyncio.to_thread(compute_briefing)
+    await update.message.reply_text(text, parse_mode=constants.ParseMode.HTML)
+
+
 @require_auth
 async def handle_backup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/backup — manueller Push des Vaults ins konfigurierte GitHub-Repo."""
@@ -1569,6 +1686,7 @@ async def handle_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "🔗 URL allein → fragt ob clippen\n\n"
         "<b>Commands:</b>\n"
         "/today — heutige Daily anzeigen\n"
+        "/briefing — Tagesbriefing (überfällig + offen + heute)\n"
         "/backup — Vault in GitHub-Repo pushen\n"
         "/reset — Conversation-Memory leeren\n\n"
         "<i>Conversation-Memory aktiv: ich erinnere mich an die letzten ~12 Turns "
@@ -1598,8 +1716,24 @@ def main():
     app = Application.builder().token(TG_TOKEN).build()
     app.add_handler(CommandHandler("start", handle_start))
     app.add_handler(CommandHandler("today", handle_today))
+    app.add_handler(CommandHandler("briefing", handle_briefing))
     app.add_handler(CommandHandler("reset", handle_reset))
     app.add_handler(CommandHandler("backup", handle_backup))
+
+    # Daily-Briefing JobQueue (wenn BRIEFING_HOUR > 0 gesetzt)
+    if BRIEFING_HOUR and ALLOWED_USER_ID > 0:
+        try:
+            briefing_time = dtime(hour=BRIEFING_HOUR, minute=0, tzinfo=TIMEZONE)
+            app.job_queue.run_daily(
+                daily_briefing_job,
+                time=briefing_time,
+                name="daily-briefing",
+            )
+            log.info(f"Daily-Briefing scheduled für {BRIEFING_HOUR}:00 {TIMEZONE.key}")
+        except Exception as e:
+            log.warning(f"JobQueue-Setup fehlgeschlagen (BRIEFING_HOUR={BRIEFING_HOUR}): {e}")
+    else:
+        log.info("Daily-Briefing deaktiviert (BRIEFING_HOUR=0 oder Setup-Modus)")
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
