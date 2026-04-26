@@ -2649,8 +2649,14 @@ Begrüßung, Smalltalk, Fragen, Statements ohne Speicher-Verb → antworten, **n
 - Deutsch, direkt, kein Höflichkeits-Geschwurbel. Sparsame Emojis (✓ ✗ ⚠️).
 - Bestätigung einer Aktion: 1 Satz mit `[[wikilink]]`.
 - Frage: so lang wie nötig, gut strukturiert.
-- Format frei wählen — Tabellen für Vergleiche, Bullets für Listen, Code-Blöcke für Code/Pfade,
+- Format frei wählen — Bullets für Listen, Code-Blöcke für Code/Pfade,
   **bold** für Schlüsselbegriffe, *italic* für Betonung, ## Headings nur bei langen Antworten.
+- **TELEGRAM-MOBILE-REGEL für Tabellen**: Telegram zeigt nur ~36 Zeichen pro Zeile lesbar.
+  - Tabellen NUR für sehr schmale Vergleiche (max 2 Spalten, je Zelle <15 Zeichen).
+  - Sobald Pfade, lange Beschreibungen oder ≥3 Spalten: KEINE Tabelle, sondern
+    pro Item ein Block: `**Name**` Zeile + darunter eingerückte Bullet-Liste mit `• Label: Wert`.
+  - Beispiel statt Tabelle "Projekt | Pfad | Hinweis":
+    `**Matura**`<newline>`  • Pfad: 05_Projects/matura/`<newline>`  • Hinweis: Haupt-Projekt`
 - **Wikilinks**: `[[id]]` mit `id` aus dem Frontmatter (z.B. `[[daily-2026-04-25]]`, `[[t-foo]]`).
   - NIE Filepath wie `[[10_Life/daily/2026-04-25.md]]`
   - NIE Beispiel-Platzhalter wie `[[t-example]]`, `[[wiki-example]]`, `[[id]]`, `[[file-name]]`
@@ -2869,17 +2875,28 @@ def _esc_html(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def _render_md_table(table_text: str) -> str:
-    """Markdown-Tabelle → monospaced ASCII mit Unicode-Box-Zeichen."""
+# Telegram-Mobile rendert ~36-40 Zeichen pro Zeile in Pre-Blocks ohne Umbruch.
+# Tabellen die breiter sind verlieren Spalten-Ausrichtung → unleserlich.
+TELEGRAM_TABLE_MAX_WIDTH = 38
+
+
+def _render_md_table_html(table_text: str) -> str:
+    """Markdown-Tabelle → Telegram-passendes HTML.
+
+    Strategie:
+      - schmale 2-Spalten-Tabellen (≤TELEGRAM_TABLE_MAX_WIDTH gesamt) → "Key: Value"-Liste
+      - schmale n-Spalten-Tabellen (≤TELEGRAM_TABLE_MAX_WIDTH) → monospaced <pre>
+      - sonst → Sektions-Layout: pro Row ein Block mit Bold-Header + Bullets je Spalte
+    """
     lines = [l for l in table_text.strip().split("\n") if l.strip()]
     if len(lines) < 3:
-        return table_text  # zu kurz für Tabelle, unverändert lassen
+        return f"<pre><code>{_esc_html(table_text)}</code></pre>"
 
     def cells(line: str) -> list:
         return [c.strip() for c in line.strip().strip("|").split("|")]
 
     header = cells(lines[0])
-    rows = [cells(l) for l in lines[2:]]  # lines[1] ist die Separator-Linie
+    rows = [cells(l) for l in lines[2:]]  # lines[1] ist Separator
     n = len(header)
     rows = [r[:n] + [""] * max(0, n - len(r)) for r in rows]
 
@@ -2888,14 +2905,48 @@ def _render_md_table(table_text: str) -> str:
         for i in range(n):
             widths[i] = max(widths[i], len(r[i]))
 
-    def fmt_row(cells_):
-        return " │ ".join(c.ljust(widths[i]) for i, c in enumerate(cells_))
+    total_width = sum(widths) + (n - 1) * 3  # " │ "-Separatoren
 
-    sep = "─┼─".join("─" * w for w in widths)
-    out = [fmt_row(header), sep]
+    # ─── A) Schmal genug für monospaced Pre? Behält Tabellen-Look. ───
+    if total_width <= TELEGRAM_TABLE_MAX_WIDTH:
+        def fmt_row(cells_):
+            return " │ ".join(c.ljust(widths[i]) for i, c in enumerate(cells_))
+        sep = "─┼─".join("─" * w for w in widths)
+        out = [fmt_row(header), sep] + [fmt_row(r) for r in rows]
+        return f"<pre><code>{_esc_html(chr(10).join(out))}</code></pre>"
+
+    # ─── B) Genau 2 Spalten? Kompakte "Key: Value"-Liste. ───
+    if n == 2:
+        out_lines = []
+        for r in rows:
+            key, val = r[0], r[1]
+            if not key and not val:
+                continue
+            out_lines.append(f"<b>{_esc_html(key)}:</b> {_esc_html(val)}")
+        return "\n".join(out_lines)
+
+    # ─── C) ≥3 Spalten & breit → Sektions-Layout. ───
+    # Erste Spalte = Item-Header (bold), restliche = Bullet-Liste mit "Header: Wert".
+    out_lines = []
     for r in rows:
-        out.append(fmt_row(r))
-    return "\n".join(out)
+        primary = r[0].strip()
+        if not primary and not any(c.strip() for c in r[1:]):
+            continue
+        out_lines.append(f"<b>{_esc_html(primary or '—')}</b>")
+        for i in range(1, n):
+            val = r[i].strip()
+            if not val:
+                continue
+            col_header = header[i].strip() if i < len(header) else ""
+            if col_header:
+                out_lines.append(f"  • <b>{_esc_html(col_header)}:</b> {_esc_html(val)}")
+            else:
+                out_lines.append(f"  • {_esc_html(val)}")
+        out_lines.append("")  # Leerzeile zwischen Items
+    # Trailing-Leerzeile abschneiden
+    while out_lines and not out_lines[-1]:
+        out_lines.pop()
+    return "\n".join(out_lines)
 
 
 # Markdown-Tabelle: Header-Zeile + Separator-Zeile (nur -:| und Spaces) + 1+ Datenzeilen
@@ -2925,10 +2976,11 @@ def md_to_telegram_html(text: str) -> str:
         stash.append(html_fragment)
         return f"\x00S{len(stash)-1}\x00"
 
-    # 1) TABELLEN — als monospaced Pre-Block stashen
+    # 1) TABELLEN — Renderer entscheidet je nach Breite/Spaltenzahl:
+    #    schmal → monospaced <pre>, 2-Spalten breit → "Key: Value"-Liste,
+    #    ≥3 Spalten breit → Sektions-Layout. Renderer liefert fertiges HTML.
     def _table_repl(m):
-        rendered = _render_md_table(m.group(1))
-        return add_stash(f"<pre><code>{_esc_html(rendered)}</code></pre>")
+        return add_stash(_render_md_table_html(m.group(1)))
     text = TABLE_RE.sub(_table_repl, text)
 
     # 2) FENCED CODE BLOCKS (```...```)
