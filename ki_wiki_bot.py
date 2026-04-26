@@ -643,6 +643,192 @@ def cancel_delete() -> str:
     return f"Löschanfrage für {len(pending[0])} Datei(en) abgebrochen."
 
 
+# ─── Reminders (persistent + JobQueue) ──────────────────────────────────────
+# Reminders überleben Bot-Restart: JSON in 06_Meta/reminders.json.
+# Bei Startup werden alle aktiven Reminders neu in die JobQueue eingehängt.
+REMINDERS_FILE = VAULT / "06_Meta" / "reminders.json"
+ACTIVE_REMINDER_JOBS: dict = {}  # id → telegram.ext.Job
+BOT_APP = None  # wird in main() gesetzt — brauchen Zugriff auf job_queue von Tools aus
+
+
+def _load_reminders() -> list:
+    if not REMINDERS_FILE.exists():
+        return []
+    try:
+        return json.loads(REMINDERS_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        log.warning(f"reminders.json kaputt: {e}")
+        return []
+
+
+def _save_reminders(reminders: list) -> None:
+    REMINDERS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    REMINDERS_FILE.write_text(
+        json.dumps(reminders, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+VALID_RECURRENCE = {None, "", "daily", "weekly", "weekdays"}
+
+
+def create_reminder(when_iso: str, message: str, recurrence: Optional[str] = None) -> str:
+    """Setzt eine Erinnerung. Wird zur angegebenen Zeit als Telegram-Nachricht geschickt.
+
+    when_iso: ISO-Datetime YYYY-MM-DDTHH:MM:SS (Lokalzeit Europe/Vienna)
+    recurrence: null/leer = einmalig, "daily" = täglich, "weekdays" = Mo-Fr,
+                "weekly" = einmal pro Woche (gleicher Wochentag wie der erste Trigger)
+    """
+    if not message or not message.strip():
+        return "Erinnerung-Text fehlt."
+    try:
+        when_dt = datetime.fromisoformat(when_iso)
+    except ValueError:
+        return f"Ungültiges Datum/Zeit: {when_iso}. Format: 2026-04-26T15:00:00"
+
+    if when_dt.tzinfo is None:
+        when_dt = when_dt.replace(tzinfo=TIMEZONE)
+
+    rec = (recurrence or None) if recurrence else None
+    if rec not in VALID_RECURRENCE:
+        return f"Ungültige Recurrence '{recurrence}'. Erlaubt: leer / daily / weekly / weekdays"
+
+    # Ein-shot Reminder in der Vergangenheit ablehnen (außer recurring)
+    if not rec and when_dt < datetime.now(TIMEZONE):
+        return f"Zeitpunkt liegt in der Vergangenheit: {when_dt.isoformat(timespec='minutes')}"
+
+    rid = "rem-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
+    reminder = {
+        "id": rid,
+        "fire_at": when_dt.isoformat(timespec="seconds"),
+        "message": message.strip(),
+        "recurrence": rec,
+        "created": datetime.now(TIMEZONE).isoformat(timespec="seconds"),
+    }
+    reminders = _load_reminders()
+    reminders.append(reminder)
+    _save_reminders(reminders)
+
+    if BOT_APP is not None:
+        _schedule_reminder(BOT_APP, reminder)
+
+    rec_str = f", wiederholt {rec}" if rec else ""
+    when_str = when_dt.strftime("%a %d.%m. %H:%M")
+    return f"⏰ Erinnerung gesetzt: {when_str}{rec_str}\n→ \"{message.strip()[:80]}\""
+
+
+def _schedule_reminder(app, reminder: dict) -> None:
+    """Hängt einen Reminder in die JobQueue ein."""
+    when_dt = datetime.fromisoformat(reminder["fire_at"])
+    if when_dt.tzinfo is None:
+        when_dt = when_dt.replace(tzinfo=TIMEZONE)
+
+    rid = reminder["id"]
+    rec = reminder.get("recurrence")
+    job_data = {"id": rid, "message": reminder["message"]}
+
+    try:
+        if rec == "daily":
+            job = app.job_queue.run_daily(
+                reminder_callback,
+                time=when_dt.timetz(),
+                data=job_data,
+                name=f"reminder-{rid}",
+            )
+        elif rec == "weekly":
+            job = app.job_queue.run_daily(
+                reminder_callback,
+                time=when_dt.timetz(),
+                days=(when_dt.weekday(),),
+                data=job_data,
+                name=f"reminder-{rid}",
+            )
+        elif rec == "weekdays":
+            job = app.job_queue.run_daily(
+                reminder_callback,
+                time=when_dt.timetz(),
+                days=(0, 1, 2, 3, 4),
+                data=job_data,
+                name=f"reminder-{rid}",
+            )
+        else:
+            # Einmalig
+            if when_dt <= datetime.now(TIMEZONE):
+                log.info(f"Reminder {rid} liegt in Vergangenheit, skip.")
+                # aus JSON entfernen
+                _remove_reminder_from_json(rid)
+                return
+            job = app.job_queue.run_once(
+                reminder_callback,
+                when=when_dt,
+                data=job_data,
+                name=f"reminder-{rid}",
+            )
+        ACTIVE_REMINDER_JOBS[rid] = job
+        log.info(f"Reminder scheduled: {rid} @ {when_dt.isoformat()} rec={rec}")
+    except Exception as e:
+        log.exception(f"Reminder-Schedule fehlgeschlagen für {rid}")
+
+
+def _remove_reminder_from_json(rid: str) -> None:
+    reminders = _load_reminders()
+    reminders = [r for r in reminders if r["id"] != rid]
+    _save_reminders(reminders)
+
+
+async def reminder_callback(ctx: ContextTypes.DEFAULT_TYPE):
+    """Wird von JobQueue ausgelöst wenn ein Reminder fällig wird."""
+    data = ctx.job.data
+    rid = data["id"]
+    message = data["message"]
+    try:
+        await ctx.bot.send_message(
+            chat_id=ALLOWED_USER_ID,
+            text=f"⏰ <b>Erinnerung</b>\n\n{_esc_html(message)}",
+            parse_mode=constants.ParseMode.HTML,
+        )
+        log.info(f"Reminder fired: {rid}")
+    except Exception as e:
+        log.exception(f"Reminder-Send fehlgeschlagen für {rid}")
+
+    # Einmalige Reminder aus JSON + ACTIVE_JOBS entfernen
+    reminders = _load_reminders()
+    reminder = next((r for r in reminders if r["id"] == rid), None)
+    if reminder and not reminder.get("recurrence"):
+        _remove_reminder_from_json(rid)
+        ACTIVE_REMINDER_JOBS.pop(rid, None)
+
+
+def list_reminders() -> str:
+    """Liste aller aktiven Reminders."""
+    reminders = _load_reminders()
+    if not reminders:
+        return "Keine aktiven Erinnerungen."
+    lines = [f"⏰ {len(reminders)} aktive Erinnerung(en):"]
+    for r in sorted(reminders, key=lambda x: x.get("fire_at", "")):
+        when = datetime.fromisoformat(r["fire_at"])
+        when_str = when.strftime("%a %d.%m. %H:%M")
+        rec = f" 🔁 {r['recurrence']}" if r.get("recurrence") else ""
+        lines.append(f"• `{r['id']}` — {when_str}{rec}\n  {r['message'][:80]}")
+    return "\n".join(lines)
+
+
+def cancel_reminder(reminder_id: str) -> str:
+    """Bricht einen Reminder ab (per ID, z.B. 'rem-20260426-153000-123')."""
+    reminders = _load_reminders()
+    found = next((r for r in reminders if r["id"] == reminder_id), None)
+    if not found:
+        return f"Erinnerung nicht gefunden: {reminder_id}"
+    _remove_reminder_from_json(reminder_id)
+    job = ACTIVE_REMINDER_JOBS.pop(reminder_id, None)
+    if job:
+        try:
+            job.schedule_removal()
+        except Exception:
+            pass
+    return f"✓ Erinnerung gecancelt: {found['message'][:60]}"
+
+
 def backup_vault() -> str:
     """Manuelles Backup: Vault in privates GitHub-Repo pushen.
 
@@ -1127,6 +1313,40 @@ TOOLS = [
         },
     }},
     {"type": "function", "function": {
+        "name": "create_reminder",
+        "description": (
+            "Setzt eine Erinnerung — Bot schickt zur angegebenen Zeit eine Telegram-Nachricht "
+            "mit dem message-Text. Berechne when_iso ALS ABSOLUTES DATUM + ZEIT in Lokalzeit "
+            "(Europe/Vienna). 'morgen 15:00' → 2026-04-27T15:00:00. 'in 30 Min' → "
+            "aktuelle Zeit + 30 Min. Heutiges Datum kennst du aus dem System-Prompt. "
+            "Wiederholungen via recurrence: daily, weekdays (Mo-Fr), weekly (jede Woche "
+            "selber Wochentag). Leer/null = einmalig."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "when_iso": {"type": "string", "description": "ISO-Datetime YYYY-MM-DDTHH:MM:SS, lokal Europe/Vienna"},
+                "message": {"type": "string", "description": "Text der gesendet wird"},
+                "recurrence": {"type": "string", "enum": ["daily", "weekdays", "weekly"]},
+            },
+            "required": ["when_iso", "message"],
+        },
+    }},
+    {"type": "function", "function": {
+        "name": "list_reminders",
+        "description": "Listet alle aktiven Erinnerungen (für 'was steht an?', 'welche Reminder hab ich').",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    }},
+    {"type": "function", "function": {
+        "name": "cancel_reminder",
+        "description": "Bricht eine Erinnerung ab. Erst list_reminders aufrufen wenn der User keine ID nennt.",
+        "parameters": {
+            "type": "object",
+            "properties": {"reminder_id": {"type": "string", "description": "Reminder-ID, z.B. 'rem-20260426-153000-123'"}},
+            "required": ["reminder_id"],
+        },
+    }},
+    {"type": "function", "function": {
         "name": "backup_vault",
         "description": (
             "Manuelles Backup: pusht das gesamte Vault in das konfigurierte private "
@@ -1153,6 +1373,9 @@ TOOL_HANDLERS = {
     "cancel_delete": cancel_delete,
     "list_files": list_files,
     "create_project": create_project,
+    "create_reminder": create_reminder,
+    "list_reminders": list_reminders,
+    "cancel_reminder": cancel_reminder,
     "backup_vault": backup_vault,
 }
 
@@ -1188,6 +1411,10 @@ Tool nur aufrufen wenn Julius EXPLIZIT Speicher-Intent zeigt:
 | "ja / bestätigt / machs" nach request_delete | `confirm_delete` |
 | "nein / abbrechen" nach request_delete | `cancel_delete` |
 | "lege ein Projekt an" / "neues Projekt: ..." | `create_project` (legt Ordner + README direkt an, NICHT erst nachfragen wo) |
+| "erinner mich um X an Y" / "wecker für 14 Uhr" / "in 30 Min ping" | `create_reminder` (when_iso = absolute Lokalzeit berechnen!) |
+| "jeden Montag 8 Uhr X" / "täglich um 7 X" | `create_reminder` mit `recurrence` (daily/weekdays/weekly) |
+| "welche Reminder hab ich?" | `list_reminders` |
+| "cancel den Reminder X" / "lösche die Erinnerung Y" | `cancel_reminder` (notfalls vorher list_reminders) |
 | "mach backup" / "sicher das vault" / "git push" | `backup_vault` |
 
 Begrüßung, Smalltalk, Fragen, Statements ohne Speicher-Verb → antworten, **nichts speichern**.
@@ -1895,6 +2122,13 @@ async def handle_briefing(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 @require_auth
+async def handle_reminders(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/reminders — alle aktiven Erinnerungen listen."""
+    text = await asyncio.to_thread(list_reminders)
+    await safe_reply(update, text)
+
+
+@require_auth
 async def handle_backup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/backup — manueller Push des Vaults ins konfigurierte GitHub-Repo."""
     await update.message.chat.send_action(constants.ChatAction.TYPING)
@@ -1946,6 +2180,7 @@ async def handle_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "<b>Commands:</b>\n"
         "/today — heutige Daily anzeigen\n"
         "/briefing — Tagesbriefing (überfällig + offen + heute)\n"
+        "/reminders — alle aktiven Erinnerungen\n"
         "/backup — Vault in GitHub-Repo pushen\n"
         "/reset — Conversation-Memory leeren\n\n"
         "<i>Conversation-Memory aktiv: ich erinnere mich an die letzten ~12 Turns "
@@ -1973,11 +2208,33 @@ def main():
         log.error(f"Templates-Ordner fehlt: {TEMPLATES_DIR}")
         return
     app = Application.builder().token(TG_TOKEN).build()
+
+    # Globale Referenz fuer Tools die JobQueue brauchen (z.B. create_reminder)
+    global BOT_APP
+    BOT_APP = app
+
     app.add_handler(CommandHandler("start", handle_start))
     app.add_handler(CommandHandler("today", handle_today))
     app.add_handler(CommandHandler("briefing", handle_briefing))
+    app.add_handler(CommandHandler("reminders", handle_reminders))
     app.add_handler(CommandHandler("reset", handle_reset))
     app.add_handler(CommandHandler("backup", handle_backup))
+
+    # Persistente Reminders aus JSON laden + neu schedulen
+    persisted_reminders = _load_reminders()
+    if persisted_reminders:
+        cleaned = []
+        for r in persisted_reminders:
+            try:
+                _schedule_reminder(app, r)
+                # nur behalten wenn Reminder noch aktiv (einmalige in Vergangenheit
+                # werden durch _schedule_reminder aus JSON entfernt — daher reload)
+                cleaned.append(r)
+            except Exception as e:
+                log.warning(f"Reminder {r.get('id')} konnte nicht reactiviert werden: {e}")
+        log.info(f"Reminders geladen: {len(cleaned)} aus {REMINDERS_FILE}")
+    else:
+        log.info("Keine persistierten Reminders.")
 
     # Daily-Briefing JobQueue (wenn BRIEFING_HOUR > 0 gesetzt)
     if BRIEFING_HOUR and ALLOWED_USER_ID > 0:
