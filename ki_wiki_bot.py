@@ -74,6 +74,10 @@ try:
     BRIEFING_HOUR = int(os.environ.get("BRIEFING_HOUR", "0") or "0")
 except ValueError:
     BRIEFING_HOUR = 0
+try:
+    SUGGESTION_HOUR = int(os.environ.get("SUGGESTION_HOUR", "0") or "0")
+except ValueError:
+    SUGGESTION_HOUR = 0
 TIMEZONE = ZoneInfo(os.environ.get("TIMEZONE", "Europe/Vienna"))
 
 TG_MAX_MESSAGE = 3800
@@ -1232,6 +1236,8 @@ FACTS_FILE = BOT_MEMORY_DIR / "facts.md"
 PREFERENCES_FILE = BOT_MEMORY_DIR / "preferences.md"
 ACTIVE_PROJECT_FILE = BOT_MEMORY_DIR / "active-project.txt"
 HISTORY_FILE = BOT_MEMORY_DIR / "conversation-history.jsonl"
+CORRECTIONS_FILE = BOT_MEMORY_DIR / "corrections.jsonl"
+PENDING_SUGGESTIONS_FILE = BOT_MEMORY_DIR / "pending-suggestions.json"
 
 
 def _ensure_memory_dir():
@@ -1467,6 +1473,315 @@ def update_project_context(slug: str, text: str, mode: str = "append") -> str:
         with context_file.open("a", encoding="utf-8") as f:
             f.write(f"\n{text.strip()}\n")
         return f"✓ CONTEXT.md für {slug} erweitert"
+
+
+# ─── Korrektur-Log (Trainings-Material für späteres Fine-Tuning) ─────────────
+
+# ─── Nightly Memory-Vorschläge (Hybrid: LLM extrahiert, User approved) ─────
+
+def _load_pending_suggestions() -> list:
+    if not PENDING_SUGGESTIONS_FILE.exists():
+        return []
+    try:
+        return json.loads(PENDING_SUGGESTIONS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+
+def _save_pending_suggestions(suggestions: list) -> None:
+    _ensure_memory_dir()
+    PENDING_SUGGESTIONS_FILE.write_text(
+        json.dumps(suggestions, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _clear_pending_suggestions() -> None:
+    if PENDING_SUGGESTIONS_FILE.exists():
+        PENDING_SUGGESTIONS_FILE.unlink()
+
+
+def _read_recent_history(hours: int = 24) -> list:
+    """Letzte N Stunden Konversation aus JSONL lesen."""
+    if not HISTORY_FILE.exists():
+        return []
+    cutoff = time.time() - hours * 3600
+    out = []
+    try:
+        with HISTORY_FILE.open("r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                    if rec.get("ts", 0) > cutoff:
+                        out.append(rec)
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return out
+
+
+def _read_recent_corrections(hours: int = 24) -> list:
+    """Letzte N Stunden Korrekturen."""
+    if not CORRECTIONS_FILE.exists():
+        return []
+    cutoff_dt = datetime.now(TIMEZONE) - timedelta(hours=hours)
+    out = []
+    try:
+        with CORRECTIONS_FILE.open("r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                    ts_str = rec.get("ts", "")
+                    if ts_str:
+                        rec_dt = datetime.fromisoformat(ts_str)
+                        if rec_dt > cutoff_dt:
+                            out.append(rec)
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return out
+
+
+async def compute_memory_suggestions() -> list:
+    """LLM analysiert letzte 24h, schlägt Memory-Updates vor.
+
+    Output: list of {type: 'preference'/'fact'/'project_context',
+                     text: str, evidence: str, project_slug?: str}
+    """
+    history = _read_recent_history(24)
+    corrections = _read_recent_corrections(24)
+
+    if not history and not corrections:
+        return []
+
+    # History aufs Wesentliche kondensieren
+    history_text_parts = []
+    for rec in history[-100:]:  # cap
+        msg = rec.get("msg", {})
+        role = msg.get("role", "?")
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            content = " ".join(str(c.get("text", "")) for c in content if isinstance(c, dict))
+        content_str = str(content)[:300]
+        history_text_parts.append(f"[{role}] {content_str}")
+    history_text = "\n".join(history_text_parts)
+
+    corrections_text = "\n".join(
+        f"- FALSCH: {c.get('was_falsch','')} | RICHTIG: {c.get('was_richtig','')} | KONTEXT: {c.get('kontext','')}"
+        for c in corrections
+    ) or "(keine Korrekturen)"
+
+    extraction_prompt = f"""Analysiere die folgende 24h-Konversation + Korrekturen und schlage konservativ neue Memory-Einträge vor.
+
+KORREKTUREN:
+{corrections_text[:2000]}
+
+KONVERSATION:
+{history_text[:6000]}
+
+Drei Memory-Typen die du vorschlagen kannst:
+1. preference — Stil/Antwort-Regel die User mehrfach erwähnt hat (z.B. "antworte kürzer")
+2. fact — Bio/Setup-Fakt über User der mehrfach auftaucht (z.B. "Schule: HTL Villach")
+3. project_context — projektspezifische Regel (mit project_slug Feld)
+
+REGELN:
+- KONSERVATIV: nur vorschlagen wenn klar/mehrfach/explizit. KEINE Halluzinationen.
+- Max 5 Vorschläge insgesamt.
+- Wenn nichts klar ist: leeres Array zurückgeben.
+- Nicht das vorschlagen was bereits in PRÄFERENZEN/FAKTEN-Sektion oben steht.
+
+Antworte AUSSCHLIESSLICH mit JSON-Array (kein Markdown, kein Erklärungs-Text):
+[
+  {{"type": "preference", "text": "...", "evidence": "Grund (kurz, 1 Satz)"}},
+  {{"type": "fact", "text": "...", "evidence": "..."}},
+  {{"type": "project_context", "project_slug": "...", "text": "...", "evidence": "..."}}
+]
+"""
+
+    try:
+        resp = await asyncio.to_thread(
+            llm.chat.completions.create,
+            model=LLM_MODEL,
+            messages=[
+                {"role": "system", "content": "Du bist Memory-Extractor. Antworte nur mit valid JSON."},
+                {"role": "user", "content": extraction_prompt},
+            ],
+            max_tokens=1500,
+        )
+        content = resp.choices[0].message.content or "[]"
+        # Strip markdown fences if any
+        content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content.strip())
+        suggestions = json.loads(content)
+        if not isinstance(suggestions, list):
+            return []
+        # Validate
+        clean = []
+        for s in suggestions[:5]:
+            if not isinstance(s, dict):
+                continue
+            stype = s.get("type")
+            text = s.get("text", "").strip()
+            if stype not in ("preference", "fact", "project_context") or not text:
+                continue
+            clean.append(s)
+        return clean
+    except Exception as e:
+        log.exception(f"compute_memory_suggestions failed: {e}")
+        return []
+
+
+def _format_suggestion_briefing(suggestions: list) -> str:
+    """Formatiert Suggestions als Telegram-HTML mit Antwort-Anleitung."""
+    if not suggestions:
+        return ""
+    type_labels = {
+        "preference": "✨ <b>PRÄFERENZEN</b> (Stil/Antwort-Regeln)",
+        "fact": "📌 <b>FAKTEN</b> (Bio/Setup über dich)",
+        "project_context": "🎯 <b>PROJEKT-KONTEXT</b> (Projekt-Regeln)",
+    }
+    by_type: dict = {}
+    for i, s in enumerate(suggestions, 1):
+        by_type.setdefault(s["type"], []).append((i, s))
+
+    msg = "🌙 <b>Memory-Vorschläge</b> <i>(Analyse der letzten 24h)</i>\n"
+    for ptype in ("preference", "fact", "project_context"):
+        items = by_type.get(ptype, [])
+        if not items:
+            continue
+        msg += f"\n{type_labels[ptype]}\n"
+        for i, s in items:
+            extra = ""
+            if ptype == "project_context" and s.get("project_slug"):
+                extra = f" <i>[{s['project_slug']}]</i>"
+            msg += f"<b>{i}.</b> {_esc_html(s['text'])}{extra}\n"
+            if s.get("evidence"):
+                msg += f"   <i>Grund: {_esc_html(s['evidence'][:120])}</i>\n"
+
+    msg += (
+        "\n────────────\n"
+        "<b>Wie du antwortest:</b>\n"
+        "• <code>1 3</code> oder <code>1,3</code> → speichert nur 1 und 3\n"
+        "• <code>alle</code> oder <code>ja</code> → alle übernehmen\n"
+        "• <code>0</code> oder <code>nein</code> → alle verwerfen\n"
+        "• <code>erkläre 2</code> → mehr Detail zu Vorschlag 2"
+    )
+    return msg
+
+
+async def nightly_suggestion_job(ctx: ContextTypes.DEFAULT_TYPE):
+    """JobQueue-Callback: nächtlich Memory-Vorschläge generieren + senden."""
+    try:
+        suggestions = await compute_memory_suggestions()
+        if not suggestions:
+            log.info("Nightly suggestions: nothing to suggest.")
+            return
+        _save_pending_suggestions(suggestions)
+        msg = _format_suggestion_briefing(suggestions)
+        await ctx.bot.send_message(
+            chat_id=ALLOWED_USER_ID,
+            text=msg,
+            parse_mode=constants.ParseMode.HTML,
+        )
+        log.info(f"Nightly briefing sent: {len(suggestions)} suggestions pending")
+    except Exception as e:
+        log.exception(f"nightly_suggestion_job failed: {e}")
+
+
+def apply_memory_suggestion(action: str) -> str:
+    """Verarbeitet User-Antwort auf Memory-Briefing.
+
+    Action-Formate: '1 3', '1,3', 'alle', 'ja', '0', 'nein', 'erkläre 2'
+    """
+    pending = _load_pending_suggestions()
+    if not pending:
+        return "Keine pending Memory-Vorschläge — vielleicht schon übernommen oder noch keine generiert."
+
+    action = (action or "").strip().lower()
+
+    # 'erkläre N'
+    explain_match = re.search(r"(?:erklär|erklar)\w*\s+(\d+)", action)
+    if explain_match:
+        n = int(explain_match.group(1))
+        if 1 <= n <= len(pending):
+            s = pending[n-1]
+            details = (f"Vorschlag {n}:\n"
+                       f"Typ: {s['type']}\n"
+                       f"Text: {s['text']}\n"
+                       f"Grund: {s.get('evidence', '-')}")
+            if s.get("project_slug"):
+                details += f"\nProjekt-Slug: {s['project_slug']}"
+            return details
+        return f"Vorschlag {n} existiert nicht (1-{len(pending)})."
+
+    # Decide which to apply
+    if action in ("alle", "all", "ja", "yes", "y"):
+        nums = list(range(1, len(pending) + 1))
+    elif action in ("0", "nein", "no", "n", "skip", "verwerfen"):
+        _clear_pending_suggestions()
+        return f"Alle {len(pending)} Vorschläge verworfen."
+    else:
+        nums = [int(x) for x in re.findall(r"\d+", action)]
+        nums = [n for n in nums if 1 <= n <= len(pending)]
+        if not nums:
+            return (f"'{action}' nicht verstanden. Erlaubt: '1 3' / 'alle' / 'nein' / 'erkläre N'")
+
+    applied = []
+    skipped = []
+    for n in nums:
+        s = pending[n-1]
+        try:
+            if s["type"] == "preference":
+                set_preference(s["text"])
+                applied.append(f"✓ Präf {n}: {s['text'][:60]}")
+            elif s["type"] == "fact":
+                remember(s["text"])
+                applied.append(f"✓ Fakt {n}: {s['text'][:60]}")
+            elif s["type"] == "project_context":
+                slug = s.get("project_slug", "")
+                if slug:
+                    update_project_context(slug, s["text"])
+                    applied.append(f"✓ Proj-Ctx {n} ({slug}): {s['text'][:50]}")
+                else:
+                    skipped.append(f"✗ {n}: project_slug fehlt")
+            else:
+                skipped.append(f"✗ {n}: unbekannter Typ {s['type']}")
+        except Exception as e:
+            skipped.append(f"✗ {n}: {e}")
+
+    _clear_pending_suggestions()
+
+    out = "Übernommen:\n" + "\n".join(applied)
+    if skipped:
+        out += "\n\nÜbersprungen:\n" + "\n".join(skipped)
+    return out
+
+
+def log_correction(was_falsch: str, was_richtig: str, kontext: str = "") -> str:
+    """Speichert eine Korrektur als Lern-Datenpunkt.
+
+    Wird ausgelöst wenn Bot etwas getan hat und User korrigiert
+    ('nein anders', 'ich meinte X', 'verschieb das doch nach Y').
+    Diese Records sind später Fine-Tuning-Gold (instruction-pair-Format).
+    """
+    if not was_falsch or not was_richtig:
+        return "log_correction: was_falsch + was_richtig sind beide Pflicht."
+    _ensure_memory_dir()
+    record = {
+        "ts": datetime.now(TIMEZONE).isoformat(timespec="seconds"),
+        "was_falsch": was_falsch.strip(),
+        "was_richtig": was_richtig.strip(),
+        "kontext": (kontext or "").strip(),
+    }
+    try:
+        with CORRECTIONS_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        log.info(f"Correction logged: {was_falsch[:60]}")
+        return "✓ Korrektur gespeichert (für späteres Lernen)."
+    except Exception as e:
+        log.exception("log_correction failed")
+        return f"Log-Fehler: {e}"
 
 
 def _save_history_line(user_id: int, message: dict) -> None:
@@ -1754,6 +2069,40 @@ TOOLS = [
         },
     }},
     {"type": "function", "function": {
+        "name": "apply_memory_suggestion",
+        "description": (
+            "Verarbeitet User-Antwort auf das nightly Memory-Vorschlags-Briefing. "
+            "Action-Formate: '1 3' (speichert 1+3), 'alle'/'ja' (alle), '0'/'nein' (alle verwerfen), "
+            "'erkläre 2' (Details). Nutze SOFORT wenn User auf eine Memory-Vorschlags-Liste antwortet."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"action": {"type": "string"}},
+            "required": ["action"],
+        },
+    }},
+    {"type": "function", "function": {
+        "name": "log_correction",
+        "description": (
+            "Speichert eine Korrektur in corrections.jsonl. RUFE DAS AUF wenn der "
+            "User dich korrigiert ('nein, anders', 'das war falsch', 'ich meinte X', "
+            "'verschieb das doch nach Y', 'mach das anders'). "
+            "was_falsch = was du getan/gesagt hast. "
+            "was_richtig = was der User wollte. "
+            "kontext = kurze Beschreibung der Situation. "
+            "Diese Daten werden für nightly Memory-Vorschläge + Fine-Tuning genutzt."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "was_falsch": {"type": "string"},
+                "was_richtig": {"type": "string"},
+                "kontext": {"type": "string"},
+            },
+            "required": ["was_falsch", "was_richtig"],
+        },
+    }},
+    {"type": "function", "function": {
         "name": "set_preference",
         "description": (
             "Speichert eine Stil-/Antwort-Präferenz dauerhaft in preferences.md. "
@@ -1955,6 +2304,8 @@ TOOL_HANDLERS = {
     "activate_project": activate_project,
     "deactivate_project": deactivate_project,
     "update_project_context": update_project_context,
+    "log_correction": log_correction,
+    "apply_memory_suggestion": apply_memory_suggestion,
     "create_project": create_project,
     "create_reminder": create_reminder,
     "list_reminders": list_reminders,
@@ -2070,6 +2421,17 @@ UNTERSCHEIDUNG wichtig:
 - **Stil-Regel** ("antworte kürzer") → set_preference, NICHT remember
 - **Bio-Fakt** ("ich heiße Julius") → remember, NICHT set_preference
 - **Projekt-Regel** ("Sanierung-Kiosk: ÖNORM B 2061") → update_project_context
+
+# KORREKTUREN LERNEN
+Wenn User dich aktiv korrigiert ("nein, anders", "das war falsch", "ich meinte X",
+"verschieb das doch nach Y", "mach das anders"): Rufe `log_correction(was_falsch,
+was_richtig, kontext)`. Das landet in corrections.jsonl als Trainings-Material
+für späteres Fine-Tuning + nightly Memory-Vorschläge.
+
+# NIGHTLY MEMORY-VORSCHLÄGE
+Jede Nacht analysiert ein Job die letzten 24h und schickt dir Memory-Vorschläge.
+Wenn User darauf antwortet (Format "1 3" / "alle" / "nein" / "erkläre 2"):
+SOFORT `apply_memory_suggestion(action)` rufen — Format ist genau diese Strings.
 
 # AUTO-TAGGING
 Beim Anlegen von Tasks / Notizen / Meetings: extrahiere **2-5 thematische Tags**
@@ -2940,6 +3302,21 @@ def main():
             log.warning(f"JobQueue-Setup fehlgeschlagen (BRIEFING_HOUR={BRIEFING_HOUR}): {e}")
     else:
         log.info("Daily-Briefing deaktiviert (BRIEFING_HOUR=0 oder Setup-Modus)")
+
+    # Nightly Memory-Suggestion-Briefing
+    if SUGGESTION_HOUR and ALLOWED_USER_ID > 0:
+        try:
+            sug_time = dtime(hour=SUGGESTION_HOUR, minute=0, tzinfo=TIMEZONE)
+            app.job_queue.run_daily(
+                nightly_suggestion_job,
+                time=sug_time,
+                name="nightly-memory-briefing",
+            )
+            log.info(f"Nightly-Memory-Vorschläge scheduled für {SUGGESTION_HOUR}:00 {TIMEZONE.key}")
+        except Exception as e:
+            log.warning(f"Suggestion-Job-Setup fehlgeschlagen: {e}")
+    else:
+        log.info("Nightly-Memory-Vorschläge deaktiviert (SUGGESTION_HOUR=0)")
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
