@@ -140,10 +140,24 @@ def slugify(s: str, max_len: int = 50) -> str:
 
 
 def safe_path(rel_path: str) -> Path:
-    """Resolve rel_path inside VAULT, prevent traversal."""
+    """Resolve rel_path inside VAULT, prevent traversal.
+
+    Nutzt is_relative_to (Python 3.9+) — startswith() ist anfällig für
+    Prefix-Bug: VAULT='/x/vault' würde '/x/vault_evil/secret' akzeptieren.
+    Vault selbst ist erlaubt (Edge-Case bei rel_path='').
+    """
+    vault_resolved = VAULT.resolve()
     p = (VAULT / rel_path).resolve()
-    if not str(p).startswith(str(VAULT.resolve())):
-        raise ValueError(f"Path traversal: {rel_path}")
+    try:
+        # is_relative_to True wenn p == vault_resolved oder echter Subpath
+        if not p.is_relative_to(vault_resolved):
+            raise ValueError(f"Path traversal: {rel_path}")
+    except AttributeError:
+        # Fallback für Python < 3.9 — separator-aware prefix-check
+        v_str = str(vault_resolved)
+        p_str = str(p)
+        if p_str != v_str and not p_str.startswith(v_str + os.sep):
+            raise ValueError(f"Path traversal: {rel_path}")
     return p
 
 
@@ -558,7 +572,9 @@ def append_to_daily(section: str, text: str) -> str:
 
 VALID_PRIORITIES = {"low", "medium", "high", "urgent"}
 VALID_TASK_CONTEXTS = {"home", "work", "errand", "phone", "computer"}
-VALID_RECURRENCE = {"daily", "weekdays", "weekly", "monthly"}
+# WICHTIG: getrennt von Reminder-Recurrence — Tasks haben monthly, Reminders nicht.
+# Frühere Doppeldefinition als VALID_RECURRENCE hat sich überschrieben → Bug.
+VALID_TASK_RECURRENCE = {"daily", "weekdays", "weekly", "monthly"}
 
 
 def create_task(title: str, priority: str = "medium",
@@ -717,8 +733,13 @@ def mark_task_done(slug: str) -> str:
 
 # ─── Tagesplanung: Listings + Agenda ────────────────────────────────────────
 
-# Priority-Sortierung für Listings (urgent zuerst)
+# Priority-Sortierung + Symbole (zentral — vermeidet Drift zwischen
+# _format_task_line und compute_briefing wo vorher unterschiedliche
+# Symbol-Maps definiert waren)
 _PRIO_ORDER = {"urgent": 0, "high": 1, "medium": 2, "low": 3}
+# Symbole nach visueller Lautstärke: 🔴 > 🟠 > • > · — low ist quasi unsichtbar,
+# medium dezenter Bullet, urgent/high deutlich
+PRIO_SYMBOLS = {"urgent": "🔴", "high": "🟠", "medium": "•", "low": "·"}
 
 
 def _read_open_tasks() -> list:
@@ -874,15 +895,30 @@ def list_open_tasks(when: Optional[str] = None,
 
 
 def _format_task_line(t: dict, today: date) -> str:
-    """Eine Task als Bullet-Zeile mit Symbolen."""
-    prio_sym = {"urgent": "🔴", "high": "🟠", "medium": "·", "low": "🔵"}.get(t.get("priority"), "·")
+    """Eine Task als Bullet-Zeile mit Symbolen.
+
+    Robust gegen YAML-Date-Objekte: PyYAML parsed unquoted `due: 2026-04-30`
+    zu `datetime.date`, nicht zu str → strptime würde TypeError werfen.
+    """
+    prio_sym = PRIO_SYMBOLS.get(t.get("priority"), PRIO_SYMBOLS["medium"])
     rec_sym = " 🔁" if t.get("recurrence") else ""
     proj = f" [{t['project']}]" if t.get("project") else ""
     due_str = ""
     d = t.get("due")
     if d:
-        try:
-            dd = datetime.strptime(d, "%Y-%m-%d").date()
+        # Normalisieren: date-Objekt oder String beide akzeptieren
+        dd = None
+        if isinstance(d, date) and not isinstance(d, datetime):
+            dd = d
+        elif isinstance(d, datetime):
+            dd = d.date()
+        elif isinstance(d, str):
+            try:
+                dd = datetime.strptime(d, "%Y-%m-%d").date()
+            except ValueError:
+                pass  # weiter unten als raw-String anzeigen
+
+        if dd is not None:
             delta = (dd - today).days
             if delta == 0:
                 due_str = " · heute"
@@ -893,8 +929,8 @@ def _format_task_line(t: dict, today: date) -> str:
             elif delta <= 7:
                 due_str = f" · in {delta}d"
             else:
-                due_str = f" · {d}"
-        except ValueError:
+                due_str = f" · {dd.isoformat()}"
+        else:
             due_str = f" · {d}"
     return f"  {prio_sym} [[{t['id']}]] {t['title']}{proj}{due_str}{rec_sym}"
 
@@ -1201,6 +1237,8 @@ def move_path(src_rel: str, dst_rel: str, overwrite: bool = False) -> str:
     src_rel_clean = src.relative_to(VAULT).as_posix()
     final_rel = final.relative_to(VAULT).as_posix()
     kind = "Ordner" if final.is_dir() else "Datei"
+    # Move kann .md-File in/aus Skip-Dirs (z.B. 99_Archive) bewegen → Index neu bauen
+    invalidate_link_index()
     return f"✓ {kind} verschoben: `{src_rel_clean}` → `{final_rel}`"
 
 
@@ -1262,6 +1300,9 @@ def move_paths(srcs: list, dst_dir: str, overwrite: bool = False) -> str:
             successes.append(src.name)
         except Exception as e:
             failures.append(f"{src.name}: {e}")
+
+    if successes:
+        invalidate_link_index()  # Files könnten in/aus Skip-Dirs verschoben sein
 
     dst_rel_out = dst.relative_to(VAULT).as_posix()
     parts = [f"✓ {len(successes)} verschoben → `{dst_rel_out}/`"]
@@ -1360,6 +1401,7 @@ def move_project(slug: str, parent: Optional[str] = None) -> str:
     src_rel = src.relative_to(VAULT).as_posix()
     dst_rel = dst.relative_to(VAULT).as_posix()
     parent_info = f" (jetzt Subprojekt von `{parent}`)" if parent else " (jetzt Top-Level)"
+    invalidate_link_index()
     return f"✓ Projekt verschoben: `{src_rel}/` → `{dst_rel}/`{parent_info}"
 
 
@@ -1381,6 +1423,9 @@ def edit_file(rel_path: str, find: str, replace: str, regex: bool = False) -> st
         if n == 0:
             return f"Kein Treffer für '{find[:50]}' in {rel_path}"
         atomic_write(path, new)
+        # Edit könnte Frontmatter (id/title/aliases) verändert haben → defensiv neu indexieren
+        if path.suffix == ".md":
+            invalidate_link_index()
         return f"{n}× ersetzt in {rel_path}"
     except Exception as e:
         return f"Edit-Fehler: {e}"
@@ -1586,7 +1631,9 @@ def _save_reminders(reminders: list) -> None:
     )
 
 
-VALID_RECURRENCE = {None, "", "daily", "weekly", "weekdays"}
+# Reminder-Recurrence (kein monthly — Reminders sind zeitpunkt-basiert,
+# monthly würde unklar bei "31. + Februar"-Edge-Cases). Tasks haben eigene Konstante.
+VALID_REMINDER_RECURRENCE = {None, "", "daily", "weekly", "weekdays"}
 
 
 def create_reminder(when_iso: str, message: str, recurrence: Optional[str] = None) -> str:
@@ -1607,7 +1654,7 @@ def create_reminder(when_iso: str, message: str, recurrence: Optional[str] = Non
         when_dt = when_dt.replace(tzinfo=TIMEZONE)
 
     rec = (recurrence or None) if recurrence else None
-    if rec not in VALID_RECURRENCE:
+    if rec not in VALID_REMINDER_RECURRENCE:
         return f"Ungültige Recurrence '{recurrence}'. Erlaubt: leer / daily / weekly / weekdays"
 
     # Ein-shot Reminder in der Vergangenheit ablehnen (außer recurring)
@@ -4238,12 +4285,12 @@ def compute_briefing() -> str:
             parts.append(f"• {_esc_html(title)} <i>(seit {due})</i>")
 
     if open_tasks:
-        prio_order = {"urgent": 0, "high": 1, "medium": 2, "low": 3}
-        open_tasks.sort(key=lambda x: (prio_order.get(x[2], 9), x[3] or "9999"))
+        # Zentrale Konstanten — keine lokale Re-Definition mehr (war Inkonsistenz-Quelle)
+        open_tasks.sort(key=lambda x: (_PRIO_ORDER.get(x[2], 9), x[3] or "9999"))
         parts.append("\n✏️ <b>Offene Tasks</b>")
         for tid, title, prio, due in open_tasks[:8]:
             due_str = f" <i>(bis {due})</i>" if due else ""
-            prio_emoji = {"urgent": "🔴", "high": "🟠", "medium": "•", "low": "·"}.get(prio, "•")
+            prio_emoji = PRIO_SYMBOLS.get(prio, PRIO_SYMBOLS["medium"])
             parts.append(f"{prio_emoji} {_esc_html(title)}{due_str}")
         if len(open_tasks) > 8:
             parts.append(f"<i>… und {len(open_tasks)-8} weitere</i>")
@@ -4349,10 +4396,19 @@ def _is_recurrence_due(pattern: str, last_completed: str, today: date) -> bool:
         # Reaktivieren wenn ≥7 Tage seit letztem Done
         return (today - last).days >= 7
     if pattern == "monthly":
-        # Reaktivieren wenn anderer Monat ODER heute am Monatstag wie last_completed
-        if today.month != last.month or today.year != last.year:
-            return today.day >= last.day
-        return False
+        # Reaktivieren wenn anderer Monat UND wir den last.day-Tag-of-Month
+        # erreicht haben — bzw. am Monatsende falls last.day > Monatslänge
+        # (sonst würde 31er-Task in Februar/April/... NIE reaktivieren).
+        if today.month == last.month and today.year == last.year:
+            return False
+        # Letzter Tag des aktuellen Monats:
+        if today.month == 12:
+            next_first = date(today.year + 1, 1, 1)
+        else:
+            next_first = date(today.year, today.month + 1, 1)
+        last_day_of_month = (next_first - timedelta(days=1)).day
+        target_day = min(last.day, last_day_of_month)
+        return today.day >= target_day
     return False
 
 
@@ -4377,7 +4433,7 @@ def reset_recurring_tasks() -> dict:
             continue
         meta = post.metadata
         recurrence = meta.get("recurrence")
-        if not recurrence or recurrence not in VALID_RECURRENCE:
+        if not recurrence or recurrence not in VALID_TASK_RECURRENCE:
             continue
         if meta.get("status") != "done":
             continue
@@ -4563,6 +4619,20 @@ def main():
     if not TEMPLATES_DIR.exists():
         log.error(f"Templates-Ordner fehlt: {TEMPLATES_DIR}")
         return
+
+    # ─── Tool-Konsistenz-Check: TOOLS-Schema ↔ TOOL_HANDLERS-Dispatch ───
+    # Bei Drift wird der Bot beim Boot abgewiesen statt erst zur Laufzeit
+    # mit "Tool nicht bekannt"-Errors zu enttäuschen.
+    declared = {t["function"]["name"] for t in TOOLS if t.get("function", {}).get("name")}
+    handled = set(TOOL_HANDLERS.keys())
+    missing_handlers = declared - handled
+    orphan_handlers = handled - declared
+    if missing_handlers:
+        log.error(f"❌ Tools im Schema OHNE Handler: {sorted(missing_handlers)}")
+        return
+    if orphan_handlers:
+        log.warning(f"⚠️  Handler ohne Tool-Schema (für LLM unsichtbar): {sorted(orphan_handlers)}")
+    log.info(f"Tools: {len(declared)} declared, {len(handled)} handled — alle aligned")
     app = Application.builder().token(TG_TOKEN).build()
 
     # Globale Referenz fuer Tools die JobQueue brauchen (z.B. create_reminder)
