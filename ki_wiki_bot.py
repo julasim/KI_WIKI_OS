@@ -1231,6 +1231,10 @@ HISTORY_MAX_MESSAGES = 60       # ca. 30 User+Assistant-Turns
 HISTORY_TIMEOUT = 60 * 60       # 1h Inaktivität → RAM-Cache leeren, beim nächsten Zugriff von Disk lazy-laden
 HISTORY_PERSIST_LIMIT = 1000    # max Lines im JSONL bevor compaction (auf 200 trim)
 
+# Lock gegen Race-Conditions zwischen User-Messages und nightly_suggestion_job
+# (asyncio-cooperative — kein echtes Threading, aber sauber)
+_HISTORY_LOCK = asyncio.Lock()
+
 BOT_MEMORY_DIR = VAULT / "06_Meta" / "bot-memory"
 FACTS_FILE = BOT_MEMORY_DIR / "facts.md"
 PREFERENCES_FILE = BOT_MEMORY_DIR / "preferences.md"
@@ -1293,24 +1297,24 @@ def list_facts() -> str:
     return f"Persistente Fakten:\n\n{facts[:3000]}"
 
 
-def forget_fact(matching_text: str) -> str:
-    """Entfernt Fakten die `matching_text` enthalten (case-insensitive)."""
+def forget_fact(pattern: str) -> str:
+    """Entfernt Fakten die `pattern` enthalten (case-insensitive)."""
     if not FACTS_FILE.exists():
         return "Keine Fakten-Datei."
-    if not matching_text or not matching_text.strip():
+    if not pattern or not pattern.strip():
         return "Such-Text fehlt."
-    matching_text = matching_text.strip().lower()
+    needle = pattern.strip().lower()
     content = FACTS_FILE.read_text(encoding="utf-8")
     lines = content.splitlines()
     kept = []
     removed = []
     for line in lines:
-        if line.startswith("- ") and matching_text in line.lower():
+        if line.startswith("- ") and needle in line.lower():
             removed.append(line)
         else:
             kept.append(line)
     if not removed:
-        return f"Kein Fakt gefunden mit '{matching_text}'."
+        return f"Kein Fakt gefunden mit '{pattern}'."
     FACTS_FILE.write_text("\n".join(kept) + "\n", encoding="utf-8")
     return f"Entfernt ({len(removed)}):\n" + "\n".join(removed[:5])
 
@@ -1373,22 +1377,22 @@ def list_preferences() -> str:
     return f"Präferenzen:\n\n{prefs[:2000]}"
 
 
-def forget_preference(matching_text: str) -> str:
+def forget_preference(pattern: str) -> str:
     if not PREFERENCES_FILE.exists():
         return "Keine Präferenzen-Datei."
-    if not matching_text or not matching_text.strip():
+    if not pattern or not pattern.strip():
         return "Such-Text fehlt."
-    matching = matching_text.strip().lower()
+    needle = pattern.strip().lower()
     content = PREFERENCES_FILE.read_text(encoding="utf-8")
     lines = content.splitlines()
     kept, removed = [], []
     for line in lines:
-        if line.startswith("- ") and matching in line.lower():
+        if line.startswith("- ") and needle in line.lower():
             removed.append(line)
         else:
             kept.append(line)
     if not removed:
-        return f"Keine Präferenz mit '{matching_text}'."
+        return f"Keine Präferenz mit '{pattern}'."
     PREFERENCES_FILE.write_text("\n".join(kept) + "\n", encoding="utf-8")
     return f"Entfernt ({len(removed)}):\n" + "\n".join(removed[:5])
 
@@ -1833,8 +1837,8 @@ def _maybe_compact_history() -> None:
         log.warning(f"history compact failed: {e}")
 
 
-def get_history(user_id: int) -> list:
-    """History für User. Bei Cache-Miss/Timeout: lazy-load aus JSONL."""
+def _get_history_unlocked(user_id: int) -> list:
+    """Interner Read — ohne Lock. Nur aus locked Context aufrufen."""
     last = CONVERSATION_TIMESTAMPS.get(user_id, 0.0)
     cached = CONVERSATION_HISTORY.get(user_id)
     if cached is None or (time.time() - last) > HISTORY_TIMEOUT:
@@ -1846,27 +1850,40 @@ def get_history(user_id: int) -> list:
     return cached
 
 
-def update_history(user_id: int, new_messages: list) -> None:
-    """History anhängen + persistieren + auf Max-Länge trimmen."""
-    history = get_history(user_id)
-    history.extend(new_messages)
-    if len(history) > HISTORY_MAX_MESSAGES:
-        history = history[-HISTORY_MAX_MESSAGES:]
-    CONVERSATION_HISTORY[user_id] = history
-    CONVERSATION_TIMESTAMPS[user_id] = time.time()
-    # Persistieren
-    for msg in new_messages:
-        _save_history_line(user_id, msg)
-    _maybe_compact_history()
+async def get_history(user_id: int) -> list:
+    """History für User. Bei Cache-Miss/Timeout: lazy-load aus JSONL.
+
+    Lock-protected gegen race conditions zwischen User-Messages + nightly Job.
+    """
+    async with _HISTORY_LOCK:
+        return list(_get_history_unlocked(user_id))  # Copy → kein Mutation-Risiko
 
 
-def reset_history(user_id: int) -> None:
+async def update_history(user_id: int, new_messages: list) -> None:
+    """History anhängen + persistieren + auf Max-Länge trimmen.
+
+    Lock-protected: read+modify+write atomic, JSONL-Append innerhalb Lock.
+    """
+    async with _HISTORY_LOCK:
+        history = list(_get_history_unlocked(user_id))
+        history.extend(new_messages)
+        if len(history) > HISTORY_MAX_MESSAGES:
+            history = history[-HISTORY_MAX_MESSAGES:]
+        CONVERSATION_HISTORY[user_id] = history
+        CONVERSATION_TIMESTAMPS[user_id] = time.time()
+        for msg in new_messages:
+            _save_history_line(user_id, msg)
+        _maybe_compact_history()
+
+
+async def reset_history(user_id: int) -> None:
     """RAM-Cache leeren. JSONL bleibt erhalten — Memory wird beim nächsten Mal neu geladen.
 
     Wenn du wirklich permanent löschen willst: HISTORY_FILE manuell entfernen.
     """
-    CONVERSATION_HISTORY.pop(user_id, None)
-    CONVERSATION_TIMESTAMPS.pop(user_id, None)
+    async with _HISTORY_LOCK:
+        CONVERSATION_HISTORY.pop(user_id, None)
+        CONVERSATION_TIMESTAMPS.pop(user_id, None)
 
 
 # ============================================================================
@@ -2126,8 +2143,8 @@ TOOLS = [
         "description": "Entfernt Präferenzen die einen Text enthalten. Nutze bei 'vergiss die Stil-Regel X'.",
         "parameters": {
             "type": "object",
-            "properties": {"matching_text": {"type": "string"}},
-            "required": ["matching_text"],
+            "properties": {"pattern": {"type": "string", "description": "Text-Snippet in der Präferenz zum matchen (case-insensitive)"}},
+            "required": ["pattern"],
         },
     }},
     {"type": "function", "function": {
@@ -2195,8 +2212,8 @@ TOOLS = [
         "description": "Entfernt Fakten die einen bestimmten Text enthalten. Nutze wenn User 'vergiss X' o.ä. sagt.",
         "parameters": {
             "type": "object",
-            "properties": {"matching_text": {"type": "string", "description": "Text-Snippet im Fakt zum matchen"}},
-            "required": ["matching_text"],
+            "properties": {"pattern": {"type": "string", "description": "Text-Snippet im Fakt zum matchen (case-insensitive)"}},
+            "required": ["pattern"],
         },
     }},
     {"type": "function", "function": {
@@ -2417,10 +2434,17 @@ eingespeist wenn vorhanden — siehe oben "PRÄFERENZEN", "PERSISTENTE FAKTEN",
    Trigger: "lass uns über Projekt X reden" / "arbeite jetzt an X" → activate_project(X)
    "X hat Auftraggeber Y, Frist Z" + Projekt aktiv → update_project_context(X, ...)
 
-UNTERSCHEIDUNG wichtig:
-- **Stil-Regel** ("antworte kürzer") → set_preference, NICHT remember
-- **Bio-Fakt** ("ich heiße Julius") → remember, NICHT set_preference
-- **Projekt-Regel** ("Sanierung-Kiosk: ÖNORM B 2061") → update_project_context
+UNTERSCHEIDUNG wichtig — präzise Decision-Tree:
+- **Verhalten/Format/Stil/Tonalität** ("antworte kürzer", "kein 'gerne!'", "Datum als DD.MM.",
+  "weniger Tabellen", "ich mag knappere Listen") → `set_preference`. Es geht um WIE der Bot reagiert.
+- **Bio/Person/Setup über User** ("ich heiße Julius", "mein KV-Lohn ist 32,80€/h", "ich studiere
+  HTL Villach", "meine Arbeitszeit ist Mo-Fr 7-15") → `remember`. Es geht um WAS über den User wahr ist.
+- **Projekt-spezifische Regel** ("Sanierung-Kiosk: ÖNORM B 2061", "Auftraggeber: Schiemer") →
+  `update_project_context`. Nur sinnvoll wenn das Projekt aktiv ist.
+
+MULTI-FAKT-KOMPRESSION: Wenn User mehrere Fakten in einem Satz nennt
+("merk dir X und Y und Z"), rufe `remember` EINMAL mit `\n`-getrenntem Multi-Line-Text auf,
+NICHT 3× mit jeweils einem Fakt. Bei `set_preference` analog.
 
 # KORREKTUREN LERNEN
 Wenn User dich aktiv korrigiert ("nein, anders", "das war falsch", "ich meinte X",
@@ -2428,10 +2452,21 @@ Wenn User dich aktiv korrigiert ("nein, anders", "das war falsch", "ich meinte X
 was_richtig, kontext)`. Das landet in corrections.jsonl als Trainings-Material
 für späteres Fine-Tuning + nightly Memory-Vorschläge.
 
-# NIGHTLY MEMORY-VORSCHLÄGE
-Jede Nacht analysiert ein Job die letzten 24h und schickt dir Memory-Vorschläge.
-Wenn User darauf antwortet (Format "1 3" / "alle" / "nein" / "erkläre 2"):
-SOFORT `apply_memory_suggestion(action)` rufen — Format ist genau diese Strings.
+# NIGHTLY MEMORY-VORSCHLÄGE — WICHTIGER TRIGGER
+Jede Nacht analysiert ein Job die letzten 24h und schickt dir Memory-Vorschläge
+mit nummerierter Liste (1., 2., 3., ...).
+
+Wenn der User danach mit einer der folgenden Mustern antwortet:
+- "1 3" / "1, 3" / "1,3" — Komma oder Space-getrennte Zahlen
+- "alle" / "ja" / "all" / "yes"
+- "0" / "nein" / "skip" / "no"
+- "erkläre 2" / "erkläre Vorschlag 3"
+
+→ SOFORT `apply_memory_suggestion(action)` mit dem EXAKTEN User-String aufrufen.
+Das gilt auch wenn die Antwort SEHR kurz ist (nur Zahlen) — interpretiere sie nicht
+als Task-Nummer oder Reminder-Index. Bei zweideutigen Fällen ("1 3" könnte auch
+Task-Nummern sein): wenn `pending-suggestions.json` existiert UND letzte Konversation
+das Briefing enthielt → es ist eine Memory-Antwort.
 
 # AUTO-TAGGING
 Beim Anlegen von Tasks / Notizen / Meetings: extrahiere **2-5 thematische Tags**
@@ -2480,7 +2515,7 @@ async def llm_loop(user_text: str, user_id: int) -> str:
             sys_text += f"\n\n# AKTIVES PROJEKT: {active_proj} (keine CONTEXT.md gesetzt)\n"
 
     # System-Prompt + History + neue User-Message
-    history = get_history(user_id)
+    history = await get_history(user_id)
     new_user_msg = {"role": "user", "content": user_text}
     messages = [
         {
@@ -2513,7 +2548,7 @@ async def llm_loop(user_text: str, user_id: int) -> str:
         new_history_msgs.append(msg_dict)
 
         if not msg.tool_calls:
-            update_history(user_id, new_history_msgs)
+            await update_history(user_id, new_history_msgs)
             return msg.content or "(keine Antwort)"
 
         for tc in msg.tool_calls:
@@ -2536,7 +2571,7 @@ async def llm_loop(user_text: str, user_id: int) -> str:
             messages.append(tool_msg)
             new_history_msgs.append(tool_msg)
 
-    update_history(user_id, new_history_msgs)
+    await update_history(user_id, new_history_msgs)
     return "(Tool-Loop-Limit erreicht — bitte präziser fragen.)"
 
 
@@ -2871,7 +2906,7 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             if ocr_text:
                 hist_msg += f"\nOCR-Text:\n{ocr_text[:400]}"
-            update_history(update.effective_user.id, [
+            await update_history(update.effective_user.id, [
                 {"role": "user", "content": hist_msg}
             ])
         except Exception as e:
@@ -3021,7 +3056,7 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 history_msg += f" PDF-Wrapper: `{wrapper_link}` (id: `{md_id}`)."
             if body_preview:
                 history_msg += f"\nInhalts-Auszug:\n{body_preview[:400]}"
-            update_history(update.effective_user.id, [
+            await update_history(update.effective_user.id, [
                 {"role": "user", "content": history_msg}
             ])
         except Exception as e:
@@ -3190,7 +3225,7 @@ async def handle_backup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def handle_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Setzt Conversation-Memory + pending Deletes zurück."""
     # Konsistent ALLOWED_USER_ID nutzen — ist single-user-bot
-    reset_history(ALLOWED_USER_ID)
+    await reset_history(ALLOWED_USER_ID)
     PENDING_DELETIONS.pop(ALLOWED_USER_ID, None)
     await update.message.reply_text("🔄 Memory + pending Deletes geleert. Frischer Anfang.")
 
