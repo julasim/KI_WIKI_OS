@@ -1142,9 +1142,19 @@ SORT date DESC
     post = frontmatter.Post(body, **post_data)
     atomic_write(readme_path, frontmatter.dumps(post) + "\n")
 
+    # CONTEXT.md leer initialisieren — kann später via update_project_context befüllt werden
+    context_path = proj_dir / "CONTEXT.md"
+    context_path.write_text(
+        f"# Kontext: {slug}\n\n"
+        "_Projekt-spezifische Regeln/Infos (Auftraggeber, Tech-Stack, Frist, Budget). "
+        f"Wird automatisch in den Bot-Prompt geladen wenn `activate_project({slug})` aktiv._\n\n"
+        "_(noch leer — fülle via Bot-Tool `update_project_context` oder direkt in Obsidian)_\n",
+        encoding="utf-8",
+    )
+
     return (f"✓ Projekt angelegt: [[project-{slug}]]\n"
-            f"Ordner: `10_Life/projects/{slug}/`\n"
-            f"Tipp: Tasks/Notes mit `project: {slug}` werden automatisch im Projekt-README gelistet.")
+            f"Ordner: `10_Life/projects/{slug}/` (README + CONTEXT.md)\n"
+            f"Tipp: `activate_project {slug}` schaltet projektspez. Kontext im Bot scharf.")
 
 
 # Noise-Verzeichnisse die in list_files-Output rausgefiltert werden
@@ -1219,6 +1229,8 @@ HISTORY_PERSIST_LIMIT = 1000    # max Lines im JSONL bevor compaction (auf 200 t
 
 BOT_MEMORY_DIR = VAULT / "06_Meta" / "bot-memory"
 FACTS_FILE = BOT_MEMORY_DIR / "facts.md"
+PREFERENCES_FILE = BOT_MEMORY_DIR / "preferences.md"
+ACTIVE_PROJECT_FILE = BOT_MEMORY_DIR / "active-project.txt"
 HISTORY_FILE = BOT_MEMORY_DIR / "conversation-history.jsonl"
 
 
@@ -1295,6 +1307,166 @@ def forget_fact(matching_text: str) -> str:
         return f"Kein Fakt gefunden mit '{matching_text}'."
     FACTS_FILE.write_text("\n".join(kept) + "\n", encoding="utf-8")
     return f"Entfernt ({len(removed)}):\n" + "\n".join(removed[:5])
+
+
+# ─── Präferenzen (Stil/Tonalität — wie der Bot reden soll) ──────────────────
+
+def _strip_md_intro(content: str) -> str:
+    """Entfernt erste H1-Überschrift + Italic-Erklärung am Datei-Anfang."""
+    if content.startswith("---"):
+        parts = content.split("---", 2)
+        if len(parts) >= 3:
+            content = parts[2].strip()
+    lines = content.splitlines()
+    # H1 raus
+    while lines and (lines[0].startswith("# ") or lines[0].strip() == ""):
+        lines.pop(0)
+    # Italic-Doku (z.B. _Hier sammelt..._) raus
+    while lines and lines[0].strip().startswith("_") and lines[0].strip().endswith("_"):
+        lines.pop(0)
+        # Leerzeile danach
+        while lines and lines[0].strip() == "":
+            lines.pop(0)
+    return "\n".join(lines).strip()
+
+
+def get_preferences() -> str:
+    """Lese Präferenzen-Inhalt (für System-Prompt-Injection)."""
+    if not PREFERENCES_FILE.exists():
+        return ""
+    try:
+        return _strip_md_intro(PREFERENCES_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        log.warning(f"preferences read failed: {e}")
+        return ""
+
+
+def set_preference(text: str) -> str:
+    """Fügt Präferenz hinzu (z.B. 'Antworte direkt ohne Floskeln')."""
+    if not text or not text.strip():
+        return "Präferenz-Text fehlt."
+    text = text.strip()
+    _ensure_memory_dir()
+    if not PREFERENCES_FILE.exists():
+        PREFERENCES_FILE.write_text(
+            "# Präferenzen — wie der Bot mir antworten soll\n\n"
+            "_Stil, Tonalität, Format. Werden bei jedem LLM-Call automatisch in den System-Prompt eingespeist._\n\n",
+            encoding="utf-8",
+        )
+    today = today_iso()
+    line = f"- ({today}) {text}\n"
+    with PREFERENCES_FILE.open("a", encoding="utf-8") as f:
+        f.write(line)
+    return f"✓ Präferenz gemerkt: {text[:120]}"
+
+
+def list_preferences() -> str:
+    prefs = get_preferences()
+    if not prefs:
+        return "Keine Präferenzen gespeichert."
+    return f"Präferenzen:\n\n{prefs[:2000]}"
+
+
+def forget_preference(matching_text: str) -> str:
+    if not PREFERENCES_FILE.exists():
+        return "Keine Präferenzen-Datei."
+    if not matching_text or not matching_text.strip():
+        return "Such-Text fehlt."
+    matching = matching_text.strip().lower()
+    content = PREFERENCES_FILE.read_text(encoding="utf-8")
+    lines = content.splitlines()
+    kept, removed = [], []
+    for line in lines:
+        if line.startswith("- ") and matching in line.lower():
+            removed.append(line)
+        else:
+            kept.append(line)
+    if not removed:
+        return f"Keine Präferenz mit '{matching_text}'."
+    PREFERENCES_FILE.write_text("\n".join(kept) + "\n", encoding="utf-8")
+    return f"Entfernt ({len(removed)}):\n" + "\n".join(removed[:5])
+
+
+# ─── Projekt-Kontext (per-Projekt CONTEXT.md, on-demand) ────────────────────
+
+def get_active_project() -> Optional[str]:
+    """Slug des aktuell-aktiven Projekts (oder None)."""
+    if not ACTIVE_PROJECT_FILE.exists():
+        return None
+    try:
+        slug = ACTIVE_PROJECT_FILE.read_text(encoding="utf-8").strip()
+        return slug or None
+    except Exception:
+        return None
+
+
+def get_project_context(slug: str) -> str:
+    """Liest CONTEXT.md eines Projekts."""
+    proj_dir = LIFE / "projects" / slug
+    if not proj_dir.exists():
+        return ""
+    context_file = proj_dir / "CONTEXT.md"
+    if not context_file.exists():
+        return ""
+    try:
+        return _strip_md_intro(context_file.read_text(encoding="utf-8"))
+    except Exception as e:
+        log.warning(f"project context read failed for {slug}: {e}")
+        return ""
+
+
+def activate_project(slug: str) -> str:
+    """Setzt ein Projekt als aktiv — sein CONTEXT.md wird automatisch im Prompt geladen."""
+    if not slug or not slug.strip():
+        return "Projekt-Slug fehlt."
+    slug = slug.strip().lower()
+    if slug.startswith("project-"):
+        slug = slug[len("project-"):]
+    proj_dir = LIFE / "projects" / slug
+    if not proj_dir.exists():
+        return f"Projekt nicht gefunden: {slug}"
+    _ensure_memory_dir()
+    ACTIVE_PROJECT_FILE.write_text(slug, encoding="utf-8")
+    ctx = get_project_context(slug)
+    ctx_info = f" (CONTEXT.md: {len(ctx)} Zeichen)" if ctx else " (noch keine CONTEXT.md)"
+    return f"✓ Projekt aktiviert: [[project-{slug}]]{ctx_info}"
+
+
+def deactivate_project() -> str:
+    """Bricht aktives Projekt ab — CONTEXT.md wird nicht mehr geladen."""
+    was = get_active_project()
+    if ACTIVE_PROJECT_FILE.exists():
+        ACTIVE_PROJECT_FILE.unlink()
+    return f"Aktives Projekt zurückgesetzt (war: {was or 'keins'})."
+
+
+def update_project_context(slug: str, text: str, mode: str = "append") -> str:
+    """Update CONTEXT.md eines Projekts. mode: 'append' (default) oder 'replace'."""
+    if not slug or not slug.strip():
+        return "Slug fehlt."
+    slug = slug.strip().lower()
+    if slug.startswith("project-"):
+        slug = slug[len("project-"):]
+    proj_dir = LIFE / "projects" / slug
+    if not proj_dir.exists():
+        return f"Projekt nicht gefunden: {slug}"
+    if mode not in ("append", "replace"):
+        mode = "append"
+
+    context_file = proj_dir / "CONTEXT.md"
+    header = (
+        f"# Kontext: {slug}\n\n"
+        "_Projekt-spezifischer Kontext für den Bot. Nur aktiv wenn Projekt via "
+        "`activate_project` aktiviert ist._\n\n"
+    )
+
+    if mode == "replace" or not context_file.exists():
+        context_file.write_text(header + text.strip() + "\n", encoding="utf-8")
+        return f"✓ CONTEXT.md für {slug} {'ersetzt' if mode == 'replace' else 'angelegt'}"
+    else:
+        with context_file.open("a", encoding="utf-8") as f:
+            f.write(f"\n{text.strip()}\n")
+        return f"✓ CONTEXT.md für {slug} erweitert"
 
 
 def _save_history_line(user_id: int, message: dict) -> None:
@@ -1582,6 +1754,72 @@ TOOLS = [
         },
     }},
     {"type": "function", "function": {
+        "name": "set_preference",
+        "description": (
+            "Speichert eine Stil-/Antwort-Präferenz dauerhaft in preferences.md. "
+            "Nutze wenn User sagt 'antworte immer kürzer', 'verwende kein gerne!', "
+            "'gib Datum in DD.MM. statt ISO', etc. UNTERSCHIED zu remember(): "
+            "Präferenzen = wie der Bot reagieren soll, Facts = was der Bot wissen muss."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"text": {"type": "string", "description": "Präferenz als knapper Satz"}},
+            "required": ["text"],
+        },
+    }},
+    {"type": "function", "function": {
+        "name": "list_preferences",
+        "description": "Zeigt alle gespeicherten Präferenzen.",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    }},
+    {"type": "function", "function": {
+        "name": "forget_preference",
+        "description": "Entfernt Präferenzen die einen Text enthalten. Nutze bei 'vergiss die Stil-Regel X'.",
+        "parameters": {
+            "type": "object",
+            "properties": {"matching_text": {"type": "string"}},
+            "required": ["matching_text"],
+        },
+    }},
+    {"type": "function", "function": {
+        "name": "activate_project",
+        "description": (
+            "Setzt ein Projekt als aktiv — sein CONTEXT.md wird ab jetzt in jeden "
+            "System-Prompt eingespeist (projektspezifische Regeln, Auftraggeber, Fristen, etc.). "
+            "Nutze wenn User sagt 'lass uns über Projekt X reden', 'arbeite jetzt an X', "
+            "'aktiviere X'. Slug ohne 'project-' Präfix."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"slug": {"type": "string", "description": "z.B. 'sanierung-kiosk'"}},
+            "required": ["slug"],
+        },
+    }},
+    {"type": "function", "function": {
+        "name": "deactivate_project",
+        "description": "Bricht aktives Projekt ab (CONTEXT.md wird nicht mehr in Prompt geladen).",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    }},
+    {"type": "function", "function": {
+        "name": "update_project_context",
+        "description": (
+            "Schreibt projektspezifischen Kontext nach 10_Life/projects/<slug>/CONTEXT.md. "
+            "mode='append' (default) hängt an, 'replace' überschreibt komplett. "
+            "Nutze für Projekt-Setup-Infos: Auftraggeber, Tech-Stack, Fristen, Budget, "
+            "spezielle Regeln. Wird automatisch in den System-Prompt geladen wenn dieses "
+            "Projekt aktiv ist."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "slug": {"type": "string"},
+                "text": {"type": "string"},
+                "mode": {"type": "string", "enum": ["append", "replace"], "default": "append"},
+            },
+            "required": ["slug", "text"],
+        },
+    }},
+    {"type": "function", "function": {
         "name": "remember",
         "description": (
             "Fügt einen persistenten Fakt zur Bot-Memory hinzu (06_Meta/bot-memory/facts.md). "
@@ -1711,6 +1949,12 @@ TOOL_HANDLERS = {
     "remember": remember,
     "list_facts": list_facts,
     "forget_fact": forget_fact,
+    "set_preference": set_preference,
+    "list_preferences": list_preferences,
+    "forget_preference": forget_preference,
+    "activate_project": activate_project,
+    "deactivate_project": deactivate_project,
+    "update_project_context": update_project_context,
     "create_project": create_project,
     "create_reminder": create_reminder,
     "list_reminders": list_reminders,
@@ -1800,16 +2044,32 @@ Begrüßung, Smalltalk, Fragen, Statements ohne Speicher-Verb → antworten, **n
   (z.B. "dringend Server-Backup einrichten" → title="Server-Backup einrichten",
   priority="urgent")
 
-# MEMORY
-Du hast 3-Tier-Memory:
-1. Aktuelle Konversation (letzte ~30 Turns)
-2. Persistente History (alles, lazy-load nach Restart)
-3. Long-term Fakten (siehe oben unter "PERSISTENTE FAKTEN" — falls da, nutzen)
+# MEMORY (mehrstufig)
 
-Wenn User dauerhaft was merken soll ("merk dir dass...", "speicher das als Fakt",
-"mein KV-Lohn ist X", "ich studiere an Y"): rufe `remember(fact)` auf.
-Wenn User "vergiss X" sagt: `forget_fact(matching_text)`.
-Wenn User "was weißt du über mich" / "welche Fakten hast du" fragt: `list_facts`.
+**Konversation**: Letzte ~30 Turns (RAM) + komplette History (persistiert).
+Du erinnerst dich an alles innerhalb einer Session und auch über Bot-Restarts.
+
+**Drei persistente Memory-Typen** (werden automatisch in den System-Prompt
+eingespeist wenn vorhanden — siehe oben "PRÄFERENZEN", "PERSISTENTE FAKTEN",
+"AKTIVES PROJEKT"):
+
+1. **Präferenzen** (`set_preference` / `list_preferences` / `forget_preference`)
+   = Wie du antworten sollst (Stil, Tonalität, Format)
+   Trigger: "antworte immer kürzer", "kein 'gerne!'", "Datum als DD.MM.", etc.
+
+2. **Fakten** (`remember` / `list_facts` / `forget_fact`)
+   = Was Bot über User dauerhaft wissen muss
+   Trigger: "merk dir dass...", "ich studiere X", "mein KV-Lohn ist 32,80 €/h"
+
+3. **Projekt-Kontext** (`activate_project` / `deactivate_project` / `update_project_context`)
+   = Per-Projekt CONTEXT.md mit projektspezifischen Regeln (Auftraggeber, Tech, Frist)
+   Trigger: "lass uns über Projekt X reden" / "arbeite jetzt an X" → activate_project(X)
+   "X hat Auftraggeber Y, Frist Z" + Projekt aktiv → update_project_context(X, ...)
+
+UNTERSCHEIDUNG wichtig:
+- **Stil-Regel** ("antworte kürzer") → set_preference, NICHT remember
+- **Bio-Fakt** ("ich heiße Julius") → remember, NICHT set_preference
+- **Projekt-Regel** ("Sanierung-Kiosk: ÖNORM B 2061") → update_project_context
 
 # AUTO-TAGGING
 Beim Anlegen von Tasks / Notizen / Meetings: extrahiere **2-5 thematische Tags**
@@ -1842,10 +2102,20 @@ async def llm_loop(user_text: str, user_id: int) -> str:
                 .replace("{now}", now_local.strftime("%H:%M"))
                 .replace("{tz}", TIMEZONE.key if hasattr(TIMEZONE, "key") else str(TIMEZONE)))
 
-    # Long-term Fakten anhängen falls vorhanden
+    # ─── Memory-Tiers in System-Prompt einspeisen ───
+    prefs = get_preferences()
+    if prefs:
+        sys_text += f"\n\n# PRÄFERENZEN (Stil/Tonalität — befolge diese)\n\n{prefs}\n"
     facts = get_facts()
     if facts:
-        sys_text += f"\n\n# PERSISTENTE FAKTEN (aus bot-memory/facts.md)\n\n{facts}\n"
+        sys_text += f"\n\n# PERSISTENTE FAKTEN (Hintergrund über Julius)\n\n{facts}\n"
+    active_proj = get_active_project()
+    if active_proj:
+        proj_ctx = get_project_context(active_proj)
+        if proj_ctx:
+            sys_text += f"\n\n# AKTIVES PROJEKT: {active_proj}\n\n{proj_ctx}\n"
+        else:
+            sys_text += f"\n\n# AKTIVES PROJEKT: {active_proj} (keine CONTEXT.md gesetzt)\n"
 
     # System-Prompt + History + neue User-Message
     history = get_history(user_id)
