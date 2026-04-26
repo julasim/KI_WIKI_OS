@@ -88,6 +88,7 @@ TASKS_DIR = LIFE / "tasks"
 NOTES_DIR = LIFE / "notes"
 MEETINGS_DIR = LIFE / "meetings"
 AREAS_DIR = LIFE / "areas"
+PROJECTS_DIR = VAULT / "05_Projects"  # Schema-konform: Projekte sind eigener Top-Level
 TEMPLATES_DIR = VAULT / "08_Templates"
 ATTACHMENTS_DIR = VAULT / "09_Attachments"
 RAW_ARTICLES_DIR = VAULT / "01_Raw" / "articles"
@@ -143,6 +144,51 @@ def safe_path(rel_path: str) -> Path:
     if not str(p).startswith(str(VAULT.resolve())):
         raise ValueError(f"Path traversal: {rel_path}")
     return p
+
+
+def find_project_dir(slug: str) -> Optional[Path]:
+    """Findet einen Projekt-Ordner via rekursiver Suche unter 05_Projects/.
+
+    Erlaubt beliebige Verschachtelung (Subprojekte). Gibt None bei Nicht-Treffer
+    oder Mehrdeutigkeit zurück (in dem Fall sollte Caller einen Fehler werfen).
+    Slug wird vorher normalisiert ('project-' Präfix entfernt, lowercase).
+    """
+    if not slug:
+        return None
+    slug = slug.strip().lower()
+    if slug.startswith("project-"):
+        slug = slug[len("project-"):]
+    if not PROJECTS_DIR.exists():
+        return None
+    matches = [d for d in PROJECTS_DIR.rglob(slug) if d.is_dir() and d.name == slug]
+    if len(matches) == 1:
+        return matches[0]
+    return None  # 0 Treffer oder mehrdeutig
+
+
+def list_all_project_slugs() -> list[tuple[str, str]]:
+    """Liefert (slug, relative_path)-Liste aller Projekte (rekursiv).
+
+    Brauchen wir für Mehrdeutigkeits-Diagnose und List-Outputs.
+    """
+    if not PROJECTS_DIR.exists():
+        return []
+    out = []
+    for d in sorted(PROJECTS_DIR.rglob("*")):
+        if not d.is_dir():
+            continue
+        # Nur Projekt-Dirs zählen — die haben README.md mit type: project
+        readme = d / "README.md"
+        if not readme.exists():
+            continue
+        try:
+            post = frontmatter.load(readme)
+            if post.metadata.get("type") == "project":
+                rel = d.relative_to(VAULT).as_posix()
+                out.append((d.name, rel))
+        except Exception:
+            continue
+    return out
 
 
 def atomic_write(path: Path, content: str) -> None:
@@ -552,6 +598,142 @@ def read_file(rel_path: str, strip_frontmatter: bool = True) -> str:
         return content[:8000]
     except Exception as e:
         return f"Lese-Fehler: {e}"
+
+
+def move_path(src_rel: str, dst_rel: str, overwrite: bool = False) -> str:
+    """Verschiebt/Renamet eine Datei oder einen Ordner innerhalb des Vaults.
+
+    src_rel + dst_rel sind relativ zum Vault-Root. Path-Traversal-geschützt
+    via safe_path. Wenn dst ein bestehender Ordner ist, wird src reingelegt.
+    Wenn dst nicht existiert, wird src nach dst umbenannt/verschoben.
+
+    overwrite=False (default): bricht ab wenn Ziel existiert.
+    overwrite=True: überschreibt — nur nutzen wenn explizit gewollt.
+    """
+    if not src_rel or not src_rel.strip():
+        return "Fehler: src darf nicht leer sein."
+    if not dst_rel or not dst_rel.strip():
+        return "Fehler: dst darf nicht leer sein."
+    try:
+        src = safe_path(src_rel)
+        dst = safe_path(dst_rel)
+    except ValueError as e:
+        return f"Pfad-Fehler: {e}"
+
+    if not src.exists():
+        return f"Quelle nicht gefunden: {src_rel}"
+    if src == VAULT.resolve():
+        return "Fehler: Vault-Root selbst kann nicht verschoben werden."
+
+    # Falls dst ein existierender Ordner ist → src darunter legen
+    if dst.is_dir():
+        final = dst / src.name
+    else:
+        final = dst
+
+    if final.exists():
+        if not overwrite:
+            return f"Ziel existiert bereits: {final.relative_to(VAULT).as_posix()} (overwrite=True um zu überschreiben)"
+        # Overwrite: erst alt löschen
+        if final.is_dir():
+            shutil.rmtree(final)
+        else:
+            final.unlink()
+
+    final.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.move(str(src), str(final))
+    except Exception as e:
+        return f"Move fehlgeschlagen: {e}"
+
+    src_rel_clean = src.relative_to(VAULT).as_posix()
+    final_rel = final.relative_to(VAULT).as_posix()
+    kind = "Ordner" if final.is_dir() else "Datei"
+    return f"✓ {kind} verschoben: `{src_rel_clean}` → `{final_rel}`"
+
+
+def delete_path(rel_path: str, recursive: bool = False) -> str:
+    """Löscht eine Datei oder einen leeren Ordner. recursive=True für Ordner mit Inhalt.
+
+    GEFÄHRLICH bei recursive=True — ruft erst nach expliziter User-Bestätigung.
+    Verschiebt nach 99_Archive/ statt zu löschen wäre sicherer; das ist
+    aber Sache des Callers (z.B. via move_path nach 99_Archive).
+    """
+    if not rel_path or not rel_path.strip():
+        return "Fehler: Pfad darf nicht leer sein."
+    try:
+        p = safe_path(rel_path)
+    except ValueError as e:
+        return f"Pfad-Fehler: {e}"
+    if not p.exists():
+        return f"Nicht gefunden: {rel_path}"
+    if p == VAULT.resolve():
+        return "Fehler: Vault-Root kann nicht gelöscht werden."
+    try:
+        if p.is_dir():
+            if recursive:
+                shutil.rmtree(p)
+                return f"✓ Ordner rekursiv gelöscht: `{rel_path}`"
+            else:
+                p.rmdir()  # nur wenn leer
+                return f"✓ Leerer Ordner gelöscht: `{rel_path}`"
+        else:
+            p.unlink()
+            return f"✓ Datei gelöscht: `{rel_path}`"
+    except OSError as e:
+        return f"Löschen fehlgeschlagen: {e}"
+
+
+def move_project(slug: str, parent: Optional[str] = None) -> str:
+    """Verschiebt ein bestehendes Projekt — entweder als Subprojekt unter `parent`,
+    oder zurück auf Top-Level wenn parent=None oder parent='' angegeben wird.
+
+    Nutzt rekursive Suche → findet Projekte überall unter 05_Projects/.
+    """
+    if not slug or not slug.strip():
+        return "Slug fehlt."
+    slug = slug.strip().lower()
+    if slug.startswith("project-"):
+        slug = slug[len("project-"):]
+    src = find_project_dir(slug)
+    if src is None:
+        return f"Projekt nicht gefunden (oder mehrdeutig): {slug}"
+
+    # Ziel bestimmen
+    if parent and parent.strip():
+        parent = parent.strip().lower()
+        if parent.startswith("project-"):
+            parent = parent[len("project-"):]
+        if parent == slug:
+            return "Fehler: Projekt kann nicht sich selbst als Parent haben."
+        parent_dir = find_project_dir(parent)
+        if parent_dir is None:
+            return f"Parent-Projekt nicht gefunden: {parent}"
+        # Prevent moving a project into its own subtree
+        try:
+            parent_dir.relative_to(src)
+            return f"Fehler: Parent `{parent}` liegt bereits unter `{slug}` — würde Schleife erzeugen."
+        except ValueError:
+            pass
+        dst = parent_dir / slug
+    else:
+        dst = PROJECTS_DIR / slug
+
+    if dst.resolve() == src.resolve():
+        return f"Projekt liegt bereits an Zielposition: `{src.relative_to(VAULT).as_posix()}/`"
+    if dst.exists():
+        return f"Ziel existiert bereits: `{dst.relative_to(VAULT).as_posix()}/`"
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.move(str(src), str(dst))
+    except Exception as e:
+        return f"Move fehlgeschlagen: {e}"
+
+    src_rel = src.relative_to(VAULT).as_posix()
+    dst_rel = dst.relative_to(VAULT).as_posix()
+    parent_info = f" (jetzt Subprojekt von `{parent}`)" if parent else " (jetzt Top-Level)"
+    return f"✓ Projekt verschoben: `{src_rel}/` → `{dst_rel}/`{parent_info}"
 
 
 def edit_file(rel_path: str, find: str, replace: str, regex: bool = False) -> str:
@@ -1070,13 +1252,17 @@ def list_existing_tags(top_n: int = 30) -> str:
     return "\n".join(lines)
 
 
-def create_project(name: str, description: str = "", area: Optional[str] = None) -> str:
-    """Legt einen neuen Projekt-Ordner unter 10_Life/projects/<slug>/ an.
+def create_project(name: str, description: str = "", area: Optional[str] = None,
+                   parent: Optional[str] = None) -> str:
+    """Legt einen neuen Projekt-Ordner unter 05_Projects/<slug>/ an.
 
     Erzeugt Ordner + README.md mit Dataview-Queries die alle Tasks/Notes mit
     'project: <slug>' im Frontmatter sammeln. So können Files weiterhin in den
     Standard-Ordnern (10_Life/tasks/, /notes/) liegen, sind aber im Projekt-
     Container automatisch gelistet.
+
+    parent: optional Slug eines existierenden Projekts → neues Projekt wird als
+    Subprojekt unter dem Parent angelegt (05_Projects/<parent>/<slug>/).
     """
     if not name or not name.strip():
         return "Fehler: Projekt-Name darf nicht leer sein."
@@ -1084,12 +1270,22 @@ def create_project(name: str, description: str = "", area: Optional[str] = None)
     if not slug or slug == "untitled":
         return f"Fehler: Slug aus '{name}' nicht ableitbar — bitte aussagekräftigeren Namen wählen."
 
-    projects_root = LIFE / "projects"
-    projects_root.mkdir(parents=True, exist_ok=True)
-    proj_dir = projects_root / slug
+    PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    if proj_dir.exists():
-        return f"Projekt existiert bereits: [[project-{slug}]] (10_Life/projects/{slug}/)"
+    # Parent auflösen falls Subprojekt
+    if parent:
+        parent_dir = find_project_dir(parent)
+        if parent_dir is None:
+            return f"Fehler: Parent-Projekt '{parent}' nicht gefunden (oder mehrdeutig)."
+        proj_dir = parent_dir / slug
+    else:
+        proj_dir = PROJECTS_DIR / slug
+
+    # Existenz-Check rekursiv (verhindert Doppel-Slugs an verschiedenen Orten)
+    existing = find_project_dir(slug)
+    if existing is not None:
+        rel = existing.relative_to(VAULT).as_posix()
+        return f"Projekt existiert bereits: [[project-{slug}]] (`{rel}/`)"
 
     proj_dir.mkdir(parents=True, exist_ok=False)
     readme_path = proj_dir / "README.md"
@@ -1156,8 +1352,10 @@ SORT date DESC
         encoding="utf-8",
     )
 
-    return (f"✓ Projekt angelegt: [[project-{slug}]]\n"
-            f"Ordner: `10_Life/projects/{slug}/` (README + CONTEXT.md)\n"
+    rel = proj_dir.relative_to(VAULT).as_posix()
+    parent_info = f" (Subprojekt von `{parent}`)" if parent else ""
+    return (f"✓ Projekt angelegt: [[project-{slug}]]{parent_info}\n"
+            f"Ordner: `{rel}/` (README + CONTEXT.md)\n"
             f"Tipp: `activate_project {slug}` schaltet projektspez. Kontext im Bot scharf.")
 
 
@@ -1411,9 +1609,9 @@ def get_active_project() -> Optional[str]:
 
 
 def get_project_context(slug: str) -> str:
-    """Liest CONTEXT.md eines Projekts."""
-    proj_dir = LIFE / "projects" / slug
-    if not proj_dir.exists():
+    """Liest CONTEXT.md eines Projekts (rekursive Suche unter 05_Projects/)."""
+    proj_dir = find_project_dir(slug)
+    if proj_dir is None:
         return ""
     context_file = proj_dir / "CONTEXT.md"
     if not context_file.exists():
@@ -1432,8 +1630,8 @@ def activate_project(slug: str) -> str:
     slug = slug.strip().lower()
     if slug.startswith("project-"):
         slug = slug[len("project-"):]
-    proj_dir = LIFE / "projects" / slug
-    if not proj_dir.exists():
+    proj_dir = find_project_dir(slug)
+    if proj_dir is None:
         return f"Projekt nicht gefunden: {slug}"
     _ensure_memory_dir()
     ACTIVE_PROJECT_FILE.write_text(slug, encoding="utf-8")
@@ -1457,8 +1655,8 @@ def update_project_context(slug: str, text: str, mode: str = "append") -> str:
     slug = slug.strip().lower()
     if slug.startswith("project-"):
         slug = slug[len("project-"):]
-    proj_dir = LIFE / "projects" / slug
-    if not proj_dir.exists():
+    proj_dir = find_project_dir(slug)
+    if proj_dir is None:
         return f"Projekt nicht gefunden: {slug}"
     if mode not in ("append", "replace"):
         mode = "append"
@@ -2010,6 +2208,58 @@ TOOLS = [
         },
     }},
     {"type": "function", "function": {
+        "name": "move_path",
+        "description": (
+            "Verschiebt oder benennt eine Datei oder einen Ordner um (vault-relative Pfade). "
+            "Wenn dst ein existierender Ordner ist, wird src dort hineingelegt — sonst wird src nach dst umbenannt. "
+            "Für Projekt-Verschiebungen lieber `move_project` nutzen (kennt die 05_Projects-Topologie). "
+            "Beispiele: move_path('00_Inbox/foo.md', '01_Raw/articles/'), "
+            "move_path('10_Life/notes/alt-name.md', '10_Life/notes/neu-name.md')."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "src_rel": {"type": "string", "description": "Quell-Pfad relativ zum Vault-Root"},
+                "dst_rel": {"type": "string", "description": "Ziel-Pfad oder Ziel-Ordner relativ zum Vault-Root"},
+                "overwrite": {"type": "boolean", "default": False, "description": "Wenn Ziel existiert: überschreiben. Nur True wenn User explizit will."},
+            },
+            "required": ["src_rel", "dst_rel"],
+        },
+    }},
+    {"type": "function", "function": {
+        "name": "move_project",
+        "description": (
+            "Verschiebt ein bestehendes Projekt — entweder unter ein anderes als Subprojekt, "
+            "oder zurück auf Top-Level (parent leer lassen). Findet Projekte rekursiv in 05_Projects/. "
+            "Beispiel: move_project('bbm-skript-k-blaetter-rdp-schriftlich', parent='matura') → "
+            "verschiebt unter 05_Projects/matura/. move_project('foo') → verschiebt foo nach Top-Level."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "slug": {"type": "string", "description": "Slug des zu verschiebenden Projekts (ohne 'project-' Präfix)"},
+                "parent": {"type": "string", "description": "Slug des Parent-Projekts. Leer/weglassen → Top-Level."},
+            },
+            "required": ["slug"],
+        },
+    }},
+    {"type": "function", "function": {
+        "name": "delete_path",
+        "description": (
+            "GEFÄHRLICH: Löscht Datei oder Ordner unwiderruflich. NICHT direkt benutzen — "
+            "stattdessen erst `request_delete` (verschiebt nach 99_Archive/, reversibel). "
+            "Nur einsetzen für Cleanup nach explizitem User-Wunsch ('lösche endgültig X')."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "rel_path": {"type": "string"},
+                "recursive": {"type": "boolean", "default": False, "description": "True nur für Ordner mit Inhalt."},
+            },
+            "required": ["rel_path"],
+        },
+    }},
+    {"type": "function", "function": {
         "name": "clip_url",
         "description": "Fetcht eine URL und speichert den Hauptinhalt als Markdown-Artikel in 01_Raw/articles/.",
         "parameters": {
@@ -2169,7 +2419,7 @@ TOOLS = [
     {"type": "function", "function": {
         "name": "update_project_context",
         "description": (
-            "Schreibt projektspezifischen Kontext nach 10_Life/projects/<slug>/CONTEXT.md. "
+            "Schreibt projektspezifischen Kontext nach 05_Projects/<slug>/CONTEXT.md (Subprojekt-Pfad ist tiefer). "
             "mode='append' (default) hängt an, 'replace' überschreibt komplett. "
             "Nutze für Projekt-Setup-Infos: Auftraggeber, Tech-Stack, Fristen, Budget, "
             "spezielle Regeln. Wird automatisch in den System-Prompt geladen wenn dieses "
@@ -2234,10 +2484,13 @@ TOOLS = [
     {"type": "function", "function": {
         "name": "create_project",
         "description": (
-            "Legt einen neuen Projekt-Ordner unter 10_Life/projects/<slug>/ an. "
+            "Legt einen neuen Projekt-Ordner unter 05_Projects/<slug>/ an. "
             "Erzeugt Folder + README.md mit Dataview-Queries für zugehörige "
             "Tasks/Notes/Meetings (gefiltert via project=<slug> Frontmatter). "
             "Nutze wenn User 'lege ein Projekt an', 'neues Projekt: ...' o.ä. sagt. "
+            "Bei Subprojekt: parent=<slug-des-eltern-projekts> setzen — wird unter "
+            "05_Projects/<parent>/<slug>/ angelegt. Bestehende Projekte verschiebt "
+            "man stattdessen mit move_project. "
             "WICHTIG: dieses Tool legt den Ordner UND die README-Datei direkt an — "
             "nicht erst fragen, dann ankündigen, dann nochmal fragen. Direkt machen."
         ),
@@ -2247,6 +2500,7 @@ TOOLS = [
                 "name": {"type": "string", "description": "Projekt-Name, wird zu Slug umgewandelt"},
                 "description": {"type": "string", "description": "Optional: kurze Beschreibung fürs README"},
                 "area": {"type": "string", "description": "Optional: zugehörige Area-ID"},
+                "parent": {"type": "string", "description": "Optional: Parent-Projekt-Slug für Subprojekt-Anlage"},
             },
             "required": ["name"],
         },
@@ -2306,6 +2560,9 @@ TOOL_HANDLERS = {
     "search_vault": search_vault,
     "read_file": read_file,
     "edit_file": edit_file,
+    "move_path": move_path,
+    "move_project": move_project,
+    "delete_path": delete_path,
     "clip_url": clip_url,
     "request_delete": request_delete,
     "confirm_delete": confirm_delete,
@@ -2362,7 +2619,9 @@ Tool nur aufrufen wenn Julius EXPLIZIT Speicher-Intent zeigt:
 | "lösche alle X" / "leere Y" | erst `list_files` für Verzeichnis, dann `request_delete` mit ALLEN Pfaden als Liste |
 | "ja / bestätigt / machs" nach request_delete | `confirm_delete` |
 | "nein / abbrechen" nach request_delete | `cancel_delete` |
-| "lege ein Projekt an" / "neues Projekt: ..." | `create_project` (legt Ordner + README direkt an, NICHT erst nachfragen wo) |
+| "lege ein Projekt an" / "neues Projekt: ..." | `create_project` (legt Ordner + README in `05_Projects/<slug>/` direkt an, NICHT erst nachfragen wo) |
+| "X als Subprojekt von Y" / "schiebe X unter Y" / "X gehört unter Y" | `move_project(slug=X, parent=Y)` (verschiebt EXISTIERENDES Projekt). Nur fragen wenn slug ambig — sonst direkt machen. |
+| "verschieb Datei A nach B" / "ordne in Y ein" | `move_path(src_rel, dst_rel)` für Dateien/Ordner irgendwo im Vault |
 | "erinner mich um X an Y" / "wecker für 14 Uhr" / "in 30 Min ping" | `create_reminder` (when_iso = absolute Lokalzeit berechnen!) |
 | "jeden Montag 8 Uhr X" / "täglich um 7 X" | `create_reminder` mit `recurrence` (daily/weekdays/weekly) |
 | "welche Reminder hab ich?" | `list_reminders` |
