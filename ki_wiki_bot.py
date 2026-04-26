@@ -2036,6 +2036,30 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if ocr_text:
             reply += f"\n\n<b>OCR</b> ({len(ocr_text)} Zeichen):\n<pre><code>{_esc_html(ocr_text[:1500])}</code></pre>"
         await update.message.reply_text(reply, parse_mode=constants.ParseMode.HTML)
+
+        # Upload-Event in LLM-History
+        try:
+            hist_msg = (
+                f"[Upload-Event] User hat Foto \"{filename}\" hochgeladen, "
+                f"gespeichert in `09_Attachments/{filename}`. "
+                f"Vision-Beschreibung: {vision_caption[:200]}"
+            )
+            if ocr_text:
+                hist_msg += f"\nOCR-Text:\n{ocr_text[:400]}"
+            update_history(update.effective_user.id, [
+                {"role": "user", "content": hist_msg}
+            ])
+        except Exception as e:
+            log.warning(f"Photo-Upload-Event nicht in History: {e}")
+
+        # Caption als Instruction an LLM routen falls vorhanden
+        if user_caption and user_caption.strip():
+            await update.message.chat.send_action(constants.ChatAction.TYPING)
+            try:
+                llm_reply = await llm_loop(user_caption.strip(), update.effective_user.id)
+                await safe_reply(update, llm_reply)
+            except Exception as e:
+                log.exception("Photo-Caption-LLM-Routing failed")
     except Exception as e:
         log.exception("photo handler failed")
         await update.message.reply_text(f"Photo-Fehler: {e}")
@@ -2151,19 +2175,43 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             log.warning(f"Daily-Link fuer Document fehlgeschlagen: {e}")
 
-        # Antwort an User
+        # Antwort an User (kompakter wenn Caption vorhanden — LLM antwortet danach)
         reply = f"📄 <b>{kind}</b> gespeichert: <code>{rel}</code>"
         if pdf_extra:
             reply += pdf_extra
-        if user_caption:
-            reply += f"\n<i>{user_caption}</i>"
-        if body_preview:
-            preview_html = _esc_html(body_preview)
+        if body_preview and not user_caption:
+            preview_html = _esc_html(body_preview[:600])
             reply += f"\n\n<b>Inhalt (Vorschau):</b>\n<pre><code>{preview_html}</code></pre>"
-        await update.message.reply_text(
-            reply,
-            parse_mode=constants.ParseMode.HTML,
-        )
+        await update.message.reply_text(reply, parse_mode=constants.ParseMode.HTML)
+
+        # ─── Upload-Event in LLM-History injizieren ───
+        # So weiß das LLM bei späteren Anfragen ("lege das als Projekt an")
+        # was kürzlich hochgeladen wurde.
+        try:
+            history_msg = (
+                f"[Upload-Event] User hat Datei \"{filename}\" hochgeladen "
+                f"({kind}), gespeichert als `{rel}`."
+            )
+            if wrapper_link:
+                history_msg += f" PDF-Wrapper: `{wrapper_link}` (id: `{md_id}`)."
+            if body_preview:
+                history_msg += f"\nInhalts-Auszug:\n{body_preview[:400]}"
+            update_history(update.effective_user.id, [
+                {"role": "user", "content": history_msg}
+            ])
+        except Exception as e:
+            log.warning(f"Upload-Event nicht in History: {e}")
+
+        # ─── Wenn Caption vorhanden: als Anweisung an LLM weiterreichen ───
+        # Damit "Lege als Projekt an"-artige Captions auch wirklich ausgeführt werden.
+        if user_caption and user_caption.strip():
+            await update.message.chat.send_action(constants.ChatAction.TYPING)
+            try:
+                llm_reply = await llm_loop(user_caption.strip(), update.effective_user.id)
+                await safe_reply(update, llm_reply)
+            except Exception as e:
+                log.exception("Caption-LLM-Routing failed")
+                await update.message.reply_text(f"Caption-Verarbeitung fehlgeschlagen: {e}")
 
     except Exception as e:
         log.exception("document handler failed")
