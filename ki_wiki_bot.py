@@ -652,6 +652,78 @@ def move_path(src_rel: str, dst_rel: str, overwrite: bool = False) -> str:
     return f"✓ {kind} verschoben: `{src_rel_clean}` → `{final_rel}`"
 
 
+def move_paths(srcs: list, dst_dir: str, overwrite: bool = False) -> str:
+    """Bulk-Move: verschiebt mehrere Dateien/Ordner auf einmal in dst_dir.
+
+    Spart massiv Tool-Calls bei Multi-File-Operationen (z.B. 6 Uploads in
+    Projekt verschieben). Pro Item wird Erfolg/Fehler einzeln gemeldet,
+    aber alle Items teilen sich denselben Tool-Call → Loop-Iterationen sparen.
+
+    srcs: Liste von vault-relativen Pfaden (Dateien oder Ordner)
+    dst_dir: vault-relatives Ziel-Verzeichnis (wird angelegt falls nicht da)
+    """
+    if not srcs or not isinstance(srcs, list):
+        return "Fehler: srcs muss eine nicht-leere Liste sein."
+    if not dst_dir or not dst_dir.strip():
+        return "Fehler: dst_dir darf nicht leer sein."
+    try:
+        dst = safe_path(dst_dir)
+    except ValueError as e:
+        return f"Pfad-Fehler dst_dir: {e}"
+
+    # dst_dir muss Ordner sein/werden — falls Datei mit gleichem Namen, ablehnen
+    if dst.exists() and not dst.is_dir():
+        return f"Ziel ist eine Datei, kein Ordner: {dst_dir}"
+    dst.mkdir(parents=True, exist_ok=True)
+
+    successes, failures = [], []
+    for src_rel in srcs:
+        if not isinstance(src_rel, str) or not src_rel.strip():
+            failures.append(f"(leerer Eintrag)")
+            continue
+        try:
+            src = safe_path(src_rel)
+        except ValueError as e:
+            failures.append(f"{src_rel}: Pfad-Fehler {e}")
+            continue
+        if not src.exists():
+            failures.append(f"{src_rel}: nicht gefunden")
+            continue
+        if src == VAULT.resolve():
+            failures.append(f"{src_rel}: Vault-Root unbeweglich")
+            continue
+        final = dst / src.name
+        if final.exists():
+            if not overwrite:
+                failures.append(f"{src.name}: Ziel existiert (overwrite=False)")
+                continue
+            try:
+                if final.is_dir():
+                    shutil.rmtree(final)
+                else:
+                    final.unlink()
+            except Exception as e:
+                failures.append(f"{src.name}: Overwrite-Cleanup fehlschlug: {e}")
+                continue
+        try:
+            shutil.move(str(src), str(final))
+            successes.append(src.name)
+        except Exception as e:
+            failures.append(f"{src.name}: {e}")
+
+    dst_rel_out = dst.relative_to(VAULT).as_posix()
+    parts = [f"✓ {len(successes)} verschoben → `{dst_rel_out}/`"]
+    if successes:
+        parts.append("  " + ", ".join(successes[:8]) + (f" (+{len(successes)-8})" if len(successes) > 8 else ""))
+    if failures:
+        parts.append(f"✗ {len(failures)} fehlgeschlagen:")
+        for f in failures[:5]:
+            parts.append(f"  • {f}")
+        if len(failures) > 5:
+            parts.append(f"  • (+{len(failures)-5} weitere)")
+    return "\n".join(parts)
+
+
 def delete_path(rel_path: str, recursive: bool = False) -> str:
     """Löscht eine Datei oder einen leeren Ordner. recursive=True für Ordner mit Inhalt.
 
@@ -2210,11 +2282,10 @@ TOOLS = [
     {"type": "function", "function": {
         "name": "move_path",
         "description": (
-            "Verschiebt oder benennt eine Datei oder einen Ordner um (vault-relative Pfade). "
-            "Wenn dst ein existierender Ordner ist, wird src dort hineingelegt — sonst wird src nach dst umbenannt. "
-            "Für Projekt-Verschiebungen lieber `move_project` nutzen (kennt die 05_Projects-Topologie). "
-            "Beispiele: move_path('00_Inbox/foo.md', '01_Raw/articles/'), "
-            "move_path('10_Life/notes/alt-name.md', '10_Life/notes/neu-name.md')."
+            "Verschiebt oder benennt EINE Datei oder einen Ordner um (vault-relative Pfade). "
+            "Für MEHRERE Files auf einmal IMMER `move_paths` nutzen — sonst läuft der Tool-Loop "
+            "voll. Wenn dst ein existierender Ordner ist, wird src dort hineingelegt — sonst wird "
+            "src nach dst umbenannt. Für Projekt-Verschiebungen lieber `move_project` nutzen."
         ),
         "parameters": {
             "type": "object",
@@ -2224,6 +2295,28 @@ TOOLS = [
                 "overwrite": {"type": "boolean", "default": False, "description": "Wenn Ziel existiert: überschreiben. Nur True wenn User explizit will."},
             },
             "required": ["src_rel", "dst_rel"],
+        },
+    }},
+    {"type": "function", "function": {
+        "name": "move_paths",
+        "description": (
+            "BULK-MOVE: verschiebt mehrere Dateien/Ordner auf einmal in einen Ziel-Ordner. "
+            "Spart massiv Tool-Calls bei Multi-File-Operationen — IMMER nutzen wenn ≥2 Files in "
+            "denselben Ordner sollen. Beispiel: nach 6 Datei-Uploads alle gleichzeitig in einen "
+            "Projektordner verschieben. Pro Item wird Erfolg/Fehler einzeln gemeldet."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "srcs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Liste vault-relativer Quellpfade (Dateien oder Ordner)",
+                },
+                "dst_dir": {"type": "string", "description": "Vault-relatives Ziel-Verzeichnis (wird angelegt falls nicht da)"},
+                "overwrite": {"type": "boolean", "default": False},
+            },
+            "required": ["srcs", "dst_dir"],
         },
     }},
     {"type": "function", "function": {
@@ -2561,6 +2654,7 @@ TOOL_HANDLERS = {
     "read_file": read_file,
     "edit_file": edit_file,
     "move_path": move_path,
+    "move_paths": move_paths,
     "move_project": move_project,
     "delete_path": delete_path,
     "clip_url": clip_url,
@@ -2621,7 +2715,8 @@ Tool nur aufrufen wenn Julius EXPLIZIT Speicher-Intent zeigt:
 | "nein / abbrechen" nach request_delete | `cancel_delete` |
 | "lege ein Projekt an" / "neues Projekt: ..." | `create_project` (legt Ordner + README in `05_Projects/<slug>/` direkt an, NICHT erst nachfragen wo) |
 | "X als Subprojekt von Y" / "schiebe X unter Y" / "X gehört unter Y" | `move_project(slug=X, parent=Y)` (verschiebt EXISTIERENDES Projekt). Nur fragen wenn slug ambig — sonst direkt machen. |
-| "verschieb Datei A nach B" / "ordne in Y ein" | `move_path(src_rel, dst_rel)` für Dateien/Ordner irgendwo im Vault |
+| "verschieb Datei A nach B" / "ordne in Y ein" | `move_path(src_rel, dst_rel)` für EINE Datei/Ordner |
+| Mehrere Dateien in denselben Ordner verschieben (≥2) | IMMER `move_paths(srcs=[...], dst_dir=...)` — ein Tool-Call statt N |
 | "erinner mich um X an Y" / "wecker für 14 Uhr" / "in 30 Min ping" | `create_reminder` (when_iso = absolute Lokalzeit berechnen!) |
 | "jeden Montag 8 Uhr X" / "täglich um 7 X" | `create_reminder` mit `recurrence` (daily/weekdays/weekly) |
 | "welche Reminder hab ich?" | `list_reminders` |
@@ -2633,6 +2728,19 @@ Begrüßung, Smalltalk, Fragen, Statements ohne Speicher-Verb → antworten, **n
 **Nachfragen vs. Direkt-Machen** (klare Regel):
 - Mini-Input ohne Kontext ("Diese", "ja", "?", einzelne Wörter) → **nachfragen**, nicht raten.
 - Vollständiger Auftrag mit klarem Speicher-Intent ("speicher: ...", "task: morgen X") → **direkt machen**, kein "wo soll ich das anlegen?"-Loop. Default-Pfade sind im Schema definiert.
+
+**MULTI-FILE / MULTI-UPLOAD-WORKFLOW** (kritisch — sonst läuft Tool-Loop voll):
+
+Telegram liefert Dateien als Stream von [Upload-Event]-Messages, automatisch in `01_Raw/uploads/` oder `09_Attachments/`. Wenn der User danach (oder davor) sagt "lege als Projekt X an" / "alle in Projekt Y" / "im Projektordner ablegen":
+
+1. Erst `create_project(name, description)` aufrufen → Ordner steht.
+2. Dann **EINEN** `move_paths(srcs=[alle 6 Pfade], dst_dir='05_Projects/<slug>/')`-Call.
+   NIEMALS 6× einzeln `move_path` — das verbraucht 6 Iterationen statt 1.
+3. Optional `activate_project(slug)`.
+
+Bei N Files → Operation in maximal 3-4 Tool-Calls erledigen, nicht N+3.
+
+Wenn Captions/Inhalte verraten dass mehrere Files thematisch zusammengehören (gleiches Projekt, gleiche Tags), gleiches Vorgehen: bulk verarbeiten.
 
 # LESEN / FRAGEN BEANTWORTEN
 - "Was weiß ich über X?" → `search_vault`, antworten mit echten `[[id]]` aus Treffern
@@ -2798,7 +2906,16 @@ async def llm_loop(user_text: str, user_id: int) -> str:
     # Diese Messages werden am Ende zur History dazugefügt
     new_history_msgs = [new_user_msg]
 
-    for _ in range(8):
+    # Iterations-Limit: 25 Iterationen reichen auch für Multi-File-Workflows
+    # (6 Uploads → Projekt anlegen → bulk-move → activate ≈ 4 Calls bei Bulk-Tools).
+    # Wenn LLM single-shot statt bulk arbeitet, fängt's spätestens bei 15 mit
+    # einem Hint zu Bulk-Tools auf, statt blind weiterzumachen.
+    LOOP_LIMIT = 25
+    BULK_HINT_AT = 15
+    bulk_hint_sent = False
+    completed_tool_calls = []  # für End-Of-Loop-Error-Message
+
+    for iteration in range(LOOP_LIMIT):
         resp = await asyncio.to_thread(
             llm.chat.completions.create,
             model=LLM_MODEL,
@@ -2823,8 +2940,9 @@ async def llm_loop(user_text: str, user_id: int) -> str:
                 if not handler:
                     result = f"Tool nicht bekannt: {tc.function.name}"
                 else:
-                    log.info(f"tool: {tc.function.name}({args})")
+                    log.info(f"tool[{iteration+1}/{LOOP_LIMIT}]: {tc.function.name}({args})")
                     result = handler(**args)
+                    completed_tool_calls.append(tc.function.name)
             except Exception as e:
                 log.exception(f"Tool {tc.function.name} failed")
                 result = f"Tool-Fehler: {e}"
@@ -2836,8 +2954,36 @@ async def llm_loop(user_text: str, user_id: int) -> str:
             messages.append(tool_msg)
             new_history_msgs.append(tool_msg)
 
+        # Hint einschleusen wenn LLM bei langen Loops noch single-shot arbeitet
+        if iteration + 1 == BULK_HINT_AT and not bulk_hint_sent:
+            move_count = sum(1 for c in completed_tool_calls if c == "move_path")
+            if move_count >= 4:
+                hint = {
+                    "role": "user",
+                    "content": (
+                        f"[System-Hint]: Du hast bereits {move_count}× move_path einzeln "
+                        f"aufgerufen. Nutze stattdessen `move_paths(srcs=[...], dst_dir=...)` "
+                        f"in EINEM Tool-Call. Schließe die Operation jetzt zügig ab, sonst "
+                        f"reicht das Iterations-Limit nicht."
+                    ),
+                }
+                messages.append(hint)
+                new_history_msgs.append(hint)
+                bulk_hint_sent = True
+
+    # Loop-Limit erreicht — User erfährt was tatsächlich passiert ist
     await update_history(user_id, new_history_msgs)
-    return "(Tool-Loop-Limit erreicht — bitte präziser fragen.)"
+    summary = ", ".join(f"{n}×{t}" for t, n in
+                        sorted({c: completed_tool_calls.count(c)
+                                for c in set(completed_tool_calls)}.items(),
+                               key=lambda x: -x[1]))
+    return (
+        f"⚠️ Operation zu komplex für eine Iteration ({LOOP_LIMIT} Tool-Calls verbraucht).\n\n"
+        f"Bisher gemacht: {summary or '(nichts erfolgreich)'}.\n\n"
+        f"Der Auftrag ist möglicherweise nur teilweise erledigt — "
+        f"bitte prüfen oder nochmal mit präziserem/kleinerem Auftrag wiederholen. "
+        f"Tipp: Bulk-Tools wie `move_paths` benutzen, nicht 6× einzeln move_path."
+    )
 
 
 # ============================================================================
