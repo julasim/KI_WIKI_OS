@@ -558,16 +558,22 @@ def append_to_daily(section: str, text: str) -> str:
 
 VALID_PRIORITIES = {"low", "medium", "high", "urgent"}
 VALID_TASK_CONTEXTS = {"home", "work", "errand", "phone", "computer"}
+VALID_RECURRENCE = {"daily", "weekdays", "weekly", "monthly"}
 
 
 def create_task(title: str, priority: str = "medium",
                 due: Optional[str] = None, area: Optional[str] = None,
                 project: Optional[str] = None, context: Optional[str] = None,
-                tags: Optional[list] = None) -> str:
+                tags: Optional[list] = None,
+                recurrence: Optional[str] = None) -> str:
     """Create a new task file in 10_Life/tasks/.
 
     Body wird dynamisch gebaut (nicht Template-Substitution) damit
     Status/Priorität/Fälligkeit korrekt im Body erscheinen.
+
+    recurrence: optional "daily" / "weekdays" / "weekly" / "monthly".
+      Bei gesetztem recurrence wird die Task nach mark_task_done vom
+      Daily-Reset-Job am nächsten passenden Tag wieder auf 'open' gesetzt.
     """
     if not title or not title.strip():
         return "Fehler: Task-Titel darf nicht leer sein."
@@ -589,6 +595,20 @@ def create_task(title: str, priority: str = "medium",
             log.warning(f"create_task: ungültiges due-Format '{due}', ignoriert")
             due = None
 
+    # Recurrence normalisieren + validieren
+    if recurrence:
+        rec_lower = recurrence.strip().lower()
+        # Aliase: weekday=weekdays, week=weekly, month=monthly, day=daily
+        rec_map = {
+            "day": "daily", "daily": "daily", "täglich": "daily",
+            "weekday": "weekdays", "weekdays": "weekdays", "werktags": "weekdays",
+            "week": "weekly", "weekly": "weekly", "wöchentlich": "weekly",
+            "month": "monthly", "monthly": "monthly", "monatlich": "monthly",
+        }
+        recurrence = rec_map.get(rec_lower)
+        if recurrence is None:
+            log.warning(f"create_task: ungültiges recurrence '{rec_lower}', ignoriert")
+
     slug = slugify(title)
     path = TASKS_DIR / f"{slug}.md"
     n = 2
@@ -599,9 +619,10 @@ def create_task(title: str, priority: str = "medium",
     task_id = f"t-{path.stem}"
 
     # Body dynamisch bauen (statt Template mit Hardcoded-Defaults)
+    rec_line = f" · **Wiederholung**: {recurrence}" if recurrence else ""
     body = (
         f"# {title}\n\n"
-        f"**Status**: open · **Priorität**: {priority} · **Fällig**: {due or '—'}\n\n"
+        f"**Status**: open · **Priorität**: {priority} · **Fällig**: {due or '—'}{rec_line}\n\n"
         f"## Was\n\n"
         f"## Warum\n\n"
         f"## Subschritte\n- [ ]\n\n"
@@ -638,6 +659,8 @@ def create_task(title: str, priority: str = "medium",
         ctx_lower = context.lower().strip()
         if ctx_lower in VALID_TASK_CONTEXTS:
             fm_data["context"] = ctx_lower
+    if recurrence:
+        fm_data["recurrence"] = recurrence
 
     post = frontmatter.Post(body, **fm_data)
     atomic_write(path, frontmatter.dumps(post) + "\n")
@@ -657,22 +680,38 @@ def create_task(title: str, priority: str = "medium",
         extras.append(f"projekt {project}")
     if priority != "medium":
         extras.append(f"prio {priority}")
+    if recurrence:
+        extras.append(f"wiederholt {recurrence}")
     extra_str = f" ({', '.join(extras)})" if extras else ""
     return f"Task angelegt: [[{task_id}]]{extra_str}"
 
 
 def mark_task_done(slug: str) -> str:
-    """Mark task as done."""
+    """Mark task as done.
+
+    Bei recurring Tasks (frontmatter.recurrence gesetzt): Status bleibt 'done'
+    bis der recurring_task_reset_job am passenden nächsten Tag wieder auf
+    'open' setzt. last_completed wird gesetzt damit Reset weiß wann es passt.
+    """
     filename = slug[2:] if slug.startswith("t-") else slug
     path = TASKS_DIR / f"{filename}.md"
     if not path.exists():
         return f"Task nicht gefunden: {slug}"
     post = frontmatter.load(path)
+    today = today_iso()
     post["status"] = "done"
-    post["updated"] = today_iso()
-    body = (post.content or "").rstrip() + f"\n- {today_iso()}: erledigt\n"
+    post["updated"] = today
+    recurrence = post.metadata.get("recurrence")
+    if recurrence:
+        post["last_completed"] = today
+        log_line = f"\n- {today}: erledigt (recurring={recurrence}, kommt automatisch wieder)\n"
+    else:
+        log_line = f"\n- {today}: erledigt\n"
+    body = (post.content or "").rstrip() + log_line
     post.content = body
     atomic_write(path, frontmatter.dumps(post) + "\n")
+    if recurrence:
+        return f"Task erledigt: [[t-{filename}]] — wiederholt sich ({recurrence})"
     return f"Task erledigt: [[t-{filename}]]"
 
 
@@ -2407,7 +2446,9 @@ TOOLS = [
             "WICHTIG: Optionale Parameter NUR setzen wenn explizit aus User-Input ableitbar — "
             "NIE raten/defaulten. Z.B. due nur wenn User wirklich ein Datum nennt; "
             "project nur wenn User Projekt nennt oder es klar aus Conversation-Memory hervorgeht. "
-            "tags: 2-5 thematische Schlagworte aus dem Inhalt extrahieren (kebab-case, Deutsch)."
+            "tags: 2-5 thematische Schlagworte aus dem Inhalt extrahieren (kebab-case, Deutsch). "
+            "recurrence NUR setzen bei klaren Wiederholungs-Triggern: 'jeden Tag', 'täglich', "
+            "'jede Woche', 'jeden Montag', 'jeden Monat' o.ä. — NICHT bei einmaligen Tasks!"
         ),
         "parameters": {
             "type": "object",
@@ -2422,6 +2463,16 @@ TOOLS = [
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "2-5 thematische Tags (kebab-case, Deutsch). Topical, nicht 'task'/'todo'. Bei Bedarf vorher list_existing_tags für konsistente Vokabular.",
+                },
+                "recurrence": {
+                    "type": "string",
+                    "enum": ["daily", "weekdays", "weekly", "monthly"],
+                    "description": (
+                        "Wiederholungs-Pattern. NUR setzen bei klaren Wiederholungs-Wörtern: "
+                        "'jeden Tag/täglich' → daily, 'werktags/Mo-Fr' → weekdays, "
+                        "'jede Woche/jeden <Wochentag>' → weekly, 'jeden Monat/monatlich' → monthly. "
+                        "Wenn User nur einmal etwas erwähnt: NICHT setzen."
+                    ),
                 },
             },
             "required": ["title"],
@@ -2932,6 +2983,7 @@ Tool nur aufrufen wenn Julius EXPLIZIT Speicher-Intent zeigt:
 |---|---|
 | "speicher / merk dir / notiere / schreib auf / ins tagebuch" | `append_to_daily` oder `create_note` |
 | "task: …" / "todo: …" / "morgen X machen" / Imperativ+Frist | `create_task` |
+| "jeden Tag X" / "täglich X" / "jede Woche X" / "jeden Montag X" / "monatlich X" | `create_task` mit `recurrence` (daily/weekdays/weekly/monthly) — Task taucht nach jedem Done automatisch wieder auf |
 | "meeting: …" / "war im Termin mit …" | `create_meeting` |
 | "X erledigt / fertig / done" | `mark_task_done` (ggf. erst `search_vault`) |
 | URL allein, sonst nichts | erst fragen, dann `clip_url` |
@@ -3863,9 +3915,114 @@ def compute_briefing() -> str:
     return "\n".join(parts)
 
 
+# ─── Recurring Tasks: Daily-Reset ──────────────────────────────────────────
+# Tasks mit frontmatter.recurrence werden vom Reset-Job morgens reaktiviert,
+# wenn sie done sind und das Pattern fällig ist. So lebt EINE Task-Datei für
+# alle Wiederholungen, History sammelt sich im Log.
+
+def _is_recurrence_due(pattern: str, last_completed: str, today: date) -> bool:
+    """Bestimmt ob eine recurring Task heute reaktiviert werden soll.
+
+    pattern: 'daily' | 'weekdays' | 'weekly' | 'monthly'
+    last_completed: ISO-Datum des letzten Done-Markings
+    today: aktuelles Datum
+    """
+    try:
+        last = datetime.strptime(last_completed, "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        # Kein gültiges last_completed → nicht reaktivieren
+        # (sicherer als raten — User soll erst einmal manuell done markieren)
+        return False
+    if last >= today:
+        return False  # heute schon done oder in Zukunft (defensiv)
+
+    if pattern == "daily":
+        return True  # jeden Tag wieder
+    if pattern == "weekdays":
+        return today.weekday() < 5  # Mo-Fr (0-4)
+    if pattern == "weekly":
+        # Reaktivieren wenn ≥7 Tage seit letztem Done
+        return (today - last).days >= 7
+    if pattern == "monthly":
+        # Reaktivieren wenn anderer Monat ODER heute am Monatstag wie last_completed
+        if today.month != last.month or today.year != last.year:
+            return today.day >= last.day
+        return False
+    return False
+
+
+def reset_recurring_tasks() -> dict:
+    """Walked alle Tasks, reaktiviert fällige recurring Tasks.
+
+    Returns: dict mit Statistik {"checked": n, "reactivated": [slugs]}
+    """
+    if not TASKS_DIR.exists():
+        return {"checked": 0, "reactivated": []}
+    today = datetime.now(TIMEZONE).date()
+    today_str = today.strftime("%Y-%m-%d")
+    checked = 0
+    reactivated = []
+
+    for task_file in TASKS_DIR.glob("*.md"):
+        checked += 1
+        try:
+            post = frontmatter.load(task_file)
+        except Exception as e:
+            log.warning(f"recurring-reset: konnte {task_file.name} nicht laden: {e}")
+            continue
+        meta = post.metadata
+        recurrence = meta.get("recurrence")
+        if not recurrence or recurrence not in VALID_RECURRENCE:
+            continue
+        if meta.get("status") != "done":
+            continue
+        last_completed = meta.get("last_completed", "")
+        if not _is_recurrence_due(recurrence, last_completed, today):
+            continue
+
+        # Reaktivieren
+        post["status"] = "open"
+        post["updated"] = today_str
+        body = (post.content or "").rstrip() + f"\n- {today_str}: reaktiviert (recurring={recurrence})\n"
+        post.content = body
+        try:
+            atomic_write(task_file, frontmatter.dumps(post) + "\n")
+            slug = task_file.stem
+            reactivated.append(slug)
+            # Link in heutige Daily damit User es im Briefing sieht
+            try:
+                title = meta.get("title", slug)
+                append_to_daily("Heute", f"- [ ] [[t-{slug}]] {title} (wiederkehrend)")
+            except Exception as e:
+                log.warning(f"Daily-Link für reaktivierten Task fehlgeschlagen: {e}")
+        except Exception as e:
+            log.warning(f"recurring-reset: konnte {task_file.name} nicht schreiben: {e}")
+
+    return {"checked": checked, "reactivated": reactivated}
+
+
+async def recurring_task_reset_job(ctx: ContextTypes.DEFAULT_TYPE):
+    """JobQueue-Callback — läuft täglich vor dem Briefing.
+
+    Setzt fällige recurring Tasks zurück auf 'open'. Schreibt nichts an User
+    (das Briefing-Job zeigt die reaktivierten Tasks ja in der Daily-Note).
+    """
+    try:
+        stats = await asyncio.to_thread(reset_recurring_tasks)
+        if stats["reactivated"]:
+            log.info(f"recurring-reset: {len(stats['reactivated'])}/{stats['checked']} reaktiviert: {stats['reactivated']}")
+        else:
+            log.info(f"recurring-reset: {stats['checked']} Tasks geprüft, keine fällig")
+    except Exception as e:
+        log.exception(f"recurring_task_reset_job failed: {e}")
+
+
 async def daily_briefing_job(ctx: ContextTypes.DEFAULT_TYPE):
     """JobQueue-Callback — wird täglich um BRIEFING_HOUR ausgeführt."""
     try:
+        # Erst recurring Tasks reaktivieren, dann Briefing — so sieht User
+        # die wiederkehrenden Tasks in der heutigen Daily.
+        await asyncio.to_thread(reset_recurring_tasks)
         text = await asyncio.to_thread(compute_briefing)
         await ctx.bot.send_message(
             chat_id=ALLOWED_USER_ID,
@@ -4024,6 +4181,19 @@ def main():
         except Exception as e:
             log.warning(f"JobQueue-Setup fehlgeschlagen (BRIEFING_HOUR={BRIEFING_HOUR}): {e}")
     else:
+        # Briefing aus, aber recurring-Reset trotzdem schedulen — so funktionieren
+        # wiederkehrende Tasks auch ohne Briefing. Default-Slot: 5:00 morgens.
+        if ALLOWED_USER_ID > 0:
+            try:
+                reset_time = dtime(hour=5, minute=0, tzinfo=TIMEZONE)
+                app.job_queue.run_daily(
+                    recurring_task_reset_job,
+                    time=reset_time,
+                    name="recurring-task-reset",
+                )
+                log.info(f"Recurring-Task-Reset scheduled für 05:00 {TIMEZONE.key} (Briefing ist aus)")
+            except Exception as e:
+                log.warning(f"Recurring-Reset-Setup fehlgeschlagen: {e}")
         log.info("Daily-Briefing deaktiviert (BRIEFING_HOUR=0 oder Setup-Modus)")
 
     # Nightly Memory-Suggestion-Briefing
