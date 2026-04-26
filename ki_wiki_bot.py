@@ -16,6 +16,7 @@ import os
 import re
 import json
 import time
+import threading
 import base64
 import shutil
 import asyncio
@@ -297,6 +298,211 @@ def _clean_section_body(body: str) -> str:
     return "\n".join(l for l in lines if l.strip())  # Auch leere Zeilen weg
 
 
+# ─── Auto-Linking ───────────────────────────────────────────────────────────
+# Wandelt erkannte Vault-IDs/Titles im Schreiber-Output in [[wikilinks]] um.
+# Conservative-by-default: nur exakte Matches, Stop-Wörter ausgenommen, Code/
+# bestehende Links unangetastet, mit Cache und expliziter Invalidierung.
+
+# Cache: (timestamp, phrase_lower → canonical_id)
+_AUTO_LINK_CACHE: tuple = (0.0, {})
+_AUTO_LINK_TTL_SEC = 300  # 5 Min — bei Schreibvorgang explizit invalidiert
+_AUTO_LINK_LOCK = threading.Lock()
+
+# Verzeichnisse die NIE gescannt werden (Templates/Tools/Memory würden False-
+# Positives erzeugen und nichts Sinnvolles beitragen)
+_LINK_INDEX_SKIP_DIRS = {
+    ".obsidian", ".trash", "99_Archive",
+    "06_Meta", "07_Tools", "08_Templates",
+}
+
+# Häufige Wörter die Bot oft schreibt — würden sonst nervig auto-linked
+# wenn jemand zufällig ein Note/Task mit so einem Title hat
+_LINK_STOPWORDS = {
+    # Zeit
+    "heute", "morgen", "gestern", "jetzt", "abends", "morgens",
+    # Generic Vault-Begriffe
+    "test", "todo", "task", "tasks", "meeting", "meetings", "note", "notes",
+    "projekt", "projekte", "project", "projects", "area", "areas", "daily",
+    # Häufige Sätze
+    "info", "link", "wichtig", "okay", "danke", "bitte", "frage", "antwort",
+    # Englisch
+    "what", "where", "when", "this", "that", "these", "those",
+}
+
+# Min-Length für Phrase-Kandidaten — verhindert dass jeder 3-Buchstaben-Slug
+# (RAG, API, etc.) jeden Vorkommnis kapert
+_LINK_MIN_LEN = 4
+
+# Schutz-Regex: alles was wir NICHT auto-linken (geschützte Bereiche werden
+# durch Sentinels ersetzt, am Ende zurückgetauscht)
+_PROTECT_RE = re.compile(
+    r"```.*?```"             # fenced code
+    r"|`[^`\n]+`"             # inline code
+    r"|\[\[[^\]\n]+\]\]"      # already-wikilink
+    r"|\[[^\]\n]+\]\([^)\n]+\)"  # markdown-link
+    r"|https?://\S+"          # URL
+    r"|<[^>\n]+>",            # HTML-Tag
+    re.DOTALL,
+)
+
+
+def _build_link_index() -> dict:
+    """Walk vault, extrahiere {phrase_lower: canonical_id} für Auto-Linking."""
+    phrase_map: dict = {}
+    if not VAULT.exists():
+        return phrase_map
+
+    for md_file in VAULT.rglob("*.md"):
+        rel = md_file.relative_to(VAULT)
+        if rel.parts and rel.parts[0] in _LINK_INDEX_SKIP_DIRS:
+            continue
+        try:
+            post = frontmatter.load(md_file)
+        except Exception:
+            continue
+        meta = post.metadata
+        file_id = meta.get("id")
+        if not file_id or not isinstance(file_id, str):
+            continue
+        file_id = file_id.strip()
+        if len(file_id) < _LINK_MIN_LEN:
+            continue
+        if file_id.lower() in _LINK_STOPWORDS:
+            continue
+
+        # Kandidaten-Phrasen sammeln
+        candidates = {file_id, file_id.replace("-", " "), file_id.replace("_", " ")}
+
+        title = meta.get("title")
+        if isinstance(title, str) and len(title.strip()) >= 6:
+            t = title.strip()
+            if t.lower() not in _LINK_STOPWORDS:
+                candidates.add(t)
+
+        aliases = meta.get("aliases", [])
+        if isinstance(aliases, list):
+            for a in aliases:
+                if isinstance(a, str) and len(a.strip()) >= _LINK_MIN_LEN:
+                    a_clean = a.strip()
+                    if a_clean.lower() not in _LINK_STOPWORDS:
+                        candidates.add(a_clean)
+
+        for c in candidates:
+            key = c.strip().lower()
+            if not key or key in _LINK_STOPWORDS:
+                continue
+            # Erste Zuordnung gewinnt — bei Konflikt (zwei Files mit ähnlicher
+            # Phrase) lieber gar nicht linken als falsch linken. Wir markieren
+            # mit None.
+            if key in phrase_map and phrase_map[key] != file_id:
+                phrase_map[key] = None
+            else:
+                phrase_map.setdefault(key, file_id)
+
+    # None-Einträge entfernen (mehrdeutig)
+    return {k: v for k, v in phrase_map.items() if v is not None}
+
+
+def _get_link_index() -> dict:
+    global _AUTO_LINK_CACHE
+    now = time.time()
+    ts, pmap = _AUTO_LINK_CACHE
+    if now - ts <= _AUTO_LINK_TTL_SEC and pmap:
+        return pmap
+    with _AUTO_LINK_LOCK:
+        ts, pmap = _AUTO_LINK_CACHE
+        if now - ts > _AUTO_LINK_TTL_SEC or not pmap:
+            try:
+                pmap = _build_link_index()
+            except Exception as e:
+                log.warning(f"link-index build failed: {e}")
+                pmap = {}
+            _AUTO_LINK_CACHE = (now, pmap)
+    return pmap
+
+
+def invalidate_link_index() -> None:
+    """Cache-Reset nach Schreibvorgang (neuer File könnte neuen Link-Kandidat sein)."""
+    global _AUTO_LINK_CACHE
+    _AUTO_LINK_CACHE = (0.0, {})
+
+
+def auto_link(text: str, exclude_ids: Optional[set] = None) -> str:
+    """Findet bekannte Vault-IDs im Text + ersetzt durch [[wikilinks]].
+
+    Schützt Code, bestehende Links, URLs vor Substitution. Idempotent —
+    Doppelaufruf produziert keine doppelten Links.
+
+    exclude_ids: IDs die NICHT verlinkt werden sollen (typisch: das File
+    das gerade selbst geschrieben wird → keine Self-Links).
+    """
+    if not text or not isinstance(text, str):
+        return text
+
+    pmap = _get_link_index()
+    if not pmap:
+        return text
+
+    exclude = exclude_ids or set()
+
+    # 1) Geschützte Bereiche stashen
+    stash: list = []
+
+    def _stash_repl(m):
+        stash.append(m.group(0))
+        return f"\x00LINK{len(stash)-1}\x00"
+
+    safe_text = _PROTECT_RE.sub(_stash_repl, text)
+
+    # 2) Phrasen sortieren — längste zuerst (damit "BBM Skript K-Blätter"
+    # vor "BBM" matcht und nicht umgekehrt)
+    phrases = sorted(pmap.keys(), key=len, reverse=True)
+
+    # Cap: max 30 Substitutionen pro Aufruf gegen Pathological-Input
+    sub_count = 0
+    SUB_CAP = 30
+
+    for phrase in phrases:
+        if sub_count >= SUB_CAP:
+            break
+        target_id = pmap[phrase]
+        if target_id in exclude:
+            continue
+        if len(phrase) < _LINK_MIN_LEN:
+            continue
+
+        # Whole-word match — Wortgrenzen mit Umlaut-Awareness:
+        # negative Lookarounds auf [Buchstabe/Ziffer/Underscore/Umlaut].
+        pat = re.compile(
+            r"(?<![\wÀ-ſ])"
+            + re.escape(phrase)
+            + r"(?![\wÀ-ſ])",
+            re.IGNORECASE,
+        )
+
+        def _link_repl(m):
+            nonlocal sub_count
+            if sub_count >= SUB_CAP:
+                return m.group(0)
+            sub_count += 1
+            matched = m.group(0)
+            # Wenn matched lowercase exakt = ID → einfacher [[id]]-Link
+            if matched.lower() == target_id.lower():
+                return f"[[{target_id}]]"
+            # Sonst Display-Form: [[id|original-Schreibweise]]
+            return f"[[{target_id}|{matched}]]"
+
+        safe_text = pat.sub(_link_repl, safe_text)
+
+    # 3) Stash zurücktauschen
+    def _unstash(m):
+        idx = int(m.group(1))
+        return stash[idx] if idx < len(stash) else m.group(0)
+
+    safe_text = re.sub(r"\x00LINK(\d+)\x00", _unstash, safe_text)
+    return safe_text
+
+
 def append_to_daily(section: str, text: str) -> str:
     """Append text to today's daily under the given section.
 
@@ -307,6 +513,11 @@ def append_to_daily(section: str, text: str) -> str:
         section = "Notizen & Gedanken"
     path = ensure_daily()
     content = path.read_text(encoding="utf-8")
+
+    # Auto-Link bekannte Vault-IDs/Titles im neuen Text — exclude die Daily
+    # selbst (verhindert Self-Reference wenn die Daily-ID im Text vorkommt).
+    today_daily_id = f"daily-{today_iso()}"
+    text = auto_link(text, exclude_ids={today_daily_id})
 
     pattern = rf"(?m)^## {re.escape(section)}\s*$"
     match = re.search(pattern, content)
@@ -437,6 +648,8 @@ def create_task(title: str, priority: str = "medium",
     except Exception as e:
         log.warning(f"Daily-Link für Task fehlgeschlagen: {e}")
 
+    invalidate_link_index()
+
     extras = []
     if due:
         extras.append(f"fällig {due}")
@@ -512,6 +725,7 @@ def create_meeting(title: str, attendees: Optional[list] = None,
     }
     post = frontmatter.Post(body, **fm_data)
     atomic_write(path, frontmatter.dumps(post) + "\n")
+    invalidate_link_index()
     return f"Meeting angelegt: [[meeting-{today}-{slug}]]"
 
 
@@ -537,8 +751,11 @@ def create_note(title: str, body: str, tags: Optional[list] = None) -> str:
                 clean_tags.append(t.strip().lower())
                 seen.add(t.strip())
 
+    # Auto-Link bekannte Vault-IDs/Titles — exclude die Note selbst
+    linked_body = auto_link(body.strip(), exclude_ids={slug})
+
     # Body dynamisch — direkt H1 + User-Body, kein Template-Comment
-    note_body = f"# {title}\n\n{body.strip()}\n"
+    note_body = f"# {title}\n\n{linked_body}\n"
 
     fm_data = {
         "id": slug,
@@ -552,6 +769,7 @@ def create_note(title: str, body: str, tags: Optional[list] = None) -> str:
     }
     post = frontmatter.Post(note_body, **fm_data)
     atomic_write(path, frontmatter.dumps(post) + "\n")
+    invalidate_link_index()
     return f"Notiz angelegt: [[{slug}]]"
 
 
@@ -742,16 +960,19 @@ def delete_path(rel_path: str, recursive: bool = False) -> str:
     if p == VAULT.resolve():
         return "Fehler: Vault-Root kann nicht gelöscht werden."
     try:
-        if p.is_dir():
+        was_dir = p.is_dir()
+        if was_dir:
             if recursive:
                 shutil.rmtree(p)
-                return f"✓ Ordner rekursiv gelöscht: `{rel_path}`"
+                msg = f"✓ Ordner rekursiv gelöscht: `{rel_path}`"
             else:
                 p.rmdir()  # nur wenn leer
-                return f"✓ Leerer Ordner gelöscht: `{rel_path}`"
+                msg = f"✓ Leerer Ordner gelöscht: `{rel_path}`"
         else:
             p.unlink()
-            return f"✓ Datei gelöscht: `{rel_path}`"
+            msg = f"✓ Datei gelöscht: `{rel_path}`"
+        invalidate_link_index()  # gelöschte ID darf nicht mehr verlinkt werden
+        return msg
     except OSError as e:
         return f"Löschen fehlgeschlagen: {e}"
 
@@ -993,6 +1214,7 @@ def confirm_delete() -> str:
         header = f"Verschoben nach 99_Archive/ ({len(paths)} Datei(en)):"
 
     PENDING_DELETIONS.pop(ALLOWED_USER_ID, None)
+    invalidate_link_index()  # gelöschte/archivierte IDs nicht mehr verlinkbar
     return f"{header}\n" + "\n".join(results)
 
 
@@ -1424,6 +1646,8 @@ SORT date DESC
         encoding="utf-8",
     )
 
+    invalidate_link_index()
+
     rel = proj_dir.relative_to(VAULT).as_posix()
     parent_info = f" (Subprojekt von `{parent}`)" if parent else ""
     return (f"✓ Projekt angelegt: [[project-{slug}]]{parent_info}\n"
@@ -1733,6 +1957,9 @@ def update_project_context(slug: str, text: str, mode: str = "append") -> str:
     if mode not in ("append", "replace"):
         mode = "append"
 
+    # Auto-Link bekannte Vault-IDs/Titles im Kontext-Text — exclude das Projekt selbst
+    linked_text = auto_link(text.strip(), exclude_ids={slug, f"project-{slug}"})
+
     context_file = proj_dir / "CONTEXT.md"
     header = (
         f"# Kontext: {slug}\n\n"
@@ -1741,11 +1968,11 @@ def update_project_context(slug: str, text: str, mode: str = "append") -> str:
     )
 
     if mode == "replace" or not context_file.exists():
-        context_file.write_text(header + text.strip() + "\n", encoding="utf-8")
+        context_file.write_text(header + linked_text + "\n", encoding="utf-8")
         return f"✓ CONTEXT.md für {slug} {'ersetzt' if mode == 'replace' else 'angelegt'}"
     else:
         with context_file.open("a", encoding="utf-8") as f:
-            f.write(f"\n{text.strip()}\n")
+            f.write(f"\n{linked_text}\n")
         return f"✓ CONTEXT.md für {slug} erweitert"
 
 
@@ -2770,6 +2997,10 @@ Wenn Captions/Inhalte verraten dass mehrere Files thematisch zusammengehören (g
   - NIE Beispiel-Platzhalter wie `[[t-example]]`, `[[wiki-example]]`, `[[id]]`, `[[file-name]]`
   - NUR IDs verwenden die du tatsächlich aus search_vault/read_file/list_files kennst.
     Wenn du keine IDs zur Hand hast → KEINE Wikilinks setzen, lieber Klartext.
+  - **AUTO-LINKING aktiv**: Bei `append_to_daily`, `create_note`, `update_project_context`
+    werden bekannte Vault-IDs/Titles automatisch zu `[[wikilinks]]`. Du musst sie nicht
+    selbst in `[[…]]` setzen — schreib einfach den Klartext ("Matura"), der Renderer
+    findet das Match. Nur bei direkter Telegram-Antwort musst du `[[id]]` selbst setzen.
 - **NIE** HTML-Tags (`<br>`, `<p>`, `<span>`). NIE Frontmatter ausgeben.
 
 # DATEN
