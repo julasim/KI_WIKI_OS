@@ -617,17 +617,20 @@ def clip_url(url: str) -> str:
         return f"Clip-Fehler: {e}"
 
 
-# ─── Pending Deletions (Multi-File-fähig) ───────────────────────────────────
-# Two-Step-Delete: request_delete() merkt sich Pfad(e), confirm_delete() führt aus.
-# Mehrere Files können angefragt werden, alle werden bei einer Bestätigung gelöscht.
-PENDING_DELETIONS: dict[int, tuple[list[str], float]] = {}
+# ─── Pending Deletions (Multi-File-fähig + Soft/Hard) ───────────────────────
+# Two-Step-Delete: request_delete() merkt sich Pfad(e) + Modus,
+# confirm_delete() führt aus.
+# Modi: 'archive' (Default, sicher) oder 'permanent' (echtes rm).
+PENDING_DELETIONS: dict[int, tuple[list[str], float, str]] = {}  # uid → (paths, ts, mode)
 DELETE_CONFIRM_TIMEOUT = 300  # Sekunden
 
 
-def request_delete(rel_paths) -> str:
-    """Merkt sich eine Lösch-Anfrage (1 oder mehrere Files). Akkumuliert.
+def request_delete(rel_paths, permanent: bool = False) -> str:
+    """Merkt sich eine Lösch-Anfrage. Akkumuliert.
 
-    rel_paths: str (einzelne Datei) oder list[str] (mehrere)
+    rel_paths: str oder list[str]
+    permanent: False (Default) = ins 99_Archive/ verschieben (reversibel).
+               True = WIRKLICH LÖSCHEN (irreversibel via rm).
     """
     # Input normalisieren
     if isinstance(rel_paths, str):
@@ -653,53 +656,86 @@ def request_delete(rel_paths) -> str:
     if not valid:
         return "Keine gültigen Pfade. " + "; ".join(errors)
 
-    # Akkumulieren (existierende pending Liste erweitern)
-    existing = PENDING_DELETIONS.get(ALLOWED_USER_ID, ([], 0.0))[0]
-    combined = list(dict.fromkeys(existing + valid))  # dedupliziert, Reihenfolge erhält
-    PENDING_DELETIONS[ALLOWED_USER_ID] = (combined, time.time())
-    log.info(f"Pending delete: {combined}")
+    mode = "permanent" if permanent else "archive"
 
-    msg = f"⚠️ Bestätigung: soll(en) {len(combined)} Datei(en) ins Archiv verschoben werden?\n\n"
-    msg += "\n".join(f"• `{p}`" for p in combined)
+    # Akkumulieren — Mode darf nicht silent gewechselt werden
+    existing = PENDING_DELETIONS.get(ALLOWED_USER_ID)
+    if existing and existing[2] != mode:
+        return (f"Konflikt: pending Löschung läuft im Modus '{existing[2]}', "
+                f"aber neue Anfrage will '{mode}'. Erst confirm_delete oder cancel_delete.")
+
+    existing_paths = existing[0] if existing else []
+    combined = list(dict.fromkeys(existing_paths + valid))
+    PENDING_DELETIONS[ALLOWED_USER_ID] = (combined, time.time(), mode)
+    log.info(f"Pending delete ({mode}): {combined}")
+
+    if mode == "permanent":
+        msg = f"⚠️⚠️ <b>ENDGÜLTIG LÖSCHEN</b> — soll(en) {len(combined)} Datei(en) "
+        msg += "<b>UNWIDERRUFLICH gelöscht</b> werden? (kein Archiv, kein Restore!)\n\n"
+    else:
+        msg = f"⚠️ Bestätigung: soll(en) {len(combined)} Datei(en) ins Archiv verschoben werden? (reversibel)\n\n"
+    msg += "\n".join(f"• <code>{p}</code>" for p in combined)
     if errors:
-        msg += "\n\n_(übersprungen: " + ", ".join(errors) + ")_"
+        msg += "\n\n<i>(übersprungen: " + ", ".join(errors) + ")</i>"
     msg += f"\n\nAntworte mit 'ja' / 'bestätigt' / 'machs' (innerhalb {DELETE_CONFIRM_TIMEOUT//60} Min)."
     return msg
 
 
 def confirm_delete() -> str:
-    """Führt alle pending Löschungen aus."""
+    """Führt alle pending Löschungen aus — Archiv oder permanent je nach Mode."""
     pending = PENDING_DELETIONS.get(ALLOWED_USER_ID)
     if not pending or not pending[0]:
         return "Keine Löschung pending — gibts nichts zu bestätigen."
-    paths, ts = pending
+    paths, ts, mode = pending
     age = time.time() - ts
     if age > DELETE_CONFIRM_TIMEOUT:
         PENDING_DELETIONS.pop(ALLOWED_USER_ID, None)
         return f"Bestätigung zu spät ({int(age)}s > {DELETE_CONFIRM_TIMEOUT}s). Bitte nochmal anfordern."
 
-    archive_root = VAULT / "99_Archive"
     results = []
-    for rel_path in paths:
-        try:
-            src = safe_path(rel_path)
-            if not src.exists():
-                results.append(f"✗ {rel_path} verschwunden")
-                continue
-            dst = archive_root / src.relative_to(VAULT)
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            if dst.exists():
-                ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-                dst = dst.with_name(f"{dst.stem}_{ts_str}{dst.suffix}")
-            os.rename(src, dst)
-            results.append(f"✓ {rel_path}")
-            log.info(f"Archived: {rel_path} → {dst.relative_to(VAULT)}")
-        except Exception as e:
-            log.exception(f"delete {rel_path} failed")
-            results.append(f"✗ {rel_path} ({e})")
+
+    if mode == "permanent":
+        # Hart löschen via rm
+        for rel_path in paths:
+            try:
+                src = safe_path(rel_path)
+                if not src.exists():
+                    results.append(f"✗ {rel_path} schon weg")
+                    continue
+                if src.is_dir():
+                    shutil.rmtree(src)
+                else:
+                    src.unlink()
+                results.append(f"💀 {rel_path}")
+                log.info(f"Hard-deleted: {rel_path}")
+            except Exception as e:
+                log.exception(f"hard-delete {rel_path} failed")
+                results.append(f"✗ {rel_path} ({e})")
+        header = f"💀 ENDGÜLTIG GELÖSCHT ({len(paths)} Datei(en)):"
+    else:
+        # Soft: nach 99_Archive/ verschieben
+        archive_root = VAULT / "99_Archive"
+        for rel_path in paths:
+            try:
+                src = safe_path(rel_path)
+                if not src.exists():
+                    results.append(f"✗ {rel_path} verschwunden")
+                    continue
+                dst = archive_root / src.relative_to(VAULT)
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                if dst.exists():
+                    ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    dst = dst.with_name(f"{dst.stem}_{ts_str}{dst.suffix}")
+                os.rename(src, dst)
+                results.append(f"✓ {rel_path}")
+                log.info(f"Archived: {rel_path} → {dst.relative_to(VAULT)}")
+            except Exception as e:
+                log.exception(f"archive {rel_path} failed")
+                results.append(f"✗ {rel_path} ({e})")
+        header = f"Verschoben nach 99_Archive/ ({len(paths)} Datei(en)):"
 
     PENDING_DELETIONS.pop(ALLOWED_USER_ID, None)
-    return f"Verschoben nach 99_Archive/ ({len(paths)} Datei(en)):\n" + "\n".join(results)
+    return f"{header}\n" + "\n".join(results)
 
 
 def cancel_delete() -> str:
@@ -707,7 +743,7 @@ def cancel_delete() -> str:
     pending = PENDING_DELETIONS.pop(ALLOWED_USER_ID, None)
     if not pending or not pending[0]:
         return "Keine pending Löschung."
-    return f"Löschanfrage für {len(pending[0])} Datei(en) abgebrochen."
+    return f"Löschanfrage für {len(pending[0])} Datei(en) abgebrochen ({pending[2]}-Modus)."
 
 
 # ─── Reminders (persistent + JobQueue) ──────────────────────────────────────
@@ -1338,11 +1374,13 @@ TOOLS = [
     {"type": "function", "function": {
         "name": "request_delete",
         "description": (
-            "Schritt 1 von 2 für sicheres Löschen: meldet Löschanfrage an User. "
-            "Akzeptiert eine ODER mehrere Pfade (Batch-Delete). Bei 'lösche alle X' "
-            "erst list_files aufrufen, dann ALLE Pfade in einem request_delete-Call "
-            "übergeben. NIEMALS direkt confirm_delete ohne vorherige User-Bestätigung. "
-            "Pfade relativ zu Vault-Root."
+            "Schritt 1 von 2 für Löschen: meldet Löschanfrage an User. "
+            "Akzeptiert einen ODER mehrere Pfade. Bei 'lösche alle X' erst list_files. "
+            "permanent=False (Default): nach 99_Archive/ verschieben (reversibel). "
+            "permanent=True NUR wenn User explizite Worte nutzt wie "
+            "'endgültig', 'wirklich weg', 'permanent', 'unwiderruflich', 'hart löschen', "
+            "'für immer', 'aus dem archiv auch'. Default ist immer Archiv (sicher). "
+            "NIEMALS direkt confirm_delete ohne vorherige User-Bestätigung."
         ),
         "parameters": {
             "type": "object",
@@ -1352,7 +1390,12 @@ TOOLS = [
                         {"type": "string"},
                         {"type": "array", "items": {"type": "string"}},
                     ],
-                    "description": "Einzelner Pfad oder Liste von Pfaden",
+                    "description": "Einzelner Pfad oder Liste von Pfaden, relativ zu Vault-Root",
+                },
+                "permanent": {
+                    "type": "boolean",
+                    "description": "True = unwiderruflich rm. Default false (Archiv).",
+                    "default": False,
                 },
             },
             "required": ["rel_paths"],
@@ -1525,7 +1568,8 @@ Tool nur aufrufen wenn Julius EXPLIZIT Speicher-Intent zeigt:
 | "meeting: …" / "war im Termin mit …" | `create_meeting` |
 | "X erledigt / fertig / done" | `mark_task_done` (ggf. erst `search_vault`) |
 | URL allein, sonst nichts | erst fragen, dann `clip_url` |
-| "lösche X / weg mit X" | `request_delete` (NIE direkt confirm!) |
+| "lösche X / weg mit X" | `request_delete` mit `permanent=false` (→ ins Archiv, reversibel) |
+| "lösche endgültig X" / "wirklich weg" / "permanent" / "unwiderruflich" / "für immer" / "hart" | `request_delete` mit `permanent=true` (→ rm, kein Restore!) |
 | "lösche alle X" / "leere Y" | erst `list_files` für Verzeichnis, dann `request_delete` mit ALLEN Pfaden als Liste |
 | "ja / bestätigt / machs" nach request_delete | `confirm_delete` |
 | "nein / abbrechen" nach request_delete | `cancel_delete` |
