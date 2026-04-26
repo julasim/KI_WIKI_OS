@@ -1206,35 +1206,178 @@ def list_files(rel_dir: str = "", include_system: bool = False) -> str:
         return f"List-Fehler: {e}"
 
 
-# ─── Conversation Memory ─────────────────────────────────────────────────────
-# Letzte N Turns pro User. Lebt im RAM solange Container läuft.
-# Reset nach 30 Min Inaktivität.
+# ─── Conversation Memory (3-Tier) ────────────────────────────────────────────
+# Tier 1: RAM-Cache (letzte HISTORY_MAX_MESSAGES, schneller Zugriff)
+# Tier 2: Persistent JSONL (überlebt Restart, lazy-loaded)
+# Tier 3: Facts-File (long-term Fakten über User, always im System-Prompt)
+
 CONVERSATION_HISTORY: dict[int, list] = {}
 CONVERSATION_TIMESTAMPS: dict[int, float] = {}
-HISTORY_MAX_MESSAGES = 24       # ca. 12 User+Assistant-Turns
-HISTORY_TIMEOUT = 30 * 60       # 30 Minuten
+HISTORY_MAX_MESSAGES = 60       # ca. 30 User+Assistant-Turns
+HISTORY_TIMEOUT = 60 * 60       # 1h Inaktivität → RAM-Cache leeren, beim nächsten Zugriff von Disk lazy-laden
+HISTORY_PERSIST_LIMIT = 1000    # max Lines im JSONL bevor compaction (auf 200 trim)
+
+BOT_MEMORY_DIR = VAULT / "06_Meta" / "bot-memory"
+FACTS_FILE = BOT_MEMORY_DIR / "facts.md"
+HISTORY_FILE = BOT_MEMORY_DIR / "conversation-history.jsonl"
+
+
+def _ensure_memory_dir():
+    BOT_MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def get_facts() -> str:
+    """Long-term Fakten lesen (werden in System-Prompt eingespeist)."""
+    if not FACTS_FILE.exists():
+        return ""
+    try:
+        content = FACTS_FILE.read_text(encoding="utf-8").strip()
+        # Frontmatter überspringen falls vorhanden
+        if content.startswith("---"):
+            parts = content.split("---", 2)
+            if len(parts) >= 3:
+                content = parts[2].strip()
+        return content
+    except Exception as e:
+        log.warning(f"facts file read failed: {e}")
+        return ""
+
+
+def remember(fact: str) -> str:
+    """Fügt einen persistenten Fakt zur Memory-Datei hinzu."""
+    if not fact or not fact.strip():
+        return "Fakt-Text fehlt."
+    fact = fact.strip()
+    _ensure_memory_dir()
+
+    # Initialize file with header if needed
+    if not FACTS_FILE.exists():
+        FACTS_FILE.write_text(
+            "# Bot-Memory: persistente Fakten\n\n"
+            "_Hier sammelt der Bot Fakten die er sich dauerhaft merken soll. "
+            "Du kannst manuell editieren — Änderungen sind beim nächsten LLM-Call wirksam._\n\n",
+            encoding="utf-8",
+        )
+
+    today = today_iso()
+    line = f"- ({today}) {fact}\n"
+    with FACTS_FILE.open("a", encoding="utf-8") as f:
+        f.write(line)
+    log.info(f"Remembered fact: {fact[:80]}")
+    return f"✓ Gemerkt: {fact[:120]}"
+
+
+def list_facts() -> str:
+    """Zeigt alle gemerkten Fakten."""
+    facts = get_facts()
+    if not facts:
+        return "Keine persistenten Fakten gespeichert."
+    return f"Persistente Fakten:\n\n{facts[:3000]}"
+
+
+def forget_fact(matching_text: str) -> str:
+    """Entfernt Fakten die `matching_text` enthalten (case-insensitive)."""
+    if not FACTS_FILE.exists():
+        return "Keine Fakten-Datei."
+    if not matching_text or not matching_text.strip():
+        return "Such-Text fehlt."
+    matching_text = matching_text.strip().lower()
+    content = FACTS_FILE.read_text(encoding="utf-8")
+    lines = content.splitlines()
+    kept = []
+    removed = []
+    for line in lines:
+        if line.startswith("- ") and matching_text in line.lower():
+            removed.append(line)
+        else:
+            kept.append(line)
+    if not removed:
+        return f"Kein Fakt gefunden mit '{matching_text}'."
+    FACTS_FILE.write_text("\n".join(kept) + "\n", encoding="utf-8")
+    return f"Entfernt ({len(removed)}):\n" + "\n".join(removed[:5])
+
+
+def _save_history_line(user_id: int, message: dict) -> None:
+    """Append einzelne Message ans persistente JSONL."""
+    _ensure_memory_dir()
+    record = {"user_id": user_id, "ts": time.time(), "msg": message}
+    try:
+        with HISTORY_FILE.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as e:
+        log.warning(f"history persist failed: {e}")
+
+
+def _load_persistent_history(user_id: int) -> list:
+    """Letzte HISTORY_MAX_MESSAGES Messages für User aus JSONL laden."""
+    if not HISTORY_FILE.exists():
+        return []
+    try:
+        records = []
+        with HISTORY_FILE.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    if rec.get("user_id") == user_id:
+                        records.append(rec)
+                except json.JSONDecodeError:
+                    continue
+        return [r["msg"] for r in records[-HISTORY_MAX_MESSAGES:]]
+    except Exception as e:
+        log.warning(f"history load failed: {e}")
+        return []
+
+
+def _maybe_compact_history() -> None:
+    """JSONL trimmen wenn zu groß: nur letzte 200 Lines behalten."""
+    if not HISTORY_FILE.exists():
+        return
+    try:
+        lines = HISTORY_FILE.read_text(encoding="utf-8").splitlines()
+        if len(lines) <= HISTORY_PERSIST_LIMIT:
+            return
+        keep = lines[-200:]
+        HISTORY_FILE.write_text("\n".join(keep) + "\n", encoding="utf-8")
+        log.info(f"History compacted: {len(lines)} → {len(keep)}")
+    except Exception as e:
+        log.warning(f"history compact failed: {e}")
 
 
 def get_history(user_id: int) -> list:
-    """History für User holen, expirieren wenn zu alt."""
+    """History für User. Bei Cache-Miss/Timeout: lazy-load aus JSONL."""
     last = CONVERSATION_TIMESTAMPS.get(user_id, 0.0)
-    if time.time() - last > HISTORY_TIMEOUT:
-        CONVERSATION_HISTORY[user_id] = []
-    return CONVERSATION_HISTORY.get(user_id, [])
+    cached = CONVERSATION_HISTORY.get(user_id)
+    if cached is None or (time.time() - last) > HISTORY_TIMEOUT:
+        loaded = _load_persistent_history(user_id)
+        CONVERSATION_HISTORY[user_id] = loaded
+        if loaded:
+            CONVERSATION_TIMESTAMPS[user_id] = time.time()
+        return loaded
+    return cached
 
 
 def update_history(user_id: int, new_messages: list) -> None:
-    """History anhängen + auf Max-Länge trimmen."""
+    """History anhängen + persistieren + auf Max-Länge trimmen."""
     history = get_history(user_id)
     history.extend(new_messages)
     if len(history) > HISTORY_MAX_MESSAGES:
         history = history[-HISTORY_MAX_MESSAGES:]
     CONVERSATION_HISTORY[user_id] = history
     CONVERSATION_TIMESTAMPS[user_id] = time.time()
+    # Persistieren
+    for msg in new_messages:
+        _save_history_line(user_id, msg)
+    _maybe_compact_history()
 
 
 def reset_history(user_id: int) -> None:
-    """History komplett resetten (z.B. via /reset Command)."""
+    """RAM-Cache leeren. JSONL bleibt erhalten — Memory wird beim nächsten Mal neu geladen.
+
+    Wenn du wirklich permanent löschen willst: HISTORY_FILE manuell entfernen.
+    """
     CONVERSATION_HISTORY.pop(user_id, None)
     CONVERSATION_TIMESTAMPS.pop(user_id, None)
 
@@ -1439,6 +1582,37 @@ TOOLS = [
         },
     }},
     {"type": "function", "function": {
+        "name": "remember",
+        "description": (
+            "Fügt einen persistenten Fakt zur Bot-Memory hinzu (06_Meta/bot-memory/facts.md). "
+            "Nutze wenn User sagt 'merk dir dass...', 'speicher als Fakt', "
+            "'das musst du wissen', oder wenn ein offensichtlich dauerhafter Fakt "
+            "über User/Setup auftaucht (z.B. Schule, KV-Lohn, Lieblings-Kunde). "
+            "Werden bei jedem LLM-Call automatisch in den System-Prompt eingespeist."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "fact": {"type": "string", "description": "Der Fakt als kurzer Satz (z.B. 'KV-Lohn 2026 ist 32,80 €/h')"},
+            },
+            "required": ["fact"],
+        },
+    }},
+    {"type": "function", "function": {
+        "name": "list_facts",
+        "description": "Zeigt alle gemerkten persistenten Fakten.",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    }},
+    {"type": "function", "function": {
+        "name": "forget_fact",
+        "description": "Entfernt Fakten die einen bestimmten Text enthalten. Nutze wenn User 'vergiss X' o.ä. sagt.",
+        "parameters": {
+            "type": "object",
+            "properties": {"matching_text": {"type": "string", "description": "Text-Snippet im Fakt zum matchen"}},
+            "required": ["matching_text"],
+        },
+    }},
+    {"type": "function", "function": {
         "name": "list_existing_tags",
         "description": (
             "Liste der bereits im Vault verwendeten Tags, sortiert nach Häufigkeit. "
@@ -1534,6 +1708,9 @@ TOOL_HANDLERS = {
     "cancel_delete": cancel_delete,
     "list_files": list_files,
     "list_existing_tags": list_existing_tags,
+    "remember": remember,
+    "list_facts": list_facts,
+    "forget_fact": forget_fact,
     "create_project": create_project,
     "create_reminder": create_reminder,
     "list_reminders": list_reminders,
@@ -1623,6 +1800,17 @@ Begrüßung, Smalltalk, Fragen, Statements ohne Speicher-Verb → antworten, **n
   (z.B. "dringend Server-Backup einrichten" → title="Server-Backup einrichten",
   priority="urgent")
 
+# MEMORY
+Du hast 3-Tier-Memory:
+1. Aktuelle Konversation (letzte ~30 Turns)
+2. Persistente History (alles, lazy-load nach Restart)
+3. Long-term Fakten (siehe oben unter "PERSISTENTE FAKTEN" — falls da, nutzen)
+
+Wenn User dauerhaft was merken soll ("merk dir dass...", "speicher das als Fakt",
+"mein KV-Lohn ist X", "ich studiere an Y"): rufe `remember(fact)` auf.
+Wenn User "vergiss X" sagt: `forget_fact(matching_text)`.
+Wenn User "was weißt du über mich" / "welche Fakten hast du" fragt: `list_facts`.
+
 # AUTO-TAGGING
 Beim Anlegen von Tasks / Notizen / Meetings: extrahiere **2-5 thematische Tags**
 aus dem Inhalt und übergib sie via `tags`-Parameter.
@@ -1653,6 +1841,11 @@ async def llm_loop(user_text: str, user_id: int) -> str:
                 .replace("{today}", today_iso())
                 .replace("{now}", now_local.strftime("%H:%M"))
                 .replace("{tz}", TIMEZONE.key if hasattr(TIMEZONE, "key") else str(TIMEZONE)))
+
+    # Long-term Fakten anhängen falls vorhanden
+    facts = get_facts()
+    if facts:
+        sys_text += f"\n\n# PERSISTENTE FAKTEN (aus bot-memory/facts.md)\n\n{facts}\n"
 
     # System-Prompt + History + neue User-Message
     history = get_history(user_id)
@@ -2407,8 +2600,11 @@ async def handle_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/reminders — alle aktiven Erinnerungen\n"
         "/backup — Vault in GitHub-Repo pushen\n"
         "/reset — Conversation-Memory leeren\n\n"
-        "<i>Conversation-Memory aktiv: ich erinnere mich an die letzten ~12 Turns "
-        "(30 Min Timeout). Follow-ups wie 'ja' oder 'und füg X dazu' funktionieren.</i>",
+        "<i>3-Tier-Memory aktiv:\n"
+        "• ~30 Turns aktiver Konversation (RAM)\n"
+        "• gesamte History persistiert (überlebt Restart)\n"
+        "• Long-term Fakten in 06_Meta/bot-memory/facts.md (immer im Kontext)\n"
+        "Sag 'merk dir dass …' um persistente Fakten anzulegen.</i>",
         parse_mode=constants.ParseMode.HTML,
     )
 
