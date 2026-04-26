@@ -416,19 +416,18 @@ def mark_task_done(slug: str) -> str:
 def create_meeting(title: str, attendees: Optional[list] = None,
                    meeting_date: Optional[str] = None,
                    tags: Optional[list] = None) -> str:
-    """Create meeting protocol."""
+    """Create meeting protocol — Body dynamisch (kein Template-Cruft)."""
+    if not title or not title.strip():
+        return "Fehler: Meeting-Titel darf nicht leer sein."
     today = meeting_date or today_iso()
     slug = slugify(title)
     path = MEETINGS_DIR / f"{today}_{slug}.md"
-    template = load_template("meeting")
-    content = template.replace("{{title}}", title).replace("{{date:YYYY-MM-DD}}", today)
-    post = frontmatter.loads(content)
-    post["id"] = f"meeting-{today}-{slug}"
-    post["title"] = title
-    post["date"] = today
-    post["attendees"] = attendees or []
-    post["status"] = "done" if today <= today_iso() else "planned"
-    # Auto-Tags
+    n = 2
+    while path.exists():
+        path = MEETINGS_DIR / f"{today}_{slug}-{n}.md"
+        n += 1
+
+    # Tags filtern
     clean_tags = []
     if tags and isinstance(tags, list):
         seen = set()
@@ -436,7 +435,32 @@ def create_meeting(title: str, attendees: Optional[list] = None,
             if isinstance(t, str) and t.strip() and t.strip() not in seen:
                 clean_tags.append(t.strip().lower())
                 seen.add(t.strip())
-    post["tags"] = clean_tags
+
+    attendees_list = attendees or []
+    attendees_str = ", ".join(f"[[{a}]]" for a in attendees_list) if attendees_list else "—"
+    status = "done" if today <= today_iso() else "planned"
+
+    body = (
+        f"# {title}\n\n"
+        f"**Datum**: {today} · **Teilnehmer**: {attendees_str} · **Status**: {status}\n\n"
+        f"## Agenda\n- \n\n"
+        f"## Diskussion\n\n"
+        f"## Entscheidungen\n- \n\n"
+        f"## Action Items\n- [ ] \n"
+    )
+
+    fm_data = {
+        "id": f"meeting-{today}-{slug}",
+        "title": title,
+        "type": "meeting",
+        "date": today,
+        "created": today_iso(),
+        "updated": today_iso(),
+        "attendees": attendees_list,
+        "status": status,
+        "tags": clean_tags,
+    }
+    post = frontmatter.Post(body, **fm_data)
     atomic_write(path, frontmatter.dumps(post) + "\n")
     return f"Meeting angelegt: [[meeting-{today}-{slug}]]"
 
