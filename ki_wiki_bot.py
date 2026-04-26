@@ -1383,7 +1383,7 @@ TOOL_HANDLERS = {
 # System prompt (cached)
 # ============================================================================
 
-SYSTEM_PROMPT = """Du bist Julius' Vault-Assistent über Telegram. Deutsch. Heute ist {today}.
+SYSTEM_PROMPT = """Du bist Julius' Vault-Assistent über Telegram. Deutsch. Heute ist {today}, aktuelle Uhrzeit {now} ({tz}).
 
 VAULT
 - 10_Life/daily/YYYY-MM-DD.md   Tageseinträge (Sektionen: Heute · Notizen & Gedanken · Offen / Einsortieren · Abends)
@@ -1476,7 +1476,11 @@ async def llm_loop(user_text: str, user_id: int) -> str:
 
     Mit Conversation-Memory: letzte ~12 Turns werden als Context übergeben.
     """
-    sys_text = SYSTEM_PROMPT.replace("{today}", today_iso())
+    now_local = datetime.now(TIMEZONE)
+    sys_text = (SYSTEM_PROMPT
+                .replace("{today}", today_iso())
+                .replace("{now}", now_local.strftime("%H:%M"))
+                .replace("{tz}", TIMEZONE.key if hasattr(TIMEZONE, "key") else str(TIMEZONE)))
 
     # System-Prompt + History + neue User-Message
     history = get_history(user_id)
