@@ -442,15 +442,18 @@ def create_meeting(title: str, attendees: Optional[list] = None,
 
 
 def create_note(title: str, body: str, tags: Optional[list] = None) -> str:
-    """Create a free note in 10_Life/notes/."""
+    """Create a free note in 10_Life/notes/. Body wird dynamisch gebaut, kein Template-Platzhalter."""
+    if not title or not title.strip():
+        return "Fehler: Note-Titel darf nicht leer sein."
+
     today = today_iso()
     slug = slugify(title)
     path = NOTES_DIR / f"{today}_{slug}.md"
-    template = load_template("note")
-    content = template.replace("{{title}}", title).replace("{{date:YYYY-MM-DD}}", today)
-    post = frontmatter.loads(content)
-    post["id"] = slug
-    post["title"] = title
+    n = 2
+    while path.exists():
+        path = NOTES_DIR / f"{today}_{slug}-{n}.md"
+        n += 1
+
     # Tags filtern (nur strings, nicht-leer, deduplizieren, lowercase)
     clean_tags = []
     if tags and isinstance(tags, list):
@@ -459,9 +462,21 @@ def create_note(title: str, body: str, tags: Optional[list] = None) -> str:
             if isinstance(t, str) and t.strip() and t.strip() not in seen:
                 clean_tags.append(t.strip().lower())
                 seen.add(t.strip())
-    post["tags"] = clean_tags
-    post["quelle"] = "telegram"
-    post.content = (post.content or "") + "\n" + body + "\n"
+
+    # Body dynamisch — direkt H1 + User-Body, kein Template-Comment
+    note_body = f"# {title}\n\n{body.strip()}\n"
+
+    fm_data = {
+        "id": slug,
+        "title": title,
+        "type": "note",
+        "created": today,
+        "updated": today,
+        "tags": clean_tags,
+        "status": "draft",
+        "quelle": "telegram",
+    }
+    post = frontmatter.Post(note_body, **fm_data)
     atomic_write(path, frontmatter.dumps(post) + "\n")
     return f"Notiz angelegt: [[{slug}]]"
 
