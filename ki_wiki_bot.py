@@ -301,7 +301,8 @@ VALID_TASK_CONTEXTS = {"home", "work", "errand", "phone", "computer"}
 
 def create_task(title: str, priority: str = "medium",
                 due: Optional[str] = None, area: Optional[str] = None,
-                project: Optional[str] = None, context: Optional[str] = None) -> str:
+                project: Optional[str] = None, context: Optional[str] = None,
+                tags: Optional[list] = None) -> str:
     """Create a new task file in 10_Life/tasks/.
 
     Body wird dynamisch gebaut (nicht Template-Substitution) damit
@@ -347,13 +348,22 @@ def create_task(title: str, priority: str = "medium",
         f"## Log\n- {today}: angelegt\n"
     )
 
+    # Tags filtern (nur strings, nicht-leer, deduplizieren)
+    clean_tags = []
+    if tags and isinstance(tags, list):
+        seen = set()
+        for t in tags:
+            if isinstance(t, str) and t.strip() and t.strip() not in seen:
+                clean_tags.append(t.strip().lower())
+                seen.add(t.strip())
+
     fm_data = {
         "id": task_id,
         "title": title,
         "type": "task",
         "created": today,
         "updated": today,
-        "tags": [],
+        "tags": clean_tags,
         "status": "open",
         "priority": priority,
     }
@@ -404,7 +414,8 @@ def mark_task_done(slug: str) -> str:
 
 
 def create_meeting(title: str, attendees: Optional[list] = None,
-                   meeting_date: Optional[str] = None) -> str:
+                   meeting_date: Optional[str] = None,
+                   tags: Optional[list] = None) -> str:
     """Create meeting protocol."""
     today = meeting_date or today_iso()
     slug = slugify(title)
@@ -417,6 +428,15 @@ def create_meeting(title: str, attendees: Optional[list] = None,
     post["date"] = today
     post["attendees"] = attendees or []
     post["status"] = "done" if today <= today_iso() else "planned"
+    # Auto-Tags
+    clean_tags = []
+    if tags and isinstance(tags, list):
+        seen = set()
+        for t in tags:
+            if isinstance(t, str) and t.strip() and t.strip() not in seen:
+                clean_tags.append(t.strip().lower())
+                seen.add(t.strip())
+    post["tags"] = clean_tags
     atomic_write(path, frontmatter.dumps(post) + "\n")
     return f"Meeting angelegt: [[meeting-{today}-{slug}]]"
 
@@ -431,7 +451,15 @@ def create_note(title: str, body: str, tags: Optional[list] = None) -> str:
     post = frontmatter.loads(content)
     post["id"] = slug
     post["title"] = title
-    post["tags"] = tags or []
+    # Tags filtern (nur strings, nicht-leer, deduplizieren, lowercase)
+    clean_tags = []
+    if tags and isinstance(tags, list):
+        seen = set()
+        for t in tags:
+            if isinstance(t, str) and t.strip() and t.strip() not in seen:
+                clean_tags.append(t.strip().lower())
+                seen.add(t.strip())
+    post["tags"] = clean_tags
     post["quelle"] = "telegram"
     post.content = (post.content or "") + "\n" + body + "\n"
     atomic_write(path, frontmatter.dumps(post) + "\n")
@@ -934,6 +962,35 @@ def backup_vault() -> str:
         return f"Backup-Fehler: {e}"
 
 
+def list_existing_tags(top_n: int = 30) -> str:
+    """Liste der existierenden Tags im Vault, sortiert nach Häufigkeit.
+
+    Hilft dem LLM beim Auto-Tagging konsistent zu bleiben statt jeden
+    Eintrag neu zu erfinden ('arbeit' vs 'work' vs 'job' Drift vermeiden).
+    """
+    from collections import Counter
+    counter: Counter = Counter()
+    for p in VAULT.rglob("*.md"):
+        if any(part in (".obsidian", "99_Archive", ".trash") for part in p.parts):
+            continue
+        try:
+            post = frontmatter.load(p)
+            tags = post.get("tags") or []
+            if isinstance(tags, list):
+                for t in tags:
+                    if isinstance(t, str) and t.strip():
+                        counter[t.strip().lower()] += 1
+        except Exception:
+            continue
+    if not counter:
+        return "Keine Tags im Vault — du legst die Konvention fest."
+    top = counter.most_common(top_n)
+    lines = [f"Top {len(top)} bestehende Tags ({sum(counter.values())} Verwendungen gesamt):"]
+    for tag, count in top:
+        lines.append(f"• `{tag}` ({count}×)")
+    return "\n".join(lines)
+
+
 def create_project(name: str, description: str = "", area: Optional[str] = None) -> str:
     """Legt einen neuen Projekt-Ordner unter 10_Life/projects/<slug>/ an.
 
@@ -1130,7 +1187,8 @@ TOOLS = [
             "Legt neuen Task in 10_Life/tasks/ an, verlinkt unter 'Heute' in heutiger Daily. "
             "WICHTIG: Optionale Parameter NUR setzen wenn explizit aus User-Input ableitbar — "
             "NIE raten/defaulten. Z.B. due nur wenn User wirklich ein Datum nennt; "
-            "project nur wenn User Projekt nennt oder es klar aus Conversation-Memory hervorgeht."
+            "project nur wenn User Projekt nennt oder es klar aus Conversation-Memory hervorgeht. "
+            "tags: 2-5 thematische Schlagworte aus dem Inhalt extrahieren (kebab-case, Deutsch)."
         ),
         "parameters": {
             "type": "object",
@@ -1141,6 +1199,11 @@ TOOLS = [
                 "area": {"type": "string", "description": "Area-ID, NUR wenn User Area nennt"},
                 "project": {"type": "string", "description": "Projekt-Slug (z.B. 'sanierung-kiosk'), NUR wenn aus User-Input oder Memory klar"},
                 "context": {"type": "string", "enum": ["home", "work", "errand", "phone", "computer"]},
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "2-5 thematische Tags (kebab-case, Deutsch). Topical, nicht 'task'/'todo'. Bei Bedarf vorher list_existing_tags für konsistente Vokabular.",
+                },
             },
             "required": ["title"],
         },
@@ -1156,26 +1219,27 @@ TOOLS = [
     }},
     {"type": "function", "function": {
         "name": "create_meeting",
-        "description": "Legt ein Meeting-Protokoll in 10_Life/meetings/ an.",
+        "description": "Legt ein Meeting-Protokoll in 10_Life/meetings/ an. tags: thematische Schlagworte extrahieren (z.B. ['blitztext', 'kunde', 'kickoff']).",
         "parameters": {
             "type": "object",
             "properties": {
                 "title": {"type": "string"},
                 "attendees": {"type": "array", "items": {"type": "string"}},
                 "meeting_date": {"type": "string", "description": "ISO-Datum YYYY-MM-DD, default heute"},
+                "tags": {"type": "array", "items": {"type": "string"}, "description": "2-5 thematische Tags, kebab-case Deutsch"},
             },
             "required": ["title"],
         },
     }},
     {"type": "function", "function": {
         "name": "create_note",
-        "description": "Legt eine freie Notiz in 10_Life/notes/ an. Für längere strukturierte Inhalte (>3 Sätze, eigenes Thema), die weder Task noch Tagesreflexion sind.",
+        "description": "Legt eine freie Notiz in 10_Life/notes/ an. Für längere strukturierte Inhalte (>3 Sätze, eigenes Thema), die weder Task noch Tagesreflexion sind. tags: 2-5 thematische Schlagworte aus dem Inhalt.",
         "parameters": {
             "type": "object",
             "properties": {
                 "title": {"type": "string"},
                 "body": {"type": "string"},
-                "tags": {"type": "array", "items": {"type": "string"}},
+                "tags": {"type": "array", "items": {"type": "string"}, "description": "2-5 thematische Tags, kebab-case Deutsch (z.B. ['gesundheit', 'ernaehrung'])"},
             },
             "required": ["title", "body"],
         },
@@ -1293,6 +1357,21 @@ TOOLS = [
         },
     }},
     {"type": "function", "function": {
+        "name": "list_existing_tags",
+        "description": (
+            "Liste der bereits im Vault verwendeten Tags, sortiert nach Häufigkeit. "
+            "Optional vor create_task/note/meeting aufrufen wenn unklar welche Tags konsistent sind. "
+            "Hilft Drift zu vermeiden ('arbeit' vs 'work' vs 'job')."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "top_n": {"type": "integer", "default": 30, "description": "Anzahl Top-Tags zurückgeben"},
+            },
+            "required": [],
+        },
+    }},
+    {"type": "function", "function": {
         "name": "create_project",
         "description": (
             "Legt einen neuen Projekt-Ordner unter 10_Life/projects/<slug>/ an. "
@@ -1372,6 +1451,7 @@ TOOL_HANDLERS = {
     "confirm_delete": confirm_delete,
     "cancel_delete": cancel_delete,
     "list_files": list_files,
+    "list_existing_tags": list_existing_tags,
     "create_project": create_project,
     "create_reminder": create_reminder,
     "list_reminders": list_reminders,
@@ -1459,6 +1539,15 @@ Begrüßung, Smalltalk, Fragen, Statements ohne Speicher-Verb → antworten, **n
   Wenn ein Prio-Wort am Titel-Anfang steht, ENTFERNE es aus dem Titel
   (z.B. "dringend Server-Backup einrichten" → title="Server-Backup einrichten",
   priority="urgent")
+
+# AUTO-TAGGING
+Beim Anlegen von Tasks / Notizen / Meetings: extrahiere **2-5 thematische Tags**
+aus dem Inhalt und übergib sie via `tags`-Parameter.
+- Format: kebab-case, Deutsch (z.B. `gesundheit`, `auto-projekt`, `kunde-mueller`)
+- TOPISCH, nicht strukturell — also NICHT `task`, `note`, `daily` (die sind im `type`-Feld).
+- Bei wenig Kontext (z.B. "Mail an Anna schreiben"): wenige präzise Tags > viele vage. Lieber `[]` wenn Inhalt zu generisch.
+- Bei häufiger Nutzung optional vorher `list_existing_tags` rufen — vermeidet Drift
+  (`arbeit` vs `work` vs `job`). Default: ohne Lookup, LLM-Vokabular ist ok.
 
 # KONTEXT-NUTZUNG (Conversation-Memory)
 - Wenn du im Verlauf der letzten paar Turns ein Projekt erstellt hast (z.B. `sanierung-kiosk`)
