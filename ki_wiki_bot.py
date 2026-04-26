@@ -715,6 +715,301 @@ def mark_task_done(slug: str) -> str:
     return f"Task erledigt: [[t-{filename}]]"
 
 
+# ─── Tagesplanung: Listings + Agenda ────────────────────────────────────────
+
+# Priority-Sortierung für Listings (urgent zuerst)
+_PRIO_ORDER = {"urgent": 0, "high": 1, "medium": 2, "low": 3}
+
+
+def _read_open_tasks() -> list:
+    """Walked TASKS_DIR, gibt Liste aller offenen Tasks mit Frontmatter zurück."""
+    if not TASKS_DIR.exists():
+        return []
+    out = []
+    for f in TASKS_DIR.glob("*.md"):
+        try:
+            post = frontmatter.load(f)
+        except Exception:
+            continue
+        meta = post.metadata
+        status = meta.get("status", "")
+        if status not in ("open", "in-progress", "blocked"):
+            continue
+        out.append({
+            "slug": f.stem,
+            "id": meta.get("id", f"t-{f.stem}"),
+            "title": meta.get("title") or f.stem,
+            "status": status,
+            "priority": meta.get("priority", "medium"),
+            "due": meta.get("due"),
+            "project": meta.get("project"),
+            "area": meta.get("area"),
+            "context": meta.get("context"),
+            "tags": meta.get("tags", []) or [],
+            "recurrence": meta.get("recurrence"),
+        })
+    return out
+
+
+def list_open_tasks(when: Optional[str] = None,
+                    priority: Optional[str] = None,
+                    project: Optional[str] = None,
+                    area: Optional[str] = None,
+                    context: Optional[str] = None) -> str:
+    """Listet offene Tasks mit smartem Filter, gruppiert + sortiert für Telegram.
+
+    when: 'today' / 'tomorrow' / 'week' (nächste 7 Tage) / 'overdue' / 'nodate' / None=alle
+    priority/project/area/context: optionale weitere Filter
+    """
+    tasks = _read_open_tasks()
+    if not tasks:
+        return "Keine offenen Tasks."
+
+    today = datetime.now(TIMEZONE).date()
+
+    # Filter
+    def _due_date(t):
+        d = t.get("due")
+        if not d:
+            return None
+        try:
+            return datetime.strptime(d, "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            return None
+
+    def _matches(t):
+        # when
+        if when:
+            d = _due_date(t)
+            w = when.strip().lower()
+            if w == "today":
+                if d != today:
+                    return False
+            elif w == "tomorrow":
+                if d != today + timedelta(days=1):
+                    return False
+            elif w == "week":
+                if d is None or not (today <= d <= today + timedelta(days=7)):
+                    return False
+            elif w == "overdue":
+                if d is None or d >= today:
+                    return False
+            elif w == "nodate":
+                if d is not None:
+                    return False
+            # unbekanntes when wird ignoriert (kein Filter)
+        if priority:
+            if t.get("priority", "").lower() != priority.strip().lower():
+                return False
+        if project:
+            if (t.get("project") or "").strip().lower() != project.strip().lower():
+                return False
+        if area:
+            if (t.get("area") or "").strip().lower() != area.strip().lower():
+                return False
+        if context:
+            if (t.get("context") or "").strip().lower() != context.strip().lower():
+                return False
+        return True
+
+    matched = [t for t in tasks if _matches(t)]
+    if not matched:
+        filter_desc = []
+        if when: filter_desc.append(f"when={when}")
+        if priority: filter_desc.append(f"prio={priority}")
+        if project: filter_desc.append(f"projekt={project}")
+        if area: filter_desc.append(f"area={area}")
+        if context: filter_desc.append(f"context={context}")
+        f_str = f" (Filter: {', '.join(filter_desc)})" if filter_desc else ""
+        return f"Keine offenen Tasks{f_str}."
+
+    # Wenn kein when-Filter: gruppieren in 4 Buckets nach Fälligkeit
+    if not when:
+        overdue, today_t, week_t, later_t, nodate_t = [], [], [], [], []
+        for t in matched:
+            d = _due_date(t)
+            if d is None:
+                nodate_t.append(t)
+            elif d < today:
+                overdue.append(t)
+            elif d == today:
+                today_t.append(t)
+            elif d <= today + timedelta(days=7):
+                week_t.append(t)
+            else:
+                later_t.append(t)
+
+        def _sort(lst):
+            return sorted(lst, key=lambda t: (_PRIO_ORDER.get(t.get("priority"), 9), _due_date(t) or date.max))
+
+        sections = []
+        for label, lst in [
+            ("⚠️ Überfällig", _sort(overdue)),
+            ("📅 Heute", _sort(today_t)),
+            ("📆 Diese Woche", _sort(week_t)),
+            ("🗓 Später", _sort(later_t)),
+            ("∞ Ohne Datum", _sort(nodate_t)),
+        ]:
+            if not lst:
+                continue
+            sections.append(f"**{label}** ({len(lst)})")
+            for t in lst[:15]:  # Cap pro Sektion
+                sections.append(_format_task_line(t, today))
+            if len(lst) > 15:
+                sections.append(f"  _… {len(lst) - 15} weitere_")
+            sections.append("")
+        # Trailing-Empty entfernen
+        while sections and not sections[-1]:
+            sections.pop()
+        return "\n".join(sections)
+
+    # Mit when-Filter: flache Liste, nach Prio sortiert
+    matched_sorted = sorted(matched, key=lambda t: (_PRIO_ORDER.get(t.get("priority"), 9), _due_date(t) or date.max))
+    lines = [f"Offene Tasks (Filter: {when}, {len(matched_sorted)}):"]
+    for t in matched_sorted[:30]:
+        lines.append(_format_task_line(t, today))
+    if len(matched_sorted) > 30:
+        lines.append(f"  _… {len(matched_sorted) - 30} weitere_")
+    return "\n".join(lines)
+
+
+def _format_task_line(t: dict, today: date) -> str:
+    """Eine Task als Bullet-Zeile mit Symbolen."""
+    prio_sym = {"urgent": "🔴", "high": "🟠", "medium": "·", "low": "🔵"}.get(t.get("priority"), "·")
+    rec_sym = " 🔁" if t.get("recurrence") else ""
+    proj = f" [{t['project']}]" if t.get("project") else ""
+    due_str = ""
+    d = t.get("due")
+    if d:
+        try:
+            dd = datetime.strptime(d, "%Y-%m-%d").date()
+            delta = (dd - today).days
+            if delta == 0:
+                due_str = " · heute"
+            elif delta == 1:
+                due_str = " · morgen"
+            elif delta < 0:
+                due_str = f" · ⚠️ vor {-delta}d"
+            elif delta <= 7:
+                due_str = f" · in {delta}d"
+            else:
+                due_str = f" · {d}"
+        except ValueError:
+            due_str = f" · {d}"
+    return f"  {prio_sym} [[{t['id']}]] {t['title']}{proj}{due_str}{rec_sym}"
+
+
+def get_today_agenda() -> str:
+    """Aggregiert: heute fällige Tasks + heute feuernde Reminders + heutige Meetings.
+
+    Read-only Snapshot der heutigen Lage — primärer Tool-Call wenn User
+    fragt 'was steht heute an / was ist noch zu tun'.
+    """
+    today = datetime.now(TIMEZONE).date()
+    today_str = today.strftime("%Y-%m-%d")
+    now = datetime.now(TIMEZONE)
+
+    parts = [f"📋 Agenda für heute ({today.strftime('%a %d.%m.%Y')})"]
+
+    # Reminders heute (noch nicht gefeuert)
+    rems_today = []
+    for r in _load_reminders():
+        try:
+            fire_at = datetime.fromisoformat(r["fire_at"])
+            if fire_at.tzinfo is None:
+                fire_at = fire_at.replace(tzinfo=TIMEZONE)
+            if fire_at.date() == today and fire_at >= now:
+                rems_today.append((fire_at, r))
+        except (ValueError, KeyError, TypeError):
+            continue
+    rems_today.sort(key=lambda x: x[0])
+
+    if rems_today:
+        parts.append("")
+        parts.append(f"⏰ **Erinnerungen heute** ({len(rems_today)})")
+        for fire_at, r in rems_today:
+            rec = " 🔁" if r.get("recurrence") else ""
+            parts.append(f"  • {fire_at.strftime('%H:%M')} — {r['message'][:80]}{rec}")
+
+    # Meetings heute
+    meetings_today = []
+    if MEETINGS_DIR.exists():
+        for f in MEETINGS_DIR.glob(f"{today_str}_*.md"):
+            try:
+                post = frontmatter.load(f)
+                if post.metadata.get("status", "") != "cancelled":
+                    meetings_today.append({
+                        "id": post.metadata.get("id", f.stem),
+                        "title": post.metadata.get("title", f.stem),
+                        "status": post.metadata.get("status", ""),
+                        "attendees": post.metadata.get("attendees", []),
+                    })
+            except Exception:
+                continue
+
+    if meetings_today:
+        parts.append("")
+        parts.append(f"🤝 **Meetings heute** ({len(meetings_today)})")
+        for m in meetings_today:
+            att = ""
+            if m["attendees"]:
+                att_list = ", ".join(str(a) for a in m["attendees"][:3])
+                if len(m["attendees"]) > 3:
+                    att_list += f" +{len(m['attendees'])-3}"
+                att = f" mit {att_list}"
+            parts.append(f"  • [[{m['id']}]] {m['title']}{att}")
+
+    # Tasks: fällig heute + überfällig (kombiniert weil beides "heute zu tun")
+    all_open = _read_open_tasks()
+    overdue_tasks, today_tasks = [], []
+    for t in all_open:
+        d = t.get("due")
+        if not d:
+            continue
+        try:
+            dd = datetime.strptime(d, "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            continue
+        if dd < today:
+            overdue_tasks.append(t)
+        elif dd == today:
+            today_tasks.append(t)
+
+    def _sort_tasks(lst):
+        return sorted(lst, key=lambda t: (_PRIO_ORDER.get(t.get("priority"), 9), t.get("due") or ""))
+
+    if overdue_tasks:
+        parts.append("")
+        parts.append(f"⚠️ **Überfällige Tasks** ({len(overdue_tasks)})")
+        for t in _sort_tasks(overdue_tasks)[:10]:
+            parts.append(_format_task_line(t, today))
+        if len(overdue_tasks) > 10:
+            parts.append(f"  _… {len(overdue_tasks)-10} weitere_")
+
+    if today_tasks:
+        parts.append("")
+        parts.append(f"📅 **Heute fällige Tasks** ({len(today_tasks)})")
+        for t in _sort_tasks(today_tasks)[:15]:
+            parts.append(_format_task_line(t, today))
+        if len(today_tasks) > 15:
+            parts.append(f"  _… {len(today_tasks)-15} weitere_")
+
+    # High-Prio ohne Datum (sollte User trotzdem heute sehen)
+    high_nodate = [t for t in all_open
+                   if not t.get("due")
+                   and t.get("priority") in ("urgent", "high")]
+    if high_nodate:
+        parts.append("")
+        parts.append(f"🔥 **Hohe Prio, kein Datum** ({len(high_nodate)})")
+        for t in _sort_tasks(high_nodate)[:10]:
+            parts.append(_format_task_line(t, today))
+
+    if len(parts) == 1:
+        parts.append("\n_Heute steht aktuell nichts im Vault. Schreib mir was du heute vorhast — ich trag's ein._")
+
+    return "\n".join(parts)
+
+
 def create_meeting(title: str, attendees: Optional[list] = None,
                    meeting_date: Optional[str] = None,
                    tags: Optional[list] = None) -> str:
@@ -2488,6 +2783,43 @@ TOOLS = [
         },
     }},
     {"type": "function", "function": {
+        "name": "get_today_agenda",
+        "description": (
+            "Aggregiert die heutige Lage: heute fällige Tasks, überfällige Tasks, "
+            "heute feuernde Reminders, heute geplante Meetings, plus High-Prio-Tasks ohne Datum. "
+            "PRIMÄRER Tool-Call wenn User fragt 'was steht heute an', 'was muss ich noch erledigen', "
+            "'was ist heute zu tun', 'mein Plan für heute', 'agenda', 'tagesplan'. "
+            "Liefert fertig formatiertes Telegram-HTML — direkt zurück an User."
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    }},
+    {"type": "function", "function": {
+        "name": "list_open_tasks",
+        "description": (
+            "Listet offene Tasks gefiltert. Ohne Filter: gruppiert in Buckets "
+            "Überfällig/Heute/Diese Woche/Später/Ohne Datum. "
+            "Mit when-Filter: flache Liste. "
+            "Beispiele: list_open_tasks() — alle, gruppiert. "
+            "list_open_tasks(when='overdue') — nur überfällige. "
+            "list_open_tasks(project='matura', priority='urgent') — nur urgent in Matura."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "when": {
+                    "type": "string",
+                    "enum": ["today", "tomorrow", "week", "overdue", "nodate"],
+                    "description": "Zeit-Filter. Weglassen → alle gruppiert.",
+                },
+                "priority": {"type": "string", "enum": ["low", "medium", "high", "urgent"]},
+                "project": {"type": "string", "description": "Projekt-Slug"},
+                "area": {"type": "string", "description": "Area-Slug"},
+                "context": {"type": "string", "enum": ["home", "work", "errand", "phone", "computer"]},
+            },
+            "required": [],
+        },
+    }},
+    {"type": "function", "function": {
         "name": "create_meeting",
         "description": "Legt ein Meeting-Protokoll in 10_Life/meetings/ an. tags: thematische Schlagworte extrahieren (z.B. ['blitztext', 'kunde', 'kickoff']).",
         "parameters": {
@@ -2926,6 +3258,8 @@ TOOL_HANDLERS = {
     "append_to_daily": append_to_daily,
     "create_task": create_task,
     "mark_task_done": mark_task_done,
+    "get_today_agenda": get_today_agenda,
+    "list_open_tasks": list_open_tasks,
     "create_meeting": create_meeting,
     "create_note": create_note,
     "search_vault": search_vault,
@@ -2984,6 +3318,12 @@ Tool nur aufrufen wenn Julius EXPLIZIT Speicher-Intent zeigt:
 | "speicher / merk dir / notiere / schreib auf / ins tagebuch" | `append_to_daily` oder `create_note` |
 | "task: …" / "todo: …" / "morgen X machen" / Imperativ+Frist | `create_task` |
 | "jeden Tag X" / "täglich X" / "jede Woche X" / "jeden Montag X" / "monatlich X" | `create_task` mit `recurrence` (daily/weekdays/weekly/monthly) — Task taucht nach jedem Done automatisch wieder auf |
+| "was steht heute an" / "was muss ich noch tun" / "agenda" / "tagesplan" / "was steht noch an" | `get_today_agenda` (Tasks+Reminders+Meetings heute, fertig formatiert) |
+| "alle offenen tasks" / "todo-liste" / "was hab ich noch offen" | `list_open_tasks()` ohne Filter (gruppiert nach Fälligkeit) |
+| "was ist überfällig" / "was hängt schon" | `list_open_tasks(when='overdue')` |
+| "was steht morgen / diese woche an" | `list_open_tasks(when='tomorrow' / 'week')` |
+| "tasks ohne datum" / "loose ends" | `list_open_tasks(when='nodate')` |
+| "tasks für matura / kunde X" | `list_open_tasks(project='<slug>')` |
 | "meeting: …" / "war im Termin mit …" | `create_meeting` |
 | "X erledigt / fertig / done" | `mark_task_done` (ggf. erst `search_vault`) |
 | URL allein, sonst nichts | erst fragen, dann `clip_url` |
@@ -3021,9 +3361,27 @@ Bei N Files → Operation in maximal 3-4 Tool-Calls erledigen, nicht N+3.
 
 Wenn Captions/Inhalte verraten dass mehrere Files thematisch zusammengehören (gleiches Projekt, gleiche Tags), gleiches Vorgehen: bulk verarbeiten.
 
+**TAGESPLAN-EXTRAKTION** (User antwortet auf Morgens-Briefing oder schickt Tagesplan):
+
+Wenn User in einer Message MEHRERE Termine/Aufgaben für heute auflistet — z.B.:
+- "11 Uhr Bus, 14:00 Doc Müller, 16 mit Sarah telefonieren, abends einkaufen"
+- "heute: emailen an HR, Kalkulation für Schiemer fertig, Rückenübungen"
+
+Dann **strukturiert extrahieren**, nicht zurückfragen:
+
+| Pattern in der Message | Tool |
+|---|---|
+| Klare Uhrzeit + Aktivität ("11 Uhr X", "14:00 Y", "16:30 Z") | `create_reminder(message=X, when_iso=heute+Uhrzeit)` — KEIN Reminder erfinden ohne Uhrzeit! |
+| Aktivität ohne Uhrzeit, mit Verb ("X machen", "Y fertig", "Z anrufen") | `create_task(title=...)` mit `due=heute` |
+| Vage Tageszeit ("morgens X", "abends Y") | Reminder mit Default-Stunde (morgens=8, mittags=12, abends=18) ODER Task mit due=heute — bei Tasks im Zweifel Task |
+| "und einkaufen" / "noch X" → Anhang-Item | Eigener `create_task` |
+
+**Pro Item ein eigener Tool-Call** (parallel im selben Loop-Step ist OK, das LLM kann mehrere tool_calls in einer Message returnen). Am Ende EINE Bestätigung an User: "Eingetragen: 2 Reminders (11:00 Bus, 14:00 Doc Müller), 2 Tasks (Sarah anrufen, einkaufen)."
+
 # LESEN / FRAGEN BEANTWORTEN
 - "Was weiß ich über X?" → `search_vault`, antworten mit echten `[[id]]` aus Treffern
-- "Was steht heute an?" → `read_file` Daily + offene Tasks aus `list_files`/Frontmatter
+- "Was steht heute an?" / "agenda" / "tagesplan" → `get_today_agenda` (NICHT manuell aus list_files raussuchen — das Tool macht alles auf einmal)
+- "Was hab ich noch offen?" / "alle todos" → `list_open_tasks()` (gruppiert)
 - "Was ist im Vault?" → `list_files()` direkt aufrufen, NICHT 3× zurückfragen "welcher Bereich"
 - File-Inhalt zeigen → `read_file` (Default strip_frontmatter=true), Original-Markdown direkt
   - KEINE Meta-Tabelle "Sektion | Inhalt | (leer)"
@@ -3890,6 +4248,45 @@ def compute_briefing() -> str:
         if len(open_tasks) > 8:
             parts.append(f"<i>… und {len(open_tasks)-8} weitere</i>")
 
+    # ─── Reminders heute (noch nicht gefeuert) ───
+    today_date = datetime.now(TIMEZONE).date()
+    now_dt = datetime.now(TIMEZONE)
+    rems_today = []
+    for r in _load_reminders():
+        try:
+            fire_at = datetime.fromisoformat(r["fire_at"])
+            if fire_at.tzinfo is None:
+                fire_at = fire_at.replace(tzinfo=TIMEZONE)
+            if fire_at.date() == today_date and fire_at >= now_dt:
+                rems_today.append((fire_at, r))
+        except (ValueError, KeyError, TypeError):
+            continue
+    if rems_today:
+        rems_today.sort(key=lambda x: x[0])
+        parts.append("\n⏰ <b>Erinnerungen heute</b>")
+        for fire_at, r in rems_today[:6]:
+            rec = " 🔁" if r.get("recurrence") else ""
+            parts.append(f"• {fire_at.strftime('%H:%M')} — {_esc_html(r['message'][:80])}{rec}")
+
+    # ─── Meetings heute ───
+    meetings_today = []
+    if MEETINGS_DIR.exists():
+        for f in MEETINGS_DIR.glob(f"{today}_*.md"):
+            try:
+                mpost = frontmatter.load(f)
+                if mpost.metadata.get("status") == "cancelled":
+                    continue
+                meetings_today.append({
+                    "id": str(mpost.metadata.get("id", f.stem)),
+                    "title": str(mpost.metadata.get("title", f.stem)),
+                })
+            except Exception:
+                continue
+    if meetings_today:
+        parts.append("\n🤝 <b>Meetings heute</b>")
+        for m in meetings_today[:5]:
+            parts.append(f"• {_esc_html(m['title'])}")
+
     # ─── Gestern: Abends-Reflexion ───
     yest_path = DAILY_DIR / f"{yesterday}.md"
     if yest_path.exists():
@@ -3909,8 +4306,16 @@ def compute_briefing() -> str:
             pass
 
     # ─── Wenn nichts da: gentle morning ───
-    if not overdue and not open_tasks and not today_path.exists():
-        parts.append("\n<i>Heute steht noch nichts an. Schreib mir was du heute vorhast oder genieß den freien Kopf.</i>")
+    if not overdue and not open_tasks and not rems_today and not meetings_today and not today_path.exists():
+        parts.append("\n<i>Heute steht noch nichts an.</i>")
+
+    # ─── Tagesplan-Frage am Ende — macht das Briefing zur Conversation ───
+    parts.append(
+        "\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "💬 <b>Was hast du sonst noch vor heute?</b>\n"
+        "<i>Schreib einfach in Klartext: \"11 Uhr Bus, 14 Doc Müller, abends einkaufen\". "
+        "Ich trage Termine als Reminders, To-Dos als Tasks ein.</i>"
+    )
 
     return "\n".join(parts)
 
@@ -4077,14 +4482,33 @@ async def handle_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 @require_auth
 async def handle_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Show today's daily note (without frontmatter)."""
+    """/today — heutige Agenda (Tasks + Reminders + Meetings) plus Daily-Note."""
+    agenda = await asyncio.to_thread(get_today_agenda)
+    parts = [agenda]
+    # Plus Daily-Note Body falls vorhanden — als Sekundär-Info
     path = DAILY_DIR / f"{today_iso()}.md"
-    if not path.exists():
-        await update.message.reply_text("Heutige Daily noch leer.")
+    if path.exists():
+        content = path.read_text(encoding="utf-8")
+        body = re.sub(r"^---\n.*?\n---\n", "", content, count=1, flags=re.DOTALL).strip()
+        if body and len(body) > 10:  # nicht nur Template-Reste
+            parts.append("\n━━━━━━━━━━━━━━━━━━━━━━━━")
+            parts.append("📓 **Heutige Daily-Notes:**\n")
+            parts.append(body)
+    await safe_reply(update, "\n".join(parts))
+
+
+@require_auth
+async def handle_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/tasks [filter] — offene Tasks. Optional Filter: today/tomorrow/week/overdue/nodate."""
+    args = ctx.args if ctx.args else []
+    when = args[0].strip().lower() if args else None
+    if when and when not in ("today", "tomorrow", "week", "overdue", "nodate"):
+        await update.message.reply_text(
+            "Unbekannter Filter. Erlaubt: today, tomorrow, week, overdue, nodate (oder leer = alle gruppiert)."
+        )
         return
-    content = path.read_text(encoding="utf-8")
-    body = re.sub(r"^---\n.*?\n---\n", "", content, count=1, flags=re.DOTALL)
-    await safe_reply(update, body.strip() or "(leer)")
+    text = await asyncio.to_thread(list_open_tasks, when)
+    await safe_reply(update, text)
 
 
 @require_auth
@@ -4147,6 +4571,7 @@ def main():
 
     app.add_handler(CommandHandler("start", handle_start))
     app.add_handler(CommandHandler("today", handle_today))
+    app.add_handler(CommandHandler("tasks", handle_tasks))
     app.add_handler(CommandHandler("briefing", handle_briefing))
     app.add_handler(CommandHandler("reminders", handle_reminders))
     app.add_handler(CommandHandler("reset", handle_reset))
