@@ -963,58 +963,118 @@ def _format_task_line(t: dict, today: date) -> str:
     return f"  {prio_sym} [[{t['id']}]] {t['title']}{proj}{due_str}{rec_sym}"
 
 
-def get_today_agenda() -> str:
-    """Aggregiert: heute fällige Tasks + heute feuernde Reminders + heutige Meetings.
+def _due_to_date(d) -> Optional[date]:
+    """Normalisiert Frontmatter-due (str/date/datetime) zu date oder None."""
+    if not d:
+        return None
+    if isinstance(d, date) and not isinstance(d, datetime):
+        return d
+    if isinstance(d, datetime):
+        return d.date()
+    if isinstance(d, str):
+        try:
+            return datetime.strptime(d, "%Y-%m-%d").date()
+        except ValueError:
+            return None
+    return None
 
-    Read-only Snapshot der heutigen Lage — primärer Tool-Call wenn User
-    fragt 'was steht heute an / was ist noch zu tun'.
+
+def _sort_tasks_by_prio_due(lst: list) -> list:
+    """Sort: Prio (urgent first), dann Due (älteste first, None last)."""
+    return sorted(lst, key=lambda t: (_PRIO_ORDER.get(t.get("priority"), 9),
+                                      _due_to_date(t.get("due")) or date.max))
+
+
+def collect_today_data() -> dict:
+    """Single Source of Truth: aggregiert ALLE "heute"-Daten in einem Walk.
+
+    Genutzt von compute_briefing (HTML-Render) UND get_today_agenda (Markdown).
+    Vorher waren beide Renderer mit eigenem Aggregations-Code → Drift-Risiko.
+
+    Returns dict mit Keys:
+      today: date · today_str: ISO-string · now: datetime
+      reminders: [(fire_at_dt, reminder_dict), ...]  — heute & noch nicht gefeuert, sortiert
+      meetings: [{id, title, status, attendees}, ...]  — heute, status != cancelled
+      overdue_tasks: [task_dict, ...]   — open/in-progress, due < today, prio-sortiert
+      today_tasks: [task_dict, ...]      — open/in-progress, due == today, prio-sortiert
+      high_nodate_tasks: [task_dict, ...]  — open/in-progress, due is None, prio in (urgent, high)
     """
     today = datetime.now(TIMEZONE).date()
     today_str = today.strftime("%Y-%m-%d")
     now = datetime.now(TIMEZONE)
 
-    parts = [f"📋 Agenda für heute ({today.strftime('%a %d.%m.%Y')})"]
-
-    # Reminders heute (noch nicht gefeuert)
-    rems_today = []
+    # Reminders heute (noch nicht gefeuert), sortiert
+    reminders = []
     for r in _load_reminders():
         try:
             fire_at = datetime.fromisoformat(r["fire_at"])
             if fire_at.tzinfo is None:
                 fire_at = fire_at.replace(tzinfo=TIMEZONE)
             if fire_at.date() == today and fire_at >= now:
-                rems_today.append((fire_at, r))
+                reminders.append((fire_at, r))
         except (ValueError, KeyError, TypeError):
             continue
-    rems_today.sort(key=lambda x: x[0])
+    reminders.sort(key=lambda x: x[0])
 
-    if rems_today:
-        parts.append("")
-        parts.append(f"⏰ **Erinnerungen heute** ({len(rems_today)})")
-        for fire_at, r in rems_today:
-            rec = " 🔁" if r.get("recurrence") else ""
-            parts.append(f"  • {fire_at.strftime('%H:%M')} — {r['message'][:80]}{rec}")
-
-    # Meetings heute
-    meetings_today = []
+    # Meetings heute (nicht-cancelled)
+    meetings = []
     if MEETINGS_DIR.exists():
         for f in MEETINGS_DIR.glob(f"{today_str}_*.md"):
             try:
                 post = frontmatter.load(f)
-                if post.metadata.get("status", "") != "cancelled":
-                    meetings_today.append({
-                        "id": post.metadata.get("id", f.stem),
-                        "title": post.metadata.get("title", f.stem),
-                        "status": post.metadata.get("status", ""),
-                        "attendees": post.metadata.get("attendees", []),
-                    })
+                if post.metadata.get("status", "") == "cancelled":
+                    continue
+                meetings.append({
+                    "id": post.metadata.get("id", f.stem),
+                    "title": post.metadata.get("title", f.stem),
+                    "status": post.metadata.get("status", ""),
+                    "attendees": post.metadata.get("attendees", []),
+                })
             except Exception:
                 continue
 
-    if meetings_today:
-        parts.append("")
-        parts.append(f"🤝 **Meetings heute** ({len(meetings_today)})")
-        for m in meetings_today:
+    # Tasks: drei Buckets
+    all_open = _read_open_tasks()
+    overdue_tasks, today_tasks = [], []
+    for t in all_open:
+        dd = _due_to_date(t.get("due"))
+        if dd is None:
+            continue
+        if dd < today:
+            overdue_tasks.append(t)
+        elif dd == today:
+            today_tasks.append(t)
+    high_nodate_tasks = [t for t in all_open
+                         if t.get("due") is None
+                         and t.get("priority") in ("urgent", "high")]
+
+    return {
+        "today": today,
+        "today_str": today_str,
+        "now": now,
+        "reminders": reminders,
+        "meetings": meetings,
+        "overdue_tasks": _sort_tasks_by_prio_due(overdue_tasks),
+        "today_tasks": _sort_tasks_by_prio_due(today_tasks),
+        "high_nodate_tasks": _sort_tasks_by_prio_due(high_nodate_tasks),
+    }
+
+
+def get_today_agenda() -> str:
+    """Markdown-Render des collect_today_data-Snapshots für Telegram-Tool-Call."""
+    data = collect_today_data()
+    today = data["today"]
+    parts = [f"📋 Agenda für heute ({today.strftime('%a %d.%m.%Y')})"]
+
+    if data["reminders"]:
+        parts.append(f"\n⏰ **Erinnerungen heute** ({len(data['reminders'])})")
+        for fire_at, r in data["reminders"]:
+            rec = " 🔁" if r.get("recurrence") else ""
+            parts.append(f"  • {fire_at.strftime('%H:%M')} — {r['message'][:80]}{rec}")
+
+    if data["meetings"]:
+        parts.append(f"\n🤝 **Meetings heute** ({len(data['meetings'])})")
+        for m in data["meetings"]:
             att = ""
             if m["attendees"]:
                 att_list = ", ".join(str(a) for a in m["attendees"][:3])
@@ -1023,49 +1083,23 @@ def get_today_agenda() -> str:
                 att = f" mit {att_list}"
             parts.append(f"  • [[{m['id']}]] {m['title']}{att}")
 
-    # Tasks: fällig heute + überfällig (kombiniert weil beides "heute zu tun")
-    all_open = _read_open_tasks()
-    overdue_tasks, today_tasks = [], []
-    for t in all_open:
-        d = t.get("due")
-        if not d:
-            continue
-        try:
-            dd = datetime.strptime(d, "%Y-%m-%d").date()
-        except (ValueError, TypeError):
-            continue
-        if dd < today:
-            overdue_tasks.append(t)
-        elif dd == today:
-            today_tasks.append(t)
-
-    def _sort_tasks(lst):
-        return sorted(lst, key=lambda t: (_PRIO_ORDER.get(t.get("priority"), 9), t.get("due") or ""))
-
-    if overdue_tasks:
-        parts.append("")
-        parts.append(f"⚠️ **Überfällige Tasks** ({len(overdue_tasks)})")
-        for t in _sort_tasks(overdue_tasks)[:10]:
+    if data["overdue_tasks"]:
+        parts.append(f"\n⚠️ **Überfällige Tasks** ({len(data['overdue_tasks'])})")
+        for t in data["overdue_tasks"][:10]:
             parts.append(_format_task_line(t, today))
-        if len(overdue_tasks) > 10:
-            parts.append(f"  _… {len(overdue_tasks)-10} weitere_")
+        if len(data["overdue_tasks"]) > 10:
+            parts.append(f"  _… {len(data['overdue_tasks'])-10} weitere_")
 
-    if today_tasks:
-        parts.append("")
-        parts.append(f"📅 **Heute fällige Tasks** ({len(today_tasks)})")
-        for t in _sort_tasks(today_tasks)[:15]:
+    if data["today_tasks"]:
+        parts.append(f"\n📅 **Heute fällige Tasks** ({len(data['today_tasks'])})")
+        for t in data["today_tasks"][:15]:
             parts.append(_format_task_line(t, today))
-        if len(today_tasks) > 15:
-            parts.append(f"  _… {len(today_tasks)-15} weitere_")
+        if len(data["today_tasks"]) > 15:
+            parts.append(f"  _… {len(data['today_tasks'])-15} weitere_")
 
-    # High-Prio ohne Datum (sollte User trotzdem heute sehen)
-    high_nodate = [t for t in all_open
-                   if not t.get("due")
-                   and t.get("priority") in ("urgent", "high")]
-    if high_nodate:
-        parts.append("")
-        parts.append(f"🔥 **Hohe Prio, kein Datum** ({len(high_nodate)})")
-        for t in _sort_tasks(high_nodate)[:10]:
+    if data["high_nodate_tasks"]:
+        parts.append(f"\n🔥 **Hohe Prio, kein Datum** ({len(data['high_nodate_tasks'])})")
+        for t in data["high_nodate_tasks"][:10]:
             parts.append(_format_task_line(t, today))
 
     if len(parts) == 1:
@@ -4147,6 +4181,9 @@ def compute_briefing() -> str:
     today = today_iso()
     yesterday = (date.today() - timedelta(days=1)).isoformat()
 
+    # Single Source of Truth — gleiche Daten wie get_today_agenda
+    data = collect_today_data()
+
     parts = [f"☀️ <b>Guten Morgen — {today}</b>"]
 
     # ─── Today's Daily: was steht für heute geplant? ───
@@ -4162,78 +4199,46 @@ def compute_briefing() -> str:
         except Exception as e:
             log.warning(f"briefing: today daily parse failed: {e}")
 
-    # ─── Tasks-Scan: überfällig + offen ───
-    open_tasks = []
-    overdue = []
-    for tp, tpost in iter_vault_md(TASKS_DIR, recursive=False, skip_noise=False):
-        status = str(tpost.get("status", "")).lower()
-        if status in ("done", "cancelled"):
-            continue
-        title = str(tpost.get("title", tp.stem))
-        tid = str(tpost.get("id", f"t-{tp.stem}"))
-        prio = str(tpost.get("priority", "medium"))
-        due = str(tpost.get("due", "")).strip()
-        entry = (tid, title, prio, due)
-        if due and due < today:
-            overdue.append(entry)
-        else:
-            open_tasks.append(entry)
-
-    if overdue:
-        overdue.sort(key=lambda x: x[3])
-        parts.append("\n⚠️ <b>Überfällig</b>")
-        for tid, title, prio, due in overdue[:8]:
-            parts.append(f"• {_esc_html(title)} <i>(seit {due})</i>")
-
-    if open_tasks:
-        # Zentrale Konstanten — keine lokale Re-Definition mehr (war Inkonsistenz-Quelle)
-        open_tasks.sort(key=lambda x: (_PRIO_ORDER.get(x[2], 9), x[3] or "9999"))
-        parts.append("\n✏️ <b>Offene Tasks</b>")
-        for tid, title, prio, due in open_tasks[:8]:
-            due_str = f" <i>(bis {due})</i>" if due else ""
-            prio_emoji = PRIO_SYMBOLS.get(prio, PRIO_SYMBOLS["medium"])
-            parts.append(f"{prio_emoji} {_esc_html(title)}{due_str}")
-        if len(open_tasks) > 8:
-            parts.append(f"<i>… und {len(open_tasks)-8} weitere</i>")
-
-    # ─── Reminders heute (noch nicht gefeuert) ───
-    today_date = datetime.now(TIMEZONE).date()
-    now_dt = datetime.now(TIMEZONE)
-    rems_today = []
-    for r in _load_reminders():
-        try:
-            fire_at = datetime.fromisoformat(r["fire_at"])
-            if fire_at.tzinfo is None:
-                fire_at = fire_at.replace(tzinfo=TIMEZONE)
-            if fire_at.date() == today_date and fire_at >= now_dt:
-                rems_today.append((fire_at, r))
-        except (ValueError, KeyError, TypeError):
-            continue
-    if rems_today:
-        rems_today.sort(key=lambda x: x[0])
+    # ─── Reminders heute ───
+    if data["reminders"]:
         parts.append("\n⏰ <b>Erinnerungen heute</b>")
-        for fire_at, r in rems_today[:6]:
+        for fire_at, r in data["reminders"][:6]:
             rec = " 🔁" if r.get("recurrence") else ""
             parts.append(f"• {fire_at.strftime('%H:%M')} — {_esc_html(r['message'][:80])}{rec}")
 
     # ─── Meetings heute ───
-    meetings_today = []
-    if MEETINGS_DIR.exists():
-        for f in MEETINGS_DIR.glob(f"{today}_*.md"):
-            try:
-                mpost = frontmatter.load(f)
-                if mpost.metadata.get("status") == "cancelled":
-                    continue
-                meetings_today.append({
-                    "id": str(mpost.metadata.get("id", f.stem)),
-                    "title": str(mpost.metadata.get("title", f.stem)),
-                })
-            except Exception:
-                continue
-    if meetings_today:
+    if data["meetings"]:
         parts.append("\n🤝 <b>Meetings heute</b>")
-        for m in meetings_today[:5]:
-            parts.append(f"• {_esc_html(m['title'])}")
+        for m in data["meetings"][:5]:
+            parts.append(f"• {_esc_html(str(m['title']))}")
+
+    # ─── Überfällig + Heute fällig (kombiniert für Briefing-Übersicht) ───
+    if data["overdue_tasks"]:
+        parts.append("\n⚠️ <b>Überfällig</b>")
+        for t in data["overdue_tasks"][:8]:
+            due_disp = t.get("due") or "—"
+            parts.append(f"• {_esc_html(str(t['title']))} <i>(seit {due_disp})</i>")
+
+    # Andere offene Tasks (heute + nodate-high-prio + Rest, dedupliziert)
+    seen_ids = {t["id"] for t in data["overdue_tasks"]}
+    other_open = (
+        [t for t in data["today_tasks"] if t["id"] not in seen_ids]
+        + [t for t in data["high_nodate_tasks"] if t["id"] not in seen_ids]
+    )
+    # Resterest aus allen offenen die noch nicht in einem Bucket sind
+    seen_ids.update(t["id"] for t in other_open)
+    extra = [t for t in _read_open_tasks() if t["id"] not in seen_ids]
+    other_open.extend(_sort_tasks_by_prio_due(extra))
+
+    if other_open:
+        parts.append("\n✏️ <b>Offene Tasks</b>")
+        for t in other_open[:8]:
+            due = t.get("due") or ""
+            due_str = f" <i>(bis {due})</i>" if due else ""
+            prio_emoji = PRIO_SYMBOLS.get(t.get("priority"), PRIO_SYMBOLS["medium"])
+            parts.append(f"{prio_emoji} {_esc_html(str(t['title']))}{due_str}")
+        if len(other_open) > 8:
+            parts.append(f"<i>… und {len(other_open)-8} weitere</i>")
 
     # ─── Gestern: Abends-Reflexion ───
     yest_path = DAILY_DIR / f"{yesterday}.md"
@@ -4254,7 +4259,9 @@ def compute_briefing() -> str:
             pass
 
     # ─── Wenn nichts da: gentle morning ───
-    if not overdue and not open_tasks and not rems_today and not meetings_today and not today_path.exists():
+    has_anything = (data["overdue_tasks"] or other_open or data["reminders"]
+                    or data["meetings"] or today_path.exists())
+    if not has_anything:
         parts.append("\n<i>Heute steht noch nichts an.</i>")
 
     # ─── Tagesplan-Frage am Ende — macht das Briefing zur Conversation ───
