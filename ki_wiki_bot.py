@@ -964,15 +964,10 @@ def list_open_tasks(when: Optional[str] = None,
 
     today = datetime.now(TIMEZONE).date()
 
-    # Filter
+    # Nutze zentrale _due_to_date — strptime-Variante hatte TypeError-Falle
+    # bei YAML-date-Objekten (Tasks mit unquoted `due:` aus Obsidian-Reload).
     def _due_date(t):
-        d = t.get("due")
-        if not d:
-            return None
-        try:
-            return datetime.strptime(d, "%Y-%m-%d").date()
-        except (ValueError, TypeError):
-            return None
+        return _due_to_date(t.get("due"))
 
     def _matches(t):
         # when
@@ -2555,7 +2550,7 @@ def forget_fact(pattern: str) -> str:
             kept.append(line)
     if not removed:
         return f"Kein Fakt gefunden mit '{pattern}'."
-    FACTS_FILE.write_text("\n".join(kept) + "\n", encoding="utf-8")
+    atomic_write(FACTS_FILE, "\n".join(kept) + "\n")
     return f"Entfernt ({len(removed)}):\n" + "\n".join(removed[:5])
 
 
@@ -2633,7 +2628,7 @@ def forget_preference(pattern: str) -> str:
             kept.append(line)
     if not removed:
         return f"Keine Präferenz mit '{pattern}'."
-    PREFERENCES_FILE.write_text("\n".join(kept) + "\n", encoding="utf-8")
+    atomic_write(PREFERENCES_FILE, "\n".join(kept) + "\n")
     return f"Entfernt ({len(removed)}):\n" + "\n".join(removed[:5])
 
 
@@ -6045,12 +6040,12 @@ def _is_recurrence_due(pattern: str, last_completed: str, today: date) -> bool:
     """Bestimmt ob eine recurring Task heute reaktiviert werden soll.
 
     pattern: 'daily' | 'weekdays' | 'weekly' | 'monthly'
-    last_completed: ISO-Datum des letzten Done-Markings
+    last_completed: ISO-Datum (str) ODER date-Objekt (PyYAML kann unquoted
+                    YYYY-MM-DD direkt zu date parsen). _due_to_date handlet beide.
     today: aktuelles Datum
     """
-    try:
-        last = datetime.strptime(last_completed, "%Y-%m-%d").date()
-    except (ValueError, TypeError):
+    last = _due_to_date(last_completed)
+    if last is None:
         # Kein gültiges last_completed → nicht reaktivieren
         # (sicherer als raten — User soll erst einmal manuell done markieren)
         return False
