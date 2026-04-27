@@ -3398,7 +3398,8 @@ TOOL_HANDLERS = {
     "update_project_context": update_project_context,
     "log_correction": log_correction,
     "apply_memory_suggestion": apply_memory_suggestion,
-    "apply_health_action": apply_health_action,
+    # apply_health_action wird WEITER UNTEN nach Funktionsdefinition registriert
+    # (sie liegt im Health-Modul ~Zeile 5050 und wäre hier ein Forward-Ref-Bug).
     "create_project": create_project,
     "create_reminder": create_reminder,
     "list_reminders": list_reminders,
@@ -5157,6 +5158,14 @@ def apply_health_action(action: str) -> str:
         tail = ""
 
     return "Health-Aktionen verarbeitet:\n" + "\n".join(results) + tail
+
+
+# ─── Forward-Reference-Fix: Tool-Handler nachtragen ────────────────────────
+# apply_health_action wird im TOOL_HANDLERS-Dict (Zeile ~3370) referenziert,
+# aber die Funktion selbst ist erst hier definiert (~5030). Statt das ganze
+# Health-Modul ans Anfang zu verlagern: hier nachträglich registrieren.
+# Tool-Konsistenz-Check in main() läuft zur Boot-Zeit NACH diesem Punkt → ✓.
+TOOL_HANDLERS["apply_health_action"] = apply_health_action
 
 
 def compute_briefing() -> str:
