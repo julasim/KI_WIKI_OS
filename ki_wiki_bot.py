@@ -4237,10 +4237,6 @@ HEALTH_RECURRING_STUCK_DAYS = 14      # Recurring nicht aktiviert >14d → Propo
 HEALTH_TAG_TYPO_LEVENSHTEIN = 1       # Schwelle für Tippfehler-Cluster
 HEALTH_TAG_MAJORITY_RATIO = 5         # 5:1-Verhältnis für Stufe-C-Konsolidierung
 
-# Auto-Fix darf NUR in diesen Pfaden Files mutieren (außer Lint-Fixes die
-# überall passieren können — die sind Frontmatter-Hygiene und immer sicher)
-HEALTH_AUTO_LINK_DIRS = (LIFE,)        # Auto-Linking nur in 10_Life/
-
 # Auto-Fix-Codes für Reports + Approval-Identifizierung
 FIX_TAGS_EMPTY = "tags-empty"
 FIX_UPDATED_DATE = "updated-date"
@@ -5033,7 +5029,6 @@ def apply_health_action(action: str) -> str:
       "1,2"       — wie oben
       "alle"/"ja" — alle akzeptieren
       "0"/"nein"  — alles skippen + pending leeren
-      "skip 2"    — proposal 2 explizit skippen, Rest bleibt pending
 
     Default-Action pro Proposal-Typ:
       stale_inbox    → Files nach 99_Archive/
@@ -5260,17 +5255,25 @@ def compute_briefing() -> str:
     pending_actions = _load_pending_health_actions()
     if health_today.exists() or pending_actions:
         parts.append("\n🔧 <b>Vault-Pflege</b>")
-        # Auto-Fix-Counter aus Report extrahieren (regex auf "Auto-Fixed (N)")
+        # Auto-Fix-Counter + Issue-Counter aus Report extrahieren
+        # (regex schärft auf bekannte Issue-Headlines — sonst zählen wir
+        # Auto-Fix-Subsections und Approval-Header doppelt)
         if health_today.exists():
             try:
                 content = health_today.read_text(encoding="utf-8")
                 m = re.search(r"##\s+✅\s+Auto-Fixed\s+\((\d+)\)", content)
                 if m and int(m.group(1)) > 0:
                     parts.append(f"• {m.group(1)} Auto-Fixes über Nacht durchgeführt")
-                # Issues-Counter
-                issue_count = sum(
-                    int(x) for x in re.findall(r"###\s+\S+[^()]*\((\d+)\)", content)
+                # Issues-Counter: nur die offiziellen Issue-Headlines aus Schicht 1
+                issue_headlines = (
+                    "Lint-Issues", "Broken Wikilinks", "Orphans",
+                    "Doppelte IDs", "Stale Uploads",
                 )
+                issue_count = 0
+                for hl in issue_headlines:
+                    m = re.search(rf"###\s+{re.escape(hl)}[^()]*\((\d+)\)", content)
+                    if m:
+                        issue_count += int(m.group(1))
                 if issue_count > 0:
                     parts.append(f"• {issue_count} read-only Issues — siehe <code>{health_today.relative_to(VAULT)}</code>")
             except Exception:
