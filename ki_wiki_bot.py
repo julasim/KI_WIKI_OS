@@ -330,18 +330,35 @@ def extract_pdf_text(pdf_path: Path, max_pages: int = 200) -> tuple:
 # ============================================================================
 
 def ensure_daily() -> Path:
-    """Create today's daily file if missing, return path."""
-    path = DAILY_DIR / f"{today_iso()}.md"
+    """Create today's daily file if missing, return path.
+
+    TOCTOU-safe: atomic create-or-skip via os.O_EXCL. Verhindert dass
+    parallele Aufrufe (z.B. recurring_task_reset_job + User-Message
+    gleichzeitig) die Daily mit Template-Inhalt überschreiben nachdem
+    der erste Caller schon edits gemacht hat.
+    """
+    today = today_iso()
+    path = DAILY_DIR / f"{today}.md"
     if path.exists():
         return path
-    today = today_iso()
     template = load_template("daily")
     content = template.replace("{{date:YYYY-MM-DD}}", today)
     post = frontmatter.loads(content)
     post["id"] = f"daily-{today}"
     post["title"] = today
-    atomic_write(path, frontmatter.dumps(post) + "\n")
-    log.info(f"Created daily: {path.name}")
+    body = frontmatter.dumps(post) + "\n"
+    DAILY_DIR.mkdir(parents=True, exist_ok=True)
+    # O_EXCL: atomic create-only. Wenn ein anderer Task schon angelegt
+    # hat → FileExistsError → wir nutzen den bestehenden File.
+    try:
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        try:
+            os.write(fd, body.encode("utf-8"))
+        finally:
+            os.close(fd)
+        log.info(f"Created daily: {path.name}")
+    except FileExistsError:
+        log.debug(f"daily {path.name} bereits angelegt (parallel race) — nutze existierendes")
     return path
 
 
@@ -1300,9 +1317,14 @@ def search_vault(query: str, limit: int = 5) -> str:
     if not script.exists():
         return "vault_search.py nicht gefunden."
     try:
+        # Minimales env: vault_search braucht keine Tokens.
+        # Sonst würden TG_TOKEN/LLM_API_KEY/GITHUB_BACKUP_TOKEN an subprocess geleakt.
+        minimal_env = {k: v for k, v in os.environ.items()
+                       if k in ("PATH", "PYTHONPATH", "PYTHONIOENCODING", "LANG", "LC_ALL", "HOME")}
         result = subprocess.run(
             ["python3", str(script), "--json", query],
             capture_output=True, text=True, timeout=30, cwd=str(VAULT),
+            env=minimal_env,
         )
         if result.returncode != 0:
             return f"Suche fehlgeschlagen: {result.stderr.strip()[:300]}"
@@ -2027,7 +2049,14 @@ def backup_vault() -> str:
     repo_url = f"https://x-access-token:{safe_token}@github.com/{repo}.git"
 
     def _run(cmd, cwd=None, env_extra=None):
-        env = os.environ.copy()
+        # Minimal-env: git/rsync brauchen nur PATH + lokale Vars. Vermeidet
+        # dass TG_TOKEN/LLM_API_KEY/etc an Subprozesse vererbt werden (die
+        # könnten in error-output landen oder von kompromittiertem git-binary
+        # exfiltriert werden).
+        env = {k: v for k, v in os.environ.items()
+               if k in ("PATH", "HOME", "USER", "LANG", "LC_ALL", "TERM",
+                        "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL",
+                        "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL")}
         if env_extra:
             env.update(env_extra)
         return subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=60)
@@ -2310,7 +2339,8 @@ CONVERSATION_HISTORY: dict[int, list] = {}
 CONVERSATION_TIMESTAMPS: dict[int, float] = {}
 HISTORY_MAX_MESSAGES = 60       # ca. 30 User+Assistant-Turns
 HISTORY_TIMEOUT = 60 * 60       # 1h Inaktivität → RAM-Cache leeren, beim nächsten Zugriff von Disk lazy-laden
-HISTORY_PERSIST_LIMIT = 1000    # max Lines im JSONL bevor compaction (auf 200 trim)
+HISTORY_PERSIST_LIMIT = 1000    # max Lines im JSONL bevor compaction
+HISTORY_COMPACT_KEEP = 200       # nach compact: behalte letzte N Lines
 
 # Lock gegen Race-Conditions zwischen User-Messages und nightly_suggestion_job
 # (asyncio-cooperative — kein echtes Threading, aber sauber)
@@ -2698,6 +2728,15 @@ Antworte AUSSCHLIESSLICH mit JSON-Array (kein Markdown, kein Erklärungs-Text):
             ],
             max_tokens=1500,
         )
+        try:
+            usage = getattr(resp, "usage", None)
+            if usage is not None:
+                _track_usage(LLM_MODEL,
+                             getattr(usage, "prompt_tokens", 0),
+                             getattr(usage, "completion_tokens", 0),
+                             kind="memory-extract")
+        except Exception:
+            pass
         content = resp.choices[0].message.content or "[]"
         # Strip markdown fences if any
         content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content.strip())
@@ -2883,23 +2922,49 @@ def _save_history_line(user_id: int, message: dict) -> None:
         log.warning(f"history persist failed: {e}")
 
 
+HISTORY_TAIL_READ_BYTES = 2 * 1024 * 1024   # 2MB Tail-Read-Cap (verhindert OOM bei riesigem JSONL)
+
+
+def _read_tail_lines(path: Path, max_bytes: int) -> list[str]:
+    """Liest die letzten max_bytes der Datei + returnt Lines (ohne erste evtl. partial).
+
+    Verhindert dass eine 500MB-history.jsonl die Memory-grenze sprengt.
+    Bei normaler Größe (<2MB) liest das ganze File. Bei großen Files: nur Tail.
+    """
+    file_size = path.stat().st_size
+    if file_size <= max_bytes:
+        return path.read_text(encoding="utf-8", errors="replace").splitlines()
+    with path.open("rb") as f:
+        f.seek(file_size - max_bytes)
+        chunk = f.read()
+    text = chunk.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    if lines:
+        lines = lines[1:]  # Erste Zeile ist evtl angeschnitten
+    return lines
+
+
 def _load_persistent_history(user_id: int) -> list:
-    """Letzte HISTORY_MAX_MESSAGES Messages für User aus JSONL laden."""
+    """Letzte HISTORY_MAX_MESSAGES Messages für User aus JSONL laden.
+
+    Memory-safe via _read_tail_lines: bei riesigen Files nur die letzten
+    2MB lesen (immer noch 1000+ Records typisch).
+    """
     if not HISTORY_FILE.exists():
         return []
     try:
+        lines = _read_tail_lines(HISTORY_FILE, HISTORY_TAIL_READ_BYTES)
         records = []
-        with HISTORY_FILE.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                    if rec.get("user_id") == user_id:
-                        records.append(rec)
-                except json.JSONDecodeError:
-                    continue
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+                if rec.get("user_id") == user_id:
+                    records.append(rec)
+            except json.JSONDecodeError:
+                continue
         return [r["msg"] for r in records[-HISTORY_MAX_MESSAGES:]]
     except Exception as e:
         log.warning(f"history load failed: {e}")
@@ -2907,14 +2972,22 @@ def _load_persistent_history(user_id: int) -> list:
 
 
 def _maybe_compact_history() -> None:
-    """JSONL trimmen wenn zu groß: nur letzte 200 Lines behalten."""
+    """JSONL trimmen wenn zu groß: nur letzte 200 Lines behalten.
+
+    Memory-safe: nutzt _read_tail_lines statt full read_text wenn File riesig.
+    """
     if not HISTORY_FILE.exists():
         return
     try:
-        lines = HISTORY_FILE.read_text(encoding="utf-8").splitlines()
+        # Schnell-Check: File-Größe → wenn klein, direkt lesen, sonst tail-only
+        file_size = HISTORY_FILE.stat().st_size
+        if file_size <= HISTORY_TAIL_READ_BYTES:
+            lines = HISTORY_FILE.read_text(encoding="utf-8").splitlines()
+        else:
+            lines = _read_tail_lines(HISTORY_FILE, HISTORY_TAIL_READ_BYTES)
         if len(lines) <= HISTORY_PERSIST_LIMIT:
             return
-        keep = lines[-200:]
+        keep = lines[-HISTORY_COMPACT_KEEP:]
         HISTORY_FILE.write_text("\n".join(keep) + "\n", encoding="utf-8")
         log.info(f"History compacted: {len(lines)} → {len(keep)}")
     except Exception as e:
@@ -3001,6 +3074,152 @@ async def reset_history(user_id: int) -> None:
     async with _HISTORY_LOCK:
         CONVERSATION_HISTORY.pop(user_id, None)
         CONVERSATION_TIMESTAMPS.pop(user_id, None)
+
+
+# ============================================================================
+# Token-Usage-Tracking (für /usage Reports + Cost-Awareness)
+# ============================================================================
+# Pro Tag eine Zeile in 06_Meta/usage/YYYY-MM-DD.json — append-only.
+# Records: {"ts": iso, "model": str, "in": int, "out": int, "kind": str}
+# kind: "chat" (LLM-Call), "vision" (Photo-Caption), "whisper" (lokal, $0)
+
+USAGE_DIR = VAULT / "06_Meta" / "usage"
+
+# Approximate Pricing (USD per 1M tokens) — nur für Schätzung, nicht exakt.
+# Für Ollama-Cloud / lokale Modelle: 0/0. Bot zeigt im /usage diese Caveat.
+# Werte sind Stand 2025/2026 grob — User updated bei Bedarf in der Datei.
+PRICING_USD_PER_M = {
+    # OpenRouter / Anthropic
+    "anthropic/claude-sonnet-4-5": (3.0, 15.0),
+    "anthropic/claude-opus-4": (15.0, 75.0),
+    "anthropic/claude-haiku-4": (0.8, 4.0),
+    # OpenAI
+    "openai/gpt-4o": (2.5, 10.0),
+    "openai/gpt-4o-mini": (0.15, 0.60),
+    # Google
+    "google/gemini-2.5-flash": (0.075, 0.30),
+    "google/gemini-2.5-pro": (1.25, 10.0),
+    # Ollama Cloud / lokale → kostenlos
+    "gpt-oss:120b-cloud": (0.0, 0.0),
+    "qwen3:235b-cloud": (0.0, 0.0),
+}
+
+
+def _track_usage(model: str, prompt_tokens: int, completion_tokens: int, kind: str = "chat") -> None:
+    """Speichert ein Token-Usage-Record in 06_Meta/usage/YYYY-MM-DD.jsonl.
+
+    Wird sync aufgerufen aus dem llm_loop nach jedem LLM-Call. Failures
+    werden geloggt aber nicht propagiert — Tracking darf den Bot nie crashen.
+    """
+    try:
+        USAGE_DIR.mkdir(parents=True, exist_ok=True)
+        today = today_iso()
+        path = USAGE_DIR / f"{today}.jsonl"
+        rec = {
+            "ts": datetime.now(TIMEZONE).isoformat(timespec="seconds"),
+            "model": model,
+            "in": int(prompt_tokens or 0),
+            "out": int(completion_tokens or 0),
+            "kind": kind,
+        }
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception as e:
+        log.debug(f"usage-track failed (silently): {e}")
+
+
+def _estimate_cost_usd(model: str, in_tokens: int, out_tokens: int) -> float:
+    """Schätzt Kosten in USD für Model+Tokens. 0 wenn Model unbekannt."""
+    pricing = PRICING_USD_PER_M.get(model)
+    if not pricing:
+        return 0.0
+    in_price, out_price = pricing
+    return (in_tokens * in_price + out_tokens * out_price) / 1_000_000
+
+
+def get_usage_summary(days: int = 7) -> str:
+    """Liest letzte N Tage Usage und produziert Report.
+
+    Tool-callable von User via /usage oder LLM-Tool.
+    """
+    if not USAGE_DIR.exists():
+        return "Noch keine Usage-Daten."
+    today = datetime.now(TIMEZONE).date()
+    by_day: dict = {}  # day_iso → {"in": x, "out": y, "calls": z, "cost": $, "by_model": {model: ...}}
+    for delta in range(days):
+        d = today - timedelta(days=delta)
+        d_iso = d.isoformat()
+        path = USAGE_DIR / f"{d_iso}.jsonl"
+        if not path.exists():
+            continue
+        day_data = {"in": 0, "out": 0, "calls": 0, "cost_usd": 0.0, "by_model": {}}
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                model = rec.get("model", "unknown")
+                ti = int(rec.get("in", 0) or 0)
+                to = int(rec.get("out", 0) or 0)
+                cost = _estimate_cost_usd(model, ti, to)
+                day_data["in"] += ti
+                day_data["out"] += to
+                day_data["calls"] += 1
+                day_data["cost_usd"] += cost
+                m = day_data["by_model"].setdefault(model, {"in": 0, "out": 0, "calls": 0, "cost": 0.0})
+                m["in"] += ti
+                m["out"] += to
+                m["calls"] += 1
+                m["cost"] += cost
+            by_day[d_iso] = day_data
+        except Exception as e:
+            log.warning(f"usage-summary day {d_iso} failed: {e}")
+
+    if not by_day:
+        return f"Keine Usage-Daten in den letzten {days} Tagen."
+
+    # Aggregiert
+    total_in = sum(d["in"] for d in by_day.values())
+    total_out = sum(d["out"] for d in by_day.values())
+    total_calls = sum(d["calls"] for d in by_day.values())
+    total_cost = sum(d["cost_usd"] for d in by_day.values())
+
+    parts = [f"📊 **Token-Usage** (letzte {days} Tage)"]
+    parts.append(f"")
+    parts.append(f"**Total:** {total_calls} Calls · {total_in:,} in · {total_out:,} out")
+    if total_cost > 0:
+        parts.append(f"**Geschätzte Kosten:** ${total_cost:.3f} USD")
+    else:
+        parts.append("_Aktuelle Modelle haben keinen Preis hinterlegt (z.B. Ollama-Cloud = gratis)._")
+
+    parts.append("")
+    parts.append("**Pro Tag:**")
+    for d_iso in sorted(by_day.keys(), reverse=True):
+        d = by_day[d_iso]
+        cost_str = f" · ${d['cost_usd']:.3f}" if d["cost_usd"] > 0 else ""
+        parts.append(f"  • {d_iso}: {d['calls']} calls · {d['in']:,} in · {d['out']:,} out{cost_str}")
+
+    # Top-Modelle
+    model_totals: dict = {}
+    for d in by_day.values():
+        for m, mdata in d["by_model"].items():
+            mt = model_totals.setdefault(m, {"in": 0, "out": 0, "calls": 0, "cost": 0.0})
+            mt["in"] += mdata["in"]
+            mt["out"] += mdata["out"]
+            mt["calls"] += mdata["calls"]
+            mt["cost"] += mdata["cost"]
+    if len(model_totals) > 1:
+        parts.append("")
+        parts.append("**Pro Modell:**")
+        for m, mt in sorted(model_totals.items(), key=lambda x: -x[1]["calls"]):
+            cost_str = f" · ${mt['cost']:.3f}" if mt["cost"] > 0 else ""
+            parts.append(f"  • `{m}`: {mt['calls']} calls · {mt['in']:,}/{mt['out']:,} in/out{cost_str}")
+
+    return "\n".join(parts)
 
 
 # ============================================================================
@@ -3772,6 +3991,10 @@ async def llm_loop(user_text: str, user_id: int) -> str:
     BULK_HINT_AT = 15
     bulk_hint_sent = False
     completed_tool_calls = []  # für End-Of-Loop-Error-Message
+    # Self-Healing: wenn dasselbe Tool 3× in Folge fehlschlägt, abbrechen
+    # statt blind weiter zu loopen. Vermeidet Frust + Token-Verschwendung.
+    SELF_HEAL_FAIL_THRESHOLD = 3
+    consecutive_failures: dict = {}  # tool_name → fail-count in Folge
 
     for iteration in range(LOOP_LIMIT):
         resp = await asyncio.to_thread(
@@ -3782,6 +4005,16 @@ async def llm_loop(user_text: str, user_id: int) -> str:
             tool_choice="auto",
             max_tokens=2048,
         )
+        # Token-Usage tracken (best-effort, nie crash-causing)
+        try:
+            usage = getattr(resp, "usage", None)
+            if usage is not None:
+                _track_usage(LLM_MODEL,
+                             getattr(usage, "prompt_tokens", 0),
+                             getattr(usage, "completion_tokens", 0),
+                             kind="chat")
+        except Exception:
+            pass
         msg = resp.choices[0].message
         msg_dict = msg.model_dump(exclude_none=True)
         messages.append(msg_dict)
@@ -3792,11 +4025,13 @@ async def llm_loop(user_text: str, user_id: int) -> str:
             return msg.content or "(keine Antwort)"
 
         for tc in msg.tool_calls:
+            tool_failed = False  # für Self-Healing-Counter
             try:
                 args = json.loads(tc.function.arguments) if tc.function.arguments else {}
                 handler = TOOL_HANDLERS.get(tc.function.name)
                 if not handler:
                     result = f"Tool nicht bekannt: {tc.function.name}"
+                    tool_failed = True
                 else:
                     log.info(f"tool[{iteration+1}/{LOOP_LIMIT}]: {tc.function.name}({args})")
                     # KRITISCH: handler in Threadpool — sonst blockiert
@@ -3804,11 +4039,23 @@ async def llm_loop(user_text: str, user_id: int) -> str:
                     # den ganzen Telegram-Event-Loop minutenlang.
                     result = await asyncio.to_thread(handler, **args)
                     completed_tool_calls.append(tc.function.name)
+                    # Heuristic: Tool-Result der mit "Fehler"/"failed" anfängt → fail
+                    if isinstance(result, str) and re.match(
+                        r"^(Fehler|❌|Pfad-Fehler|Tool nicht|Ungültig)", result
+                    ):
+                        tool_failed = True
             except Exception as e:
                 log.exception(f"Tool {tc.function.name} failed")
                 # Token/Credential-Maskierung — Error landet in LLM-History
                 # und ggf in User-Reply, darf keine API-Keys leaken
                 result = _sanitize_error(f"Tool-Fehler: {e}")
+                tool_failed = True
+            # Self-Healing: track consecutive failures pro Tool
+            tn = tc.function.name
+            if tool_failed:
+                consecutive_failures[tn] = consecutive_failures.get(tn, 0) + 1
+            else:
+                consecutive_failures[tn] = 0  # Erfolg → Counter reset
             tool_msg = {
                 "role": "tool",
                 "tool_call_id": tc.id,
@@ -3816,6 +4063,15 @@ async def llm_loop(user_text: str, user_id: int) -> str:
             }
             messages.append(tool_msg)
             new_history_msgs.append(tool_msg)
+            # Hard-Break wenn ein Tool 3× in Folge failed
+            if consecutive_failures.get(tn, 0) >= SELF_HEAL_FAIL_THRESHOLD:
+                await update_history(user_id, new_history_msgs)
+                return (
+                    f"⚠️ Tool `{tn}` ist {SELF_HEAL_FAIL_THRESHOLD}× in Folge fehlgeschlagen — "
+                    f"breche ab statt weiter zu loopen.\n\n"
+                    f"Letzter Fehler: {str(result)[:300]}\n\n"
+                    f"Bitte prüfe ob das Tool ein Problem hat oder formuliere die Anfrage anders."
+                )
 
         # Hint einschleusen wenn LLM bei langen Loops noch single-shot arbeitet
         if iteration + 1 == BULK_HINT_AT and not bulk_hint_sent:
@@ -4192,6 +4448,15 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             }],
             max_tokens=300,
         )
+        try:
+            vusage = getattr(vision_resp, "usage", None)
+            if vusage is not None:
+                _track_usage(VISION_MODEL,
+                             getattr(vusage, "prompt_tokens", 0),
+                             getattr(vusage, "completion_tokens", 0),
+                             kind="vision")
+        except Exception:
+            pass
         vision_caption = (vision_resp.choices[0].message.content or "(keine Beschreibung)").strip()
 
         # OCR (Tesseract) — parallel zur Vision-Caption, macht Bild-Text suchbar
@@ -5771,6 +6036,20 @@ async def handle_tasks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 @require_auth
+async def handle_usage(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/usage [days] — Token-Usage + geschätzte Kosten der letzten N Tage (default 7)."""
+    args = ctx.args if ctx.args else []
+    days = 7
+    if args:
+        try:
+            days = max(1, min(90, int(args[0])))
+        except ValueError:
+            pass
+    text = await asyncio.to_thread(get_usage_summary, days)
+    await safe_reply(update, text)
+
+
+@require_auth
 async def handle_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 <b>Vault-Assistent bereit</b>\n\n"
@@ -5845,6 +6124,7 @@ def main():
     app.add_handler(CommandHandler("start", handle_start))
     app.add_handler(CommandHandler("today", handle_today))
     app.add_handler(CommandHandler("tasks", handle_tasks))
+    app.add_handler(CommandHandler("usage", handle_usage))
     app.add_handler(CommandHandler("briefing", handle_briefing))
     app.add_handler(CommandHandler("reminders", handle_reminders))
     app.add_handler(CommandHandler("reset", handle_reset))
