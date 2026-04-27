@@ -256,7 +256,14 @@ def atomic_write(path: Path, content: str) -> None:
 
 
 def today_iso() -> str:
-    return date.today().isoformat()
+    """Heute als ISO-String in BOT-Lokalzeit (Europe/Vienna o.ä.).
+
+    KRITISCH: nutzt TIMEZONE statt date.today(). Container läuft typisch
+    UTC — `date.today()` liefert nach 22:00 Wien-Zeit schon morgen.
+    Folge wäre: Tasks landen in falscher Daily, recurring Tasks
+    reaktivieren nie (last_completed = morgen → _is_recurrence_due False).
+    """
+    return datetime.now(TIMEZONE).date().isoformat()
 
 
 def load_template(name: str) -> str:
@@ -745,7 +752,13 @@ def mark_task_done(slug: str) -> str:
     'open' setzt. last_completed wird gesetzt damit Reset weiß wann es passt.
     """
     filename = slug[2:] if slug.startswith("t-") else slug
-    path = TASKS_DIR / f"{filename}.md"
+    # Path-Traversal-Schutz: slug ist LLM-kontrolliert. Nur kebab-case + .md erlauben.
+    if not filename or not re.match(r"^[a-zA-Z0-9_\-]+$", filename):
+        return f"Ungültiger Task-Slug: {slug!r}"
+    try:
+        path = safe_path(f"10_Life/tasks/{filename}.md")
+    except ValueError:
+        return f"Ungültiger Task-Pfad: {slug!r}"
     if not path.exists():
         return f"Task nicht gefunden: {slug}"
     post = frontmatter.load(path)
@@ -1114,15 +1127,37 @@ def get_today_agenda() -> str:
 def create_meeting(title: str, attendees: Optional[list] = None,
                    meeting_date: Optional[str] = None,
                    tags: Optional[list] = None) -> str:
-    """Create meeting protocol — Body dynamisch (kein Template-Cruft)."""
+    """Create meeting protocol — Body dynamisch (kein Template-Cruft).
+
+    meeting_date: NUR ISO YYYY-MM-DD akzeptiert. Bei Garbage/Path-Traversal
+    Fallback auf heute (LLM darf nicht beliebige Strings in den Pfad pumpen).
+    """
     if not title or not title.strip():
         return "Fehler: Meeting-Titel darf nicht leer sein."
-    today = meeting_date or today_iso()
+    # Datum strikt validieren — sonst Path-Traversal über meeting_date möglich
+    if meeting_date and re.match(r"^\d{4}-\d{2}-\d{2}$", str(meeting_date).strip()):
+        try:
+            datetime.strptime(meeting_date.strip(), "%Y-%m-%d")
+            today = meeting_date.strip()
+        except ValueError:
+            log.warning(f"create_meeting: ungültiges Datum '{meeting_date}', nutze heute")
+            today = today_iso()
+    else:
+        if meeting_date:
+            log.warning(f"create_meeting: kein ISO-Datum '{meeting_date}', nutze heute")
+        today = today_iso()
     slug = slugify(title)
-    path = MEETINGS_DIR / f"{today}_{slug}.md"
+    # safe_path defensiv anwenden — slug ist via slugify safe, today ist validiert.
+    try:
+        path = safe_path(f"10_Life/meetings/{today}_{slug}.md")
+    except ValueError:
+        return f"Ungültiger Meeting-Pfad ({today}_{slug})"
     n = 2
     while path.exists():
-        path = MEETINGS_DIR / f"{today}_{slug}-{n}.md"
+        try:
+            path = safe_path(f"10_Life/meetings/{today}_{slug}-{n}.md")
+        except ValueError:
+            return f"Ungültiger Meeting-Pfad-Variante (n={n})"
         n += 1
 
     # Tags filtern
@@ -1470,14 +1505,46 @@ def move_project(slug: str, parent: Optional[str] = None) -> str:
     return f"✓ Projekt verschoben: `{src_rel}/` → `{dst_rel}/`{parent_info}"
 
 
+EDIT_FILE_MAX_BYTES = 5 * 1024 * 1024     # 5 MB — keine Massenfile-Edits
+EDIT_FILE_MAX_REGEX_LEN = 500              # Regex >500 Zeichen → wahrscheinlich Halluzination
+# Pathological-Regex-Patterns die ReDoS triggern können (nested quantifiers
+# auf demselben Pattern). Konservativ — fängt die häufigsten Fälle.
+_REDOS_PATTERNS = [
+    re.compile(r"\([^)]*[+*]\)[+*]"),     # (a+)+ / (a*)*
+    re.compile(r"\([^)]*\|[^)]*\)[+*]"),  # (a|a)+ / (a|b)*
+]
+
+
 def edit_file(rel_path: str, find: str, replace: str, regex: bool = False) -> str:
-    """Find/replace in a file."""
+    """Find/replace in a file.
+
+    SECURITY: rel_path via safe_path. Bei regex=True: ReDoS-Schutz via
+    Pattern-Heuristik + Längen-Cap. File-Cap 5MB gegen accidental DoS.
+    """
+    if not isinstance(find, str) or not find:
+        return "Edit-Fehler: 'find' muss nicht-leerer String sein."
+    if not isinstance(replace, str):
+        return "Edit-Fehler: 'replace' muss String sein."
     try:
         path = safe_path(rel_path)
-        if not path.exists():
-            return f"Datei nicht gefunden: {rel_path}"
+    except ValueError as e:
+        return f"Pfad-Fehler: {e}"
+    if not path.exists():
+        return f"Datei nicht gefunden: {rel_path}"
+    try:
+        # File-Size-Check VOR dem Lesen — verhindert OOM bei Riesen-Files
+        if path.stat().st_size > EDIT_FILE_MAX_BYTES:
+            return f"Datei zu groß für edit_file ({path.stat().st_size} > {EDIT_FILE_MAX_BYTES}B). Manuell editieren."
         content = path.read_text(encoding="utf-8")
         if regex:
+            # ReDoS-Schutz: Pattern-Länge + bekannte pathologische Patterns ablehnen
+            if len(find) > EDIT_FILE_MAX_REGEX_LEN:
+                return f"Regex zu lang ({len(find)} > {EDIT_FILE_MAX_REGEX_LEN}) — vereinfachen oder regex=false."
+            for redos_pat in _REDOS_PATTERNS:
+                if redos_pat.search(find):
+                    return (f"Regex-Pattern '{find[:60]}' enthält pathologisches "
+                            "Konstrukt (nested quantifier) — ReDoS-Risiko, abgelehnt. "
+                            "Vereinfache das Pattern oder nutze regex=false.")
             try:
                 new, n = re.subn(find, replace, content)
             except re.error as e:
@@ -1496,12 +1563,38 @@ def edit_file(rel_path: str, find: str, replace: str, regex: bool = False) -> st
         return f"Edit-Fehler: {e}"
 
 
-def clip_url(url: str) -> str:
-    """Fetch URL via trafilatura, save as raw article."""
+CLIP_URL_TIMEOUT = 15  # Sekunden — verhindert dass slowloris-Server den Bot hängen lassen
+
+
+def _fetch_url_with_timeout(url: str, timeout: int = CLIP_URL_TIMEOUT) -> Optional[str]:
+    """Wie trafilatura.fetch_url, aber mit hartem Socket-Timeout.
+
+    trafilatura's eigener fetch_url akzeptiert kein timeout-Parameter →
+    LLM kann clip_url('http://attacker/slowloris') aufrufen und Bot hängt.
+    Stdlib urllib hat ein sauberes timeout das durchgereicht wird.
+    """
+    import urllib.request
+    import urllib.error
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; KI-WIKI-Bot/1.0)"},
+    )
     try:
-        downloaded = trafilatura.fetch_url(url)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError) as e:
+        log.warning(f"clip_url fetch failed for {url[:80]}: {e}")
+        return None
+
+
+def clip_url(url: str) -> str:
+    """Fetch URL (mit Timeout!), save as raw article."""
+    if not url or not isinstance(url, str) or not url.startswith(("http://", "https://")):
+        return f"Ungültige URL: {url!r}"
+    try:
+        downloaded = _fetch_url_with_timeout(url)
         if not downloaded:
-            return f"Konnte URL nicht laden: {url}"
+            return f"Konnte URL nicht laden (Timeout {CLIP_URL_TIMEOUT}s oder Fehler): {url}"
         text = trafilatura.extract(
             downloaded, include_comments=False, include_tables=True,
             include_links=True,
@@ -3597,7 +3690,10 @@ async def llm_loop(user_text: str, user_id: int) -> str:
                     result = f"Tool nicht bekannt: {tc.function.name}"
                 else:
                     log.info(f"tool[{iteration+1}/{LOOP_LIMIT}]: {tc.function.name}({args})")
-                    result = handler(**args)
+                    # KRITISCH: handler in Threadpool — sonst blockiert
+                    # backup_vault/clip_url/_build_link_index/extract_pdf_text
+                    # den ganzen Telegram-Event-Loop minutenlang.
+                    result = await asyncio.to_thread(handler, **args)
                     completed_tool_calls.append(tc.function.name)
             except Exception as e:
                 log.exception(f"Tool {tc.function.name} failed")
@@ -4043,12 +4139,36 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # Daily-Eintrag + Reply + History + Caption-Routing in einer Funktion.
 # Aufgespalten in drei sync Helper + dünner async Orchestrator.
 
+def _sanitize_filename(filename: str) -> str:
+    """Filename-Sanitization gegen Path-Traversal + OS-reservierte Namen.
+
+    Telegram-Client kann beliebige Filenames setzen (inkl. '../' oder
+    Windows-reservierte 'con.txt'/'nul.md'). Path(...).name strippt
+    Pfad-Komponenten, regex normalisiert verbleibende Sonderzeichen.
+    """
+    # Schritt 1: Pfad-Komponenten weg ('../foo' → 'foo')
+    base = Path(filename).name or "upload"
+    # Schritt 2: nur kebab-case Buchstaben/Ziffern/Punkt/Bindestrich/Unterstrich
+    cleaned = re.sub(r"[^\w.\-]", "_", base)
+    # Schritt 3: leading/trailing dots+spaces weg (Windows-Edge-Case)
+    cleaned = cleaned.strip(". ") or "upload"
+    # Schritt 4: max 200 Zeichen (Filesystem-Limit-Buffer)
+    if len(cleaned) > 200:
+        stem, _, ext = cleaned.rpartition(".")
+        cleaned = stem[:195] + "." + ext if ext else cleaned[:200]
+    return cleaned
+
+
 def _save_uploaded_doc(tmp_path: str, filename: str) -> tuple[Path, str, str]:
     """Verschiebt tmp-Datei in passenden Vault-Ordner, liefert (dest, kind, preview).
 
     kind: 'Text/Markdown' / 'PDF' / 'Datei'
     preview: erste 1500 Zeichen bei .md/.txt, sonst leer.
+
+    SECURITY: Filename wird VOR jeder Pfad-Konstruktion sanitisiert
+    (gegen Telegram-injizierte Path-Traversal wie '../../etc/passwd').
     """
+    filename = _sanitize_filename(filename)
     ext = Path(filename).suffix.lower()
     if ext in (".md", ".markdown", ".txt"):
         dest_dir = VAULT / "01_Raw" / "uploads"
@@ -5180,7 +5300,7 @@ def compute_briefing() -> str:
         return f"❌ <b>Briefing fehlgeschlagen</b>\nVault unter <code>{VAULT}</code> nicht erreichbar.\nMount oder Container-Volume prüfen."
 
     today = today_iso()
-    yesterday = (date.today() - timedelta(days=1)).isoformat()
+    yesterday = (datetime.now(TIMEZONE).date() - timedelta(days=1)).isoformat()
 
     # Single Source of Truth — gleiche Daten wie get_today_agenda
     data = collect_today_data()
