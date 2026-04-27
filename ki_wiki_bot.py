@@ -182,15 +182,18 @@ def iter_vault_md(root: Optional[Path] = None,
     if root is None:
         root = VAULT
     iter_method = root.rglob if recursive else root.glob
-    vault_resolved = VAULT.resolve() if skip_noise else None
     for path in iter_method("*.md"):
         if skip_noise:
+            # BUG-FIX: kein path.resolve() — rglob/glob liefern bereits
+            # absolute Pfade unter root, resolve() ist nur ein zusätzlicher
+            # filesystem-call ohne Mehrwert (potentiell langsam bei NFS).
             try:
-                rel = path.resolve().relative_to(vault_resolved)
+                rel = path.relative_to(VAULT)
                 if rel.parts and rel.parts[0] in VAULT_NOISE_DIRS:
                     continue
-            except (ValueError, AttributeError):
-                pass  # Pfad nicht unter VAULT — kein Skip-Check möglich
+            except ValueError:
+                # Pfad nicht unter VAULT (sollte nicht vorkommen) → skippen
+                continue
         try:
             post = frontmatter.load(path)
         except Exception as e:
@@ -2772,14 +2775,18 @@ def _maybe_compact_history() -> None:
 
 
 def _get_history_unlocked(user_id: int) -> list:
-    """Interner Read — ohne Lock. Nur aus locked Context aufrufen."""
+    """Interner Read — ohne Lock. Nur aus locked Context aufrufen.
+
+    BUG-FIX: TIMESTAMP wird IMMER gesetzt, auch bei loaded=[] (leere History).
+    Vorher: bei leerer History blieb timestamp=0 → JEDE User-Message reloadet
+    JSONL synchron unter Lock → handle_text hängt gefühlt minutenlang.
+    """
     last = CONVERSATION_TIMESTAMPS.get(user_id, 0.0)
     cached = CONVERSATION_HISTORY.get(user_id)
     if cached is None or (time.time() - last) > HISTORY_TIMEOUT:
         loaded = _load_persistent_history(user_id)
         CONVERSATION_HISTORY[user_id] = loaded
-        if loaded:
-            CONVERSATION_TIMESTAMPS[user_id] = time.time()
+        CONVERSATION_TIMESTAMPS[user_id] = time.time()  # IMMER setzen, nicht nur bei loaded
         return loaded
     return cached
 
