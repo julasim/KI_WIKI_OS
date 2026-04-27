@@ -1645,6 +1645,38 @@ def move_project(slug: str, parent: Optional[str] = None) -> str:
     return f"✓ Projekt verschoben: `{src_rel}/` → `{dst_rel}/`{parent_info}"
 
 
+def move(src=None, dst: Optional[str] = None,
+         project_slug: Optional[str] = None,
+         parent: Optional[str] = None,
+         overwrite: bool = False) -> str:
+    """Vereinheitlichtes Move-Tool für 3 Use-Cases:
+
+    a) Datei/Ordner einzeln umbenennen oder verschieben:
+       move(src='10_Life/notes/foo.md', dst='10_Life/notes/bar.md')
+
+    b) Mehrere Dateien in einen Ziel-Ordner (Bulk):
+       move(src=['a.md', 'b.md', 'c.md'], dst='05_Projects/matura/')
+
+    c) Projekt verschieben (mit Subprojekt-Logic, rekursiver Slug-Resolve):
+       move(project_slug='matura', parent='dachboden-umbau')
+       move(project_slug='foo')  → zurück zu Top-Level
+
+    Konsolidiert move_path + move_paths + move_project zu einem Tool.
+    Bei project_slug nicht None → Projekt-Modus (src/dst werden ignoriert).
+    Bei src=list → Bulk-Modus.
+    Bei src=str → Einzel-Modus.
+    """
+    if project_slug:
+        return move_project(project_slug, parent)
+    if src is None or dst is None:
+        return "Fehler: src und dst nötig (oder project_slug für Projekt-Move)."
+    if isinstance(src, list):
+        return move_paths(src, dst, overwrite)
+    if isinstance(src, str):
+        return move_path(src, dst, overwrite)
+    return f"Fehler: src muss str oder list sein, nicht {type(src).__name__}."
+
+
 EDIT_FILE_MAX_BYTES = 5 * 1024 * 1024     # 5 MB — keine Massenfile-Edits
 EDIT_FILE_MAX_REGEX_LEN = 500              # Regex >500 Zeichen → wahrscheinlich Halluzination
 # Pathological-Regex-Patterns die ReDoS triggern können (nested quantifiers
@@ -1837,12 +1869,21 @@ def request_delete(rel_paths, permanent: bool = False) -> str:
     return msg
 
 
-def confirm_delete() -> str:
-    """Führt alle pending Löschungen aus — Archiv oder permanent je nach Mode."""
+def confirm_delete(action: str = "confirm") -> str:
+    """Führt pending Löschungen aus oder bricht ab je nach action.
+
+    action='confirm' (default): Löschen ausführen (Archiv oder permanent
+                                je nach Mode aus request_delete)
+    action='cancel': Pending verwerfen ohne zu löschen.
+    """
     pending = PENDING_DELETIONS.get(ALLOWED_USER_ID)
     if not pending or not pending[0]:
         return "Keine Löschung pending — gibts nichts zu bestätigen."
     paths, ts, mode = pending
+    # Cancel-Pfad: einfach pending leeren
+    if action == "cancel":
+        PENDING_DELETIONS.pop(ALLOWED_USER_ID, None)
+        return f"Löschanfrage für {len(paths)} Datei(en) abgebrochen ({mode}-Modus)."
     age = time.time() - ts
     if age > DELETE_CONFIRM_TIMEOUT:
         PENDING_DELETIONS.pop(ALLOWED_USER_ID, None)
@@ -1893,14 +1934,6 @@ def confirm_delete() -> str:
     PENDING_DELETIONS.pop(ALLOWED_USER_ID, None)
     invalidate_link_index()  # gelöschte/archivierte IDs nicht mehr verlinkbar
     return f"{header}\n" + "\n".join(results)
-
-
-def cancel_delete() -> str:
-    """Bricht alle pending Löschungen ab."""
-    pending = PENDING_DELETIONS.pop(ALLOWED_USER_ID, None)
-    if not pending or not pending[0]:
-        return "Keine pending Löschung."
-    return f"Löschanfrage für {len(pending[0])} Datei(en) abgebrochen ({pending[2]}-Modus)."
 
 
 # ─── Reminders (persistent + JobQueue) ──────────────────────────────────────
@@ -2575,6 +2608,20 @@ def forget_preference(pattern: str) -> str:
     return f"Entfernt ({len(removed)}):\n" + "\n".join(removed[:5])
 
 
+def forget(kind: str, pattern: str) -> str:
+    """Vereinheitlichtes Forget für Memory: kind='fact' oder 'preference'.
+
+    Konsolidiert forget_fact + forget_preference zu einem Tool.
+    Der LLM-Agent muss nur noch entscheiden welches Memory-Tier.
+    """
+    k = (kind or "").strip().lower()
+    if k in ("fact", "facts", "f"):
+        return forget_fact(pattern)
+    if k in ("preference", "preferences", "pref", "p"):
+        return forget_preference(pattern)
+    return f"Unbekanntes kind '{kind}'. Erlaubt: 'fact' oder 'preference'."
+
+
 # ─── Projekt-Kontext (per-Projekt CONTEXT.md, on-demand) ────────────────────
 
 def get_active_project() -> Optional[str]:
@@ -2658,6 +2705,31 @@ def update_project_context(slug: str, text: str, mode: str = "append") -> str:
         with context_file.open("a", encoding="utf-8") as f:
             f.write(f"\n{linked_text}\n")
         return f"✓ CONTEXT.md für {slug} erweitert"
+
+
+def project_context(action: str, slug: Optional[str] = None,
+                    text: Optional[str] = None, mode: str = "append") -> str:
+    """Vereinheitlichtes Projekt-Kontext-Tool.
+
+    action='activate' (slug nötig)   → setzt Projekt aktiv, lädt CONTEXT.md
+    action='deactivate' (slug egal)  → bricht aktives Projekt ab
+    action='update' (slug+text nötig)→ schreibt in CONTEXT.md (mode=append/replace)
+
+    Konsolidiert die 3 Einzel-Tools (activate_project, deactivate_project,
+    update_project_context) zu einem.
+    """
+    a = (action or "").strip().lower()
+    if a in ("activate", "aktivier", "an"):
+        if not slug:
+            return "Slug fehlt für activate."
+        return activate_project(slug)
+    if a in ("deactivate", "deaktivier", "aus", "stop"):
+        return deactivate_project()
+    if a in ("update", "edit", "set"):
+        if not slug or not text:
+            return "Slug und text nötig für update."
+        return update_project_context(slug, text, mode)
+    return f"Unbekannte action '{action}'. Erlaubt: activate / deactivate / update."
 
 
 # ─── Korrektur-Log (Trainings-Material für späteres Fine-Tuning) ─────────────
@@ -3462,76 +3534,30 @@ TOOLS = [
         },
     }},
     {"type": "function", "function": {
-        "name": "move_path",
+        "name": "move",
         "description": (
-            "Verschiebt oder benennt EINE Datei oder einen Ordner um (vault-relative Pfade). "
-            "Für MEHRERE Files auf einmal IMMER `move_paths` nutzen — sonst läuft der Tool-Loop "
-            "voll. Wenn dst ein existierender Ordner ist, wird src dort hineingelegt — sonst wird "
-            "src nach dst umbenannt. Für Projekt-Verschiebungen lieber `move_project` nutzen."
+            "Vereinheitlichtes Move-Tool für 3 Use-Cases:\n"
+            "(1) EINE Datei/Ordner umbenennen/verschieben: src=str, dst=str.\n"
+            "(2) MEHRERE Files in einen Zielordner (bulk, spart Tool-Calls): src=list, dst=str.\n"
+            "(3) Projekt verschieben (mit Subprojekt-Logic): project_slug=str, parent=str|leer.\n"
+            "Für Multi-File-Upload IMMER Bulk-Mode nutzen statt N-mal einzeln."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "src_rel": {"type": "string", "description": "Quell-Pfad relativ zum Vault-Root"},
-                "dst_rel": {"type": "string", "description": "Ziel-Pfad oder Ziel-Ordner relativ zum Vault-Root"},
-                "overwrite": {"type": "boolean", "default": False, "description": "Wenn Ziel existiert: überschreiben. Nur True wenn User explizit will."},
-            },
-            "required": ["src_rel", "dst_rel"],
-        },
-    }},
-    {"type": "function", "function": {
-        "name": "move_paths",
-        "description": (
-            "BULK-MOVE: verschiebt mehrere Dateien/Ordner auf einmal in einen Ziel-Ordner. "
-            "Spart massiv Tool-Calls bei Multi-File-Operationen — IMMER nutzen wenn ≥2 Files in "
-            "denselben Ordner sollen. Beispiel: nach 6 Datei-Uploads alle gleichzeitig in einen "
-            "Projektordner verschieben. Pro Item wird Erfolg/Fehler einzeln gemeldet."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "srcs": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Liste vault-relativer Quellpfade (Dateien oder Ordner)",
+                "src": {
+                    "description": "String (Einzel-Move) oder Liste (Bulk). Weglassen bei project_slug.",
+                    "anyOf": [
+                        {"type": "string"},
+                        {"type": "array", "items": {"type": "string"}},
+                    ],
                 },
-                "dst_dir": {"type": "string", "description": "Vault-relatives Ziel-Verzeichnis (wird angelegt falls nicht da)"},
+                "dst": {"type": "string", "description": "Ziel-Pfad oder Ziel-Ordner. Bei project_slug irrelevant."},
+                "project_slug": {"type": "string", "description": "Bei Projekt-Move: Slug des zu verschiebenden Projekts."},
+                "parent": {"type": "string", "description": "Nur bei project_slug: neuer Parent-Slug oder leer für Top-Level."},
                 "overwrite": {"type": "boolean", "default": False},
             },
-            "required": ["srcs", "dst_dir"],
-        },
-    }},
-    {"type": "function", "function": {
-        "name": "move_project",
-        "description": (
-            "Verschiebt ein bestehendes Projekt — entweder unter ein anderes als Subprojekt, "
-            "oder zurück auf Top-Level (parent leer lassen). Findet Projekte rekursiv in 05_Projects/. "
-            "Beispiel: move_project('bbm-skript-k-blaetter-rdp-schriftlich', parent='matura') → "
-            "verschiebt unter 05_Projects/matura/. move_project('foo') → verschiebt foo nach Top-Level."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "slug": {"type": "string", "description": "Slug des zu verschiebenden Projekts (ohne 'project-' Präfix)"},
-                "parent": {"type": "string", "description": "Slug des Parent-Projekts. Leer/weglassen → Top-Level."},
-            },
-            "required": ["slug"],
-        },
-    }},
-    {"type": "function", "function": {
-        "name": "delete_path",
-        "description": (
-            "GEFÄHRLICH: Löscht Datei oder Ordner unwiderruflich. NICHT direkt benutzen — "
-            "stattdessen erst `request_delete` (verschiebt nach 99_Archive/, reversibel). "
-            "Nur einsetzen für Cleanup nach explizitem User-Wunsch ('lösche endgültig X')."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "rel_path": {"type": "string"},
-                "recursive": {"type": "boolean", "default": False, "description": "True nur für Ordner mit Inhalt."},
-            },
-            "required": ["rel_path"],
+            "required": [],
         },
     }},
     {"type": "function", "function": {
@@ -3576,16 +3602,22 @@ TOOLS = [
     {"type": "function", "function": {
         "name": "confirm_delete",
         "description": (
-            "Schritt 2 von 2: führt ALLE pending Löschungen aus (Files werden ins "
-            "99_Archive/ verschoben, NICHT hart gelöscht — reversibel). "
-            "Nur aufrufen NACHDEM User explizit bestätigt hat ('ja', 'bestätigt', 'machs')."
+            "Schritt 2 von 2: bestätigt oder bricht pending Löschungen ab. "
+            "action='confirm' (default) führt aus (→ ins 99_Archive verschoben oder "
+            "permanent gelöscht je nach mode). action='cancel' verwirft pending. "
+            "User-Trigger: 'ja/machs/bestätigt' → confirm. 'nein/abbrechen/doch nicht' → cancel."
         ),
-        "parameters": {"type": "object", "properties": {}, "required": []},
-    }},
-    {"type": "function", "function": {
-        "name": "cancel_delete",
-        "description": "Bricht alle pending Löschungen ab. Bei 'nein', 'abbrechen', 'doch nicht'.",
-        "parameters": {"type": "object", "properties": {}, "required": []},
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["confirm", "cancel"],
+                    "default": "confirm",
+                },
+            },
+            "required": [],
+        },
     }},
     {"type": "function", "function": {
         "name": "list_files",
@@ -3610,33 +3642,9 @@ TOOLS = [
             "required": [],
         },
     }},
-    {"type": "function", "function": {
-        "name": "apply_memory_suggestion",
-        "description": (
-            "Verarbeitet User-Antwort auf das nightly Memory-Vorschlags-Briefing. "
-            "Action-Formate: '1 3' (speichert 1+3), 'alle'/'ja' (alle), '0'/'nein' (alle verwerfen), "
-            "'erkläre 2' (Details). Nutze SOFORT wenn User auf eine Memory-Vorschlags-Liste antwortet."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {"action": {"type": "string"}},
-            "required": ["action"],
-        },
-    }},
-    {"type": "function", "function": {
-        "name": "apply_health_action",
-        "description": (
-            "Verarbeitet User-Antwort auf pending Vault-Health-Aktionen (aus dem nightly "
-            "Health-Job 02:00). Triggers: 'health 1', 'health alle', 'health 0', oder einfach "
-            "'1 2' wenn pending-health-actions.json existiert UND Briefing zeigte Vault-Pflege-Sektion. "
-            "Action-Formate: '1 2' (Aktionen 1+2 ausführen), 'alle'/'ja', '0'/'nein' (skip alle)."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {"action": {"type": "string"}},
-            "required": ["action"],
-        },
-    }},
+    # apply_memory_suggestion + apply_health_action sind KEINE LLM-Tools mehr —
+    # sie werden direkt im handle_text via _detect_pending_reply_intent gerufen
+    # (Reply-Parser für Memory/Health-Briefing-Antworten, kein LLM-Roundtrip nötig).
     {"type": "function", "function": {
         "name": "log_correction",
         "description": (
@@ -3673,50 +3681,24 @@ TOOLS = [
         },
     }},
     {"type": "function", "function": {
-        "name": "forget_preference",
-        "description": "Entfernt Präferenzen die einen Text enthalten. Nutze bei 'vergiss die Stil-Regel X'.",
-        "parameters": {
-            "type": "object",
-            "properties": {"pattern": {"type": "string", "description": "Text-Snippet in der Präferenz zum matchen (case-insensitive)"}},
-            "required": ["pattern"],
-        },
-    }},
-    {"type": "function", "function": {
-        "name": "activate_project",
+        "name": "project_context",
         "description": (
-            "Setzt ein Projekt als aktiv — sein CONTEXT.md wird ab jetzt in jeden "
-            "System-Prompt eingespeist (projektspezifische Regeln, Auftraggeber, Fristen, etc.). "
-            "Nutze wenn User sagt 'lass uns über Projekt X reden', 'arbeite jetzt an X', "
-            "'aktiviere X'. Slug ohne 'project-' Präfix."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {"slug": {"type": "string", "description": "z.B. 'sanierung-kiosk'"}},
-            "required": ["slug"],
-        },
-    }},
-    {"type": "function", "function": {
-        "name": "deactivate_project",
-        "description": "Bricht aktives Projekt ab (CONTEXT.md wird nicht mehr in Prompt geladen).",
-        "parameters": {"type": "object", "properties": {}, "required": []},
-    }},
-    {"type": "function", "function": {
-        "name": "update_project_context",
-        "description": (
-            "Schreibt projektspezifischen Kontext nach 05_Projects/<slug>/CONTEXT.md (Subprojekt-Pfad ist tiefer). "
-            "mode='append' (default) hängt an, 'replace' überschreibt komplett. "
-            "Nutze für Projekt-Setup-Infos: Auftraggeber, Tech-Stack, Fristen, Budget, "
-            "spezielle Regeln. Wird automatisch in den System-Prompt geladen wenn dieses "
-            "Projekt aktiv ist."
+            "Steuert Projekt-Kontext-Loading + CONTEXT.md-Editing in einem Tool. "
+            "action='activate' (slug nötig) → setzt Projekt aktiv, CONTEXT.md wird ab jetzt "
+            "in jeden System-Prompt eingespeist. Trigger: 'lass uns über X reden'. "
+            "action='deactivate' → bricht aktives Projekt ab. Trigger: 'fertig mit X'. "
+            "action='update' (slug+text nötig) → schreibt nach 05_Projects/<slug>/CONTEXT.md, "
+            "mode=append (default) oder replace. Trigger: 'merk für Projekt X: Y'."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "slug": {"type": "string"},
-                "text": {"type": "string"},
+                "action": {"type": "string", "enum": ["activate", "deactivate", "update"]},
+                "slug": {"type": "string", "description": "Projekt-Slug ohne 'project-' Präfix. Bei deactivate optional."},
+                "text": {"type": "string", "description": "Nur bei action='update': Kontext-Text."},
                 "mode": {"type": "string", "enum": ["append", "replace"], "default": "append"},
             },
-            "required": ["slug", "text"],
+            "required": ["action"],
         },
     }},
     {"type": "function", "function": {
@@ -3737,12 +3719,19 @@ TOOLS = [
         },
     }},
     {"type": "function", "function": {
-        "name": "forget_fact",
-        "description": "Entfernt Fakten die einen bestimmten Text enthalten. Nutze wenn User 'vergiss X' o.ä. sagt.",
+        "name": "forget",
+        "description": (
+            "Entfernt Memory-Einträge die ein Pattern enthalten (case-insensitive). "
+            "kind='fact' für Fakten in facts.md, kind='preference' für Stil-Regeln in preferences.md. "
+            "Trigger: 'vergiss X' / 'lösch die Regel Y' / 'das stimmt nicht mehr'."
+        ),
         "parameters": {
             "type": "object",
-            "properties": {"pattern": {"type": "string", "description": "Text-Snippet im Fakt zum matchen (case-insensitive)"}},
-            "required": ["pattern"],
+            "properties": {
+                "kind": {"type": "string", "enum": ["fact", "preference"]},
+                "pattern": {"type": "string", "description": "Text-Snippet zum matchen"},
+            },
+            "required": ["kind", "pattern"],
         },
     }},
     {"type": "function", "function": {
@@ -3841,27 +3830,19 @@ TOOL_HANDLERS = {
     "search_vault": search_vault,
     "read_file": read_file,
     "edit_file": edit_file,
-    "move_path": move_path,
-    "move_paths": move_paths,
-    "move_project": move_project,
-    "delete_path": delete_path,
+    "move": move,
     "clip_url": clip_url,
     "request_delete": request_delete,
     "confirm_delete": confirm_delete,
-    "cancel_delete": cancel_delete,
     "list_files": list_files,
     "list_existing_tags": list_existing_tags,
     "remember": remember,
-    "forget_fact": forget_fact,
+    "forget": forget,
     "set_preference": set_preference,
-    "forget_preference": forget_preference,
-    "activate_project": activate_project,
-    "deactivate_project": deactivate_project,
-    "update_project_context": update_project_context,
+    "project_context": project_context,
     "log_correction": log_correction,
-    "apply_memory_suggestion": apply_memory_suggestion,
-    # apply_health_action wird WEITER UNTEN nach Funktionsdefinition registriert
-    # (sie liegt im Health-Modul ~Zeile 5050 und wäre hier ein Forward-Ref-Bug).
+    # apply_memory_suggestion + apply_health_action sind KEINE LLM-Tools mehr —
+    # werden via _detect_pending_reply_intent in handle_text direkt gerufen.
     "create_project": create_project,
     "create_reminder": create_reminder,
     "list_reminders": list_reminders,
@@ -3898,10 +3879,10 @@ VAULT
 | "lösche X" | `request_delete` (Default: ins Archiv = reversibel) |
 | "lösche endgültig / wirklich weg / unwiderruflich" | `request_delete(permanent=true)` |
 | "lösche alle X / leere Y" | erst `list_files`, dann `request_delete` mit Liste |
-| "ja/bestätigt" nach request_delete | `confirm_delete`. "nein/abbrechen" → `cancel_delete`. |
+| "ja/bestätigt" nach request_delete | `confirm_delete()`. "nein/abbrechen" → `confirm_delete(action='cancel')`. |
 | "lege Projekt X an / neues Projekt" | `create_project` (Ordner+README direkt, nicht erst nachfragen) |
-| "X als Subprojekt von Y / schiebe X unter Y" | `move_project(slug=X, parent=Y)` |
-| "verschieb A nach B / ordne in Y ein" | `move_path` (1 Datei) — bei ≥2 Dateien IMMER `move_paths(srcs=[…], dst_dir=…)` |
+| "X als Subprojekt von Y / schiebe X unter Y" | `move(project_slug='X', parent='Y')` |
+| "verschieb A nach B / ordne in Y ein" | `move(src='A', dst='B')` (Einzel) oder `move(src=['a','b','c'], dst='ordner/')` (Bulk bei ≥2 Files) |
 | "erinner mich an X um Y / wecker für 14 / in 30 Min" | `create_reminder` (when_iso = absolute Lokalzeit!) |
 | "jeden Montag 8 Uhr / täglich um 7" | `create_reminder` mit recurrence (daily/weekdays/weekly) |
 | "welche Reminder / cancel reminder" | `list_reminders` / `cancel_reminder` |
@@ -3912,7 +3893,7 @@ VAULT
 - Klarer Auftrag → direkt machen, kein "wo soll ich"-Loop.
 
 **MULTI-FILE-WORKFLOW** (kritisch — sonst läuft Tool-Loop voll):
-Bei Upload + "lege als Projekt X an": (1) `create_project`, (2) EINEN `move_paths(srcs=[…], dst_dir=…)`-Call (NIEMALS N×move_path), (3) optional `activate_project`. Max 3-4 Tool-Calls für N Files.
+Bei Upload + "lege als Projekt X an": (1) `create_project`, (2) EINEN `move(src=[alle Pfade], dst='05_Projects/<slug>/')`-Call (NIEMALS N×einzeln), (3) optional `project_context(action='activate', slug=...)`. Max 3-4 Tool-Calls für N Files.
 
 **TAGESPLAN-EXTRAKTION** (User listet mehrere Items, oft als Antwort aufs Morgens-Briefing):
 - Klare Uhrzeit + Aktivität → `create_reminder` (KEIN Reminder ohne Uhrzeit erfinden!)
@@ -3932,7 +3913,7 @@ Pro Item ein Tool-Call (parallel im selben Loop-Step OK). Eine Bestätigung am E
 - Format: Bullets/Code/`**bold**`/`*italic*`. Headings nur bei langen Antworten.
 - **TELEGRAM-TABELLEN**: nur ≤2 Spalten + kurze Zellen. Sobald Pfade/lange Texte/≥3 Spalten → kein Tabellen-Format, stattdessen pro Item: `**Name**` + eingerückte `• Label: Wert`-Bullets.
 - **Wikilinks**: nur echte IDs aus search_vault/read_file. Keine Filepaths `[[10_Life/…]]`, keine Platzhalter `[[t-example]]`. Wenn keine ID → Klartext, KEIN Link.
-  - **Auto-Linking aktiv**: bei `append_to_daily`, `create_note`, `update_project_context` macht der Renderer Wikilinks aus Klartext (Matura → `[[project-matura|Matura]]`). Bei direkter Telegram-Antwort selbst setzen.
+  - **Auto-Linking aktiv**: bei `append_to_daily`, `create_note`, `project_context(action='update', ...)` macht der Renderer Wikilinks aus Klartext (Matura → `[[project-matura|Matura]]`). Bei direkter Telegram-Antwort selbst setzen.
 - NIE HTML-Tags. NIE Frontmatter ausgeben.
 
 # DATEN
@@ -3950,23 +3931,17 @@ Drei Memory-Typen (alle automatisch im System-Prompt eingespeist):
 |---|---|---|
 | "antworte kürzer / kein 'gerne!' / DD.MM. statt ISO / weniger Tabellen" | `set_preference` | WIE der Bot reagiert (Stil/Format/Tonalität) |
 | "merk dir / ich heiße Julius / KV-Lohn 32,80 / studiere HTL" | `remember` | WAS über den User wahr ist (Bio/Setup/Fakten) |
-| "Sanierung-Kiosk: ÖNORM B 2061 / Auftraggeber Schiemer" (+ Projekt aktiv) | `update_project_context` | Projekt-spezifische Regel |
-| "lass uns über X reden / arbeite jetzt an X" | `activate_project(X)` | — |
+| "Sanierung-Kiosk: ÖNORM B 2061 / Auftraggeber Schiemer" (+ Projekt aktiv) | `project_context(action='update', slug=..., text=...)` | Projekt-spezifische Regel |
+| "lass uns über X reden / arbeite jetzt an X" | `project_context(action='activate', slug='X')` | — |
+| "fertig mit X / weg vom Projekt" | `project_context(action='deactivate')` | — |
 
 **MULTI-FAKT-KOMPRESSION**: Mehrere Fakten in einem Satz → EIN `remember`-Call mit `\n`-Trennung, NICHT 3× einzeln. Analog für `set_preference`.
 
 # KORREKTUREN LERNEN
 "nein, anders / das war falsch / ich meinte X / mach das anders" → `log_correction(was_falsch, was_richtig, kontext)`. Landet in corrections.jsonl für Fine-Tuning + Nightly-Vorschläge.
 
-# NIGHTLY MEMORY-VORSCHLÄGE — KRITISCHER TRIGGER
-Jede Nacht schickt ein Job nummerierte Vorschläge (1./2./3./...). User-Antwort-Patterns:
-- "1 3" / "1,3" — Auswahl · "alle" / "ja" — alle · "0" / "nein" — verwerfen · "erkläre 2" — Detail
-→ SOFORT `apply_memory_suggestion(action)` mit EXAKTEM User-String. Auch bei sehr kurzen Antworten (nur Zahlen) — NICHT als Task-Index missverstehen. Disambiguierung: wenn `pending-suggestions.json` existiert UND letzte Konversation enthielt das Briefing → es ist eine Memory-Antwort.
-
-# VAULT-HEALTH-AKTIONEN — KRITISCHER TRIGGER
-Jede Nacht 02:00 läuft ein Health-Check. Auto-Fixes (Frontmatter, Tags, alte Done-Tasks, Tag-Konsolidierung, etc.) passieren still. Wenn pending Approvals offen sind, taucht im Briefing eine "🔧 Vault-Pflege"-Sektion mit nummerierten Aktionen auf. User-Antwort-Patterns:
-- "health 1" / "health 1 2" — Aktionen ausführen · "health alle" — alle · "health 0" / "health nein" — alles skippen
-→ SOFORT `apply_health_action(action)` mit dem User-String (das "health"-Präfix darf bleiben oder weg). Disambiguierung gegen Memory-Antworten: wenn Antwort mit "health" beginnt ODER `pending-health-actions.json` existiert UND `pending-suggestions.json` NICHT existiert → Health-Antwort.
+# NIGHTLY MEMORY/HEALTH-VORSCHLÄGE
+Antworten auf Memory- oder Health-Listen ("1 3", "alle", "0", "erkläre 2", oder mit Präfix "memory 1" / "health alle") werden DIREKT vom Bot-Loop verarbeitet, NICHT vom LLM. Du bekommst diese Pattern-Messages gar nicht zu sehen — wenn doch eine kommt heißt das Disambig war unklar (beide pending), dann frag User welche Liste gemeint ist.
 
 # AUTO-TAGGING
 Bei `create_task/note/meeting`: 2-5 thematische Tags via `tags`-Parameter (kebab-case Deutsch, z.B. `gesundheit`, `kunde-mueller`). TOPISCH, nicht strukturell (NICHT `task`/`note`). Bei vage Kontext lieber `[]` als schlechte Tags. Optional vorher `list_existing_tags` für Vokabular-Konsistenz.
@@ -4140,17 +4115,19 @@ async def llm_loop(user_text: str, user_id: int) -> str:
                     f"Bitte prüfe ob das Tool ein Problem hat oder formuliere die Anfrage anders."
                 )
 
-        # Hint einschleusen wenn LLM bei langen Loops noch single-shot arbeitet
+        # Hint einschleusen wenn LLM bei langen Loops noch single-shot arbeitet.
+        # Seit Tool-Konsolidierung gibt's nur noch `move` — mehrfach-Single-Calls
+        # erkennt man am gleichen Tool-Namen mit string-src statt list.
         if iteration + 1 == BULK_HINT_AT and not bulk_hint_sent:
-            move_count = sum(1 for c in completed_tool_calls if c == "move_path")
+            move_count = sum(1 for c in completed_tool_calls if c == "move")
             if move_count >= 4:
                 hint = {
                     "role": "user",
                     "content": (
-                        f"[System-Hint]: Du hast bereits {move_count}× move_path einzeln "
-                        f"aufgerufen. Nutze stattdessen `move_paths(srcs=[...], dst_dir=...)` "
-                        f"in EINEM Tool-Call. Schließe die Operation jetzt zügig ab, sonst "
-                        f"reicht das Iterations-Limit nicht."
+                        f"[System-Hint]: Du hast bereits {move_count}× move einzeln "
+                        f"aufgerufen. Nutze `move(src=[liste], dst='ordner/')` für Bulk in "
+                        f"EINEM Call. Schließe die Operation jetzt zügig ab, sonst reicht "
+                        f"das Iterations-Limit nicht."
                     ),
                 }
                 messages.append(hint)
@@ -4168,7 +4145,7 @@ async def llm_loop(user_text: str, user_id: int) -> str:
         f"Bisher gemacht: {summary or '(nichts erfolgreich)'}.\n\n"
         f"Der Auftrag ist möglicherweise nur teilweise erledigt — "
         f"bitte prüfen oder nochmal mit präziserem/kleinerem Auftrag wiederholen. "
-        f"Tipp: Bulk-Tools wie `move_paths` benutzen, nicht 6× einzeln move_path."
+        f"Tipp: `move(src=[liste], dst='ordner/')` für Bulk statt 6× einzeln."
     )
 
 
@@ -4430,10 +4407,84 @@ async def safe_reply(update: Update, text: str) -> None:
 
 
 @require_auth
+def _detect_pending_reply_intent(text: str) -> Optional[str]:
+    """Erkennt ob User-Message eine Antwort auf pending Memory/Health-Liste ist.
+
+    Returns: 'memory' oder 'health' oder None.
+    Heuristik:
+    - "memory <antwort>" / "memory: <antwort>" → memory
+    - "health <antwort>" → health
+    - Sonst nur wenn EXAKT ein Pending-File existiert (Disambig)
+      UND Text matches typisches Reply-Pattern (Zahlen, "alle", "nein", "0", "ja")
+    """
+    t = (text or "").strip().lower()
+    if not t:
+        return None
+    # Explizite Präfixe
+    if t.startswith(("memory ", "memory:")) or t == "memory":
+        return "memory"
+    if t.startswith(("health ", "health:")) or t == "health":
+        return "health"
+    # Typisches Reply-Pattern: nur Zahlen+Spaces+Komma, "alle", "ja", "nein", "0", "skip", "erkläre N"
+    is_reply_shape = bool(
+        re.fullmatch(r"\s*\d+(\s*[,\s]\s*\d+)*\s*", t)        # "1 2 3" / "1,3"
+        or t in ("alle", "ja", "all", "yes", "y",
+                 "nein", "no", "n", "0", "skip", "verwerfen")
+        or re.match(r"^(erklär|erklar)", t)                    # "erkläre 2"
+    )
+    if not is_reply_shape:
+        return None
+    # Disambig: welches Pending-File existiert?
+    has_mem = PENDING_SUGGESTIONS_FILE.exists()
+    has_health = PENDING_HEALTH_ACTIONS_FILE.exists()
+    if has_mem and not has_health:
+        return "memory"
+    if has_health and not has_mem:
+        return "health"
+    if has_mem and has_health:
+        # Beide pending — ohne Präfix nicht eindeutig, lass LLM entscheiden
+        return None
+    return None
+
+
+def _strip_intent_prefix(text: str) -> str:
+    """Entfernt 'memory '/'health '-Präfix vom User-Text vor Action-Parser."""
+    t = text.strip()
+    for prefix in ("memory:", "memory ", "memory", "health:", "health ", "health"):
+        if t.lower().startswith(prefix):
+            return t[len(prefix):].strip()
+    return t
+
+
+@require_auth
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
     log.info(f"text: {text[:120]}")
     await update.message.chat.send_action(constants.ChatAction.TYPING)
+
+    # Intent-Detection: ist das eine Antwort auf pending Memory/Health-Liste?
+    # Wenn ja: direkt den entsprechenden Action-Parser rufen (kein LLM-Roundtrip).
+    intent = _detect_pending_reply_intent(text)
+    if intent == "memory":
+        action = _strip_intent_prefix(text) or text.strip()
+        try:
+            reply = await asyncio.to_thread(apply_memory_suggestion, action)
+        except Exception as e:
+            log.exception("apply_memory_suggestion failed")
+            reply = _sanitize_error(f"Fehler: {e}")
+        await safe_reply(update, reply)
+        return
+    if intent == "health":
+        action = _strip_intent_prefix(text) or text.strip()
+        try:
+            reply = await asyncio.to_thread(apply_health_action, action)
+        except Exception as e:
+            log.exception("apply_health_action failed")
+            reply = _sanitize_error(f"Fehler: {e}")
+        await safe_reply(update, reply)
+        return
+
+    # Normaler Pfad: ans LLM mit Tool-Loop
     try:
         reply = await llm_loop(text, update.effective_user.id)
     except Exception as e:
@@ -5792,12 +5843,8 @@ def apply_health_action(action: str) -> str:
     return "Health-Aktionen verarbeitet:\n" + "\n".join(results) + tail
 
 
-# ─── Forward-Reference-Fix: Tool-Handler nachtragen ────────────────────────
-# apply_health_action wird im TOOL_HANDLERS-Dict (Zeile ~3370) referenziert,
-# aber die Funktion selbst ist erst hier definiert (~5030). Statt das ganze
-# Health-Modul ans Anfang zu verlagern: hier nachträglich registrieren.
-# Tool-Konsistenz-Check in main() läuft zur Boot-Zeit NACH diesem Punkt → ✓.
-TOOL_HANDLERS["apply_health_action"] = apply_health_action
+# apply_health_action ist KEIN LLM-Tool mehr — wird via _detect_pending_reply_intent
+# in handle_text direkt gerufen. Funktion selbst bleibt für diesen Aufruf erhalten.
 
 
 def compute_briefing() -> str:
