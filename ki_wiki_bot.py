@@ -287,6 +287,73 @@ def ocr_image(image_path: Path) -> str:
         return ""
 
 
+def extract_docx_text(docx_path: Path) -> tuple:
+    """Extrahiert Text + Tabellen + Metadaten aus .docx via python-docx.
+
+    Tabellen werden als Markdown-Tabellen gerendert (für Volltext-Suche
+    + Lesbarkeit im .md-Wrapper).
+
+    Returns: (text, metadata_dict, paragraph_count)
+    metadata_dict hat title, author, subject (alle optional).
+    """
+    try:
+        import docx  # type: ignore  # python-docx
+    except ImportError:
+        return "(python-docx nicht installiert)", {}, 0
+
+    try:
+        doc = docx.Document(str(docx_path))
+
+        # Body: Paragraphs + Tabellen IN REIHENFOLGE der Doc-Struktur.
+        # docx hat doc.paragraphs und doc.tables separat — Reihenfolge geht
+        # verloren wenn man sie einzeln iteriert. Lösung: über doc.element.body.
+        from docx.oxml.ns import qn  # type: ignore
+        text_parts = []
+        body = doc.element.body
+        for child in body.iterchildren():
+            tag = child.tag
+            if tag == qn("w:p"):  # Paragraph
+                # Text-Inhalt sammeln (alle text-runs)
+                runs = child.findall(".//" + qn("w:t"))
+                line = "".join(r.text or "" for r in runs).strip()
+                if line:
+                    text_parts.append(line)
+            elif tag == qn("w:tbl"):  # Tabelle
+                # Markdown-Tabelle bauen
+                rows_text = []
+                for row in child.findall(qn("w:tr")):
+                    cells = []
+                    for cell in row.findall(qn("w:tc")):
+                        cell_runs = cell.findall(".//" + qn("w:t"))
+                        cell_text = "".join(r.text or "" for r in cell_runs).strip()
+                        # Pipes in Zellen escapen
+                        cells.append(cell_text.replace("|", "\\|").replace("\n", " "))
+                    rows_text.append(cells)
+                if rows_text:
+                    n_cols = max(len(r) for r in rows_text)
+                    rows_text = [r + [""] * (n_cols - len(r)) for r in rows_text]
+                    md_table = ["| " + " | ".join(rows_text[0]) + " |",
+                                "|" + "|".join(["---"] * n_cols) + "|"]
+                    for r in rows_text[1:]:
+                        md_table.append("| " + " | ".join(r) + " |")
+                    text_parts.append("\n" + "\n".join(md_table) + "\n")
+
+        # Core-Metadaten
+        cp = doc.core_properties
+        meta = {
+            "title": (cp.title or "").strip(),
+            "author": (cp.author or "").strip(),
+            "subject": (cp.subject or "").strip(),
+        }
+        para_count = sum(1 for c in body.iterchildren() if c.tag == qn("w:p"))
+
+        text = "\n\n".join(text_parts).strip()
+        return (text or "(kein Text extrahiert)", meta, para_count)
+    except Exception as e:
+        log.exception(f"DOCX extract failed for {docx_path}")
+        return f"(Extraktions-Fehler: {e})", {}, 0
+
+
 def extract_pdf_text(pdf_path: Path, max_pages: int = 200) -> tuple:
     """Extrahiert Text + Metadaten aus PDF via pymupdf.
 
@@ -4555,6 +4622,9 @@ def _save_uploaded_doc(tmp_path: str, filename: str) -> tuple[Path, str, str]:
     elif ext == ".pdf":
         dest_dir = VAULT / "01_Raw" / "papers"
         kind = "PDF"
+    elif ext == ".docx":
+        dest_dir = VAULT / "01_Raw" / "uploads"
+        kind = "Word-Dokument"
     else:
         dest_dir = VAULT / "09_Attachments"
         kind = "Datei"
@@ -4616,12 +4686,57 @@ def _create_pdf_wrapper(dest: Path, filename: str) -> tuple[Path, str, str, int]
     return md_path, md_id, pdf_text or "", total_pages
 
 
+def _create_docx_wrapper(dest: Path, filename: str) -> tuple[Path, str, str, int]:
+    """DOCX-Sibling als .md anlegen (volltext-suchbar via vault_search).
+
+    Analog zu _create_pdf_wrapper. Tabellen werden als Markdown
+    gerendert (in extract_docx_text). type='document' im Frontmatter.
+
+    Returns: (md_path, md_id, docx_text, paragraph_count).
+    """
+    docx_text, docx_meta, para_count = extract_docx_text(dest)
+    docx_title = docx_meta.get("title") or Path(filename).stem
+    docx_author = docx_meta.get("author") or "unknown"
+
+    md_path = dest.with_suffix(".md")
+    n = 1
+    while md_path.exists():
+        md_path = dest.with_name(f"{dest.stem}-{n}.md")
+        n += 1
+
+    md_id = slugify(f"doc-{docx_title}")
+    md_body = (
+        f"# {docx_title}\n\n"
+        f"📎 [Original DOCX: {dest.name}](./{dest.name})\n\n"
+        f"**Autor**: {docx_author} · **Absätze**: {para_count}"
+        + (f" · **Subject**: {docx_meta['subject']}" if docx_meta.get('subject') else "")
+        + "\n\n---\n\n"
+        + (docx_text or "(Text-Extraktion ergab keinen Inhalt)")
+    )
+    md_post = frontmatter.Post(
+        md_body,
+        id=md_id,
+        title=docx_title,
+        type="document",
+        source=str(dest.relative_to(VAULT)),
+        author=docx_author,
+        captured=today_iso(),
+        paragraphs=para_count,
+        tags=[],
+    )
+    atomic_write(md_path, frontmatter.dumps(md_post) + "\n")
+    return md_path, md_id, docx_text or "", para_count
+
+
 def _record_upload_in_daily(rel: Path, wrapper_link: Optional[Path],
-                            md_id: Optional[str], user_caption: str) -> None:
+                            md_id: Optional[str], user_caption: str,
+                            kind: str = "Datei") -> None:
     """Eintrag in heutige Daily ('Notizen & Gedanken'-Sektion). Failures werden geloggt."""
     try:
         if wrapper_link and md_id:
-            link_text = f"📄 PDF hochgeladen: <code>{rel}</code> → durchsuchbar als [[{md_id}]]"
+            # Format-spezifisches Emoji
+            emoji = {"PDF": "📑", "Word-Dokument": "📝"}.get(kind, "📄")
+            link_text = f"{emoji} {kind} hochgeladen: <code>{rel}</code> → durchsuchbar als [[{md_id}]]"
         else:
             link_text = f"📄 Datei hochgeladen: <code>{rel}</code>"
         if user_caption:
@@ -4637,7 +4752,7 @@ def _build_upload_event_msg(filename: str, kind: str, rel: Path,
     """Baut die Upload-Event-Message für die LLM-History."""
     msg = f"[Upload-Event] User hat Datei \"{filename}\" hochgeladen ({kind}), gespeichert als `{rel}`."
     if wrapper_link and md_id:
-        msg += f" PDF-Wrapper: `{wrapper_link}` (id: `{md_id}`)."
+        msg += f" Wrapper: `{wrapper_link}` (id: `{md_id}`)."
     if body_preview:
         msg += f"\nInhalts-Auszug:\n{body_preview[:400]}"
     return msg
@@ -4672,24 +4787,33 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         tmp_path = None  # ownership transferred → kein cleanup mehr nötig
         rel = dest.relative_to(VAULT)
 
-        # 3. PDF-Sonderfall: .md-Wrapper für Volltext-Suche
-        wrapper_link, md_id, pdf_extra = None, None, ""
-        if dest.suffix.lower() == ".pdf":
+        # 3. Format-spezifischer Wrapper für Volltext-Suche
+        wrapper_link, md_id, extra_html = None, None, ""
+        ext_lower = dest.suffix.lower()
+        if ext_lower == ".pdf":
             await update.message.chat.send_action(constants.ChatAction.TYPING)
             md_path, md_id, pdf_text, total_pages = await asyncio.to_thread(
                 _create_pdf_wrapper, dest, filename
             )
             wrapper_link = md_path.relative_to(VAULT)
             body_preview = pdf_text[:1500] if pdf_text else ""
-            pdf_extra = f"\n📑 Wrapper: <code>{wrapper_link}</code> ({total_pages} S., id <code>{md_id}</code>)"
+            extra_html = f"\n📑 Wrapper: <code>{wrapper_link}</code> ({total_pages} S., id <code>{md_id}</code>)"
+        elif ext_lower == ".docx":
+            await update.message.chat.send_action(constants.ChatAction.TYPING)
+            md_path, md_id, docx_text, para_count = await asyncio.to_thread(
+                _create_docx_wrapper, dest, filename
+            )
+            wrapper_link = md_path.relative_to(VAULT)
+            body_preview = docx_text[:1500] if docx_text else ""
+            extra_html = f"\n📝 Wrapper: <code>{wrapper_link}</code> ({para_count} Absätze, id <code>{md_id}</code>)"
 
         # 4. Daily-Eintrag (sync, schnell)
-        _record_upload_in_daily(rel, wrapper_link, md_id, user_caption)
+        _record_upload_in_daily(rel, wrapper_link, md_id, user_caption, kind=kind)
 
         # 5. Antwort an User (kompakter falls Caption — LLM antwortet danach detailliert)
         reply = f"📄 <b>{kind}</b> gespeichert: <code>{rel}</code>"
-        if pdf_extra:
-            reply += pdf_extra
+        if extra_html:
+            reply += extra_html
         if body_preview and not user_caption:
             reply += f"\n\n<b>Inhalt (Vorschau):</b>\n<pre><code>{_esc_html(body_preview[:600])}</code></pre>"
         await update.message.reply_text(reply, parse_mode=constants.ParseMode.HTML)
@@ -6066,6 +6190,7 @@ async def handle_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "🖼 Foto → in 09_Attachments + Vision-Caption + OCR (Tesseract de+en)\n"
         "📄 .md/.txt → in 01_Raw/uploads/\n"
         "📑 .pdf → in 01_Raw/papers/ + Volltext-Extraktion + .md-Wrapper für Suche\n"
+        "📝 .docx → in 01_Raw/uploads/ + Text+Tabellen-Extraktion + .md-Wrapper\n"
         "📎 sonstige Files → in 09_Attachments\n"
         "🔗 URL allein → fragt ob clippen\n\n"
         "<b>Commands:</b>\n"
