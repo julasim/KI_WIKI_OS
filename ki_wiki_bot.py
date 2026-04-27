@@ -4010,9 +4010,116 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Photo-Fehler: {e}")
 
 
+# ─── Document-Upload-Helpers ────────────────────────────────────────────────
+# handle_document war 155 LOC, machte Download + Speichern + PDF-Wrap +
+# Daily-Eintrag + Reply + History + Caption-Routing in einer Funktion.
+# Aufgespalten in drei sync Helper + dünner async Orchestrator.
+
+def _save_uploaded_doc(tmp_path: str, filename: str) -> tuple[Path, str, str]:
+    """Verschiebt tmp-Datei in passenden Vault-Ordner, liefert (dest, kind, preview).
+
+    kind: 'Text/Markdown' / 'PDF' / 'Datei'
+    preview: erste 1500 Zeichen bei .md/.txt, sonst leer.
+    """
+    ext = Path(filename).suffix.lower()
+    if ext in (".md", ".markdown", ".txt"):
+        dest_dir = VAULT / "01_Raw" / "uploads"
+        kind = "Text/Markdown"
+    elif ext == ".pdf":
+        dest_dir = VAULT / "01_Raw" / "papers"
+        kind = "PDF"
+    else:
+        dest_dir = VAULT / "09_Attachments"
+        kind = "Datei"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    # Konflikt-Handling: Suffix-Counter
+    dest = dest_dir / filename
+    counter = 1
+    while dest.exists():
+        dest = dest_dir / f"{Path(filename).stem}-{counter}{ext}"
+        counter += 1
+    shutil.move(tmp_path, dest)
+
+    body_preview = ""
+    if ext in (".md", ".markdown", ".txt"):
+        try:
+            body_preview = dest.read_text(encoding="utf-8", errors="replace")[:1500]
+        except Exception:
+            body_preview = "(Inhalt nicht lesbar)"
+    return dest, kind, body_preview
+
+
+def _create_pdf_wrapper(dest: Path, filename: str) -> tuple[Path, str, str, int]:
+    """PDF-Sibling als .md anlegen (volltext-suchbar via vault_search).
+
+    Returns: (md_path, md_id, pdf_text, total_pages).
+    """
+    pdf_text, pdf_meta, total_pages = extract_pdf_text(dest)
+    pdf_title = pdf_meta.get("title") or Path(filename).stem
+    pdf_author = pdf_meta.get("author") or "unknown"
+
+    md_path = dest.with_suffix(".md")
+    n = 1
+    while md_path.exists():
+        md_path = dest.with_name(f"{dest.stem}-{n}.md")
+        n += 1
+
+    md_id = slugify(f"paper-{pdf_title}")
+    md_body = (
+        f"# {pdf_title}\n\n"
+        f"📎 [Original PDF: {dest.name}](./{dest.name})\n\n"
+        f"**Autor**: {pdf_author} · **Seiten**: {total_pages}"
+        + (f" · **Subject**: {pdf_meta['subject']}" if pdf_meta.get('subject') else "")
+        + "\n\n---\n\n"
+        + (pdf_text or "(Text-Extraktion ergab keinen Inhalt)")
+    )
+    md_post = frontmatter.Post(
+        md_body,
+        id=md_id,
+        title=pdf_title,
+        type="paper",
+        source=str(dest.relative_to(VAULT)),
+        author=pdf_author,
+        captured=today_iso(),
+        pages=total_pages,
+        tags=[],
+    )
+    atomic_write(md_path, frontmatter.dumps(md_post) + "\n")
+    return md_path, md_id, pdf_text or "", total_pages
+
+
+def _record_upload_in_daily(rel: Path, wrapper_link: Optional[Path],
+                            md_id: Optional[str], user_caption: str) -> None:
+    """Eintrag in heutige Daily ('Notizen & Gedanken'-Sektion). Failures werden geloggt."""
+    try:
+        if wrapper_link and md_id:
+            link_text = f"📄 PDF hochgeladen: <code>{rel}</code> → durchsuchbar als [[{md_id}]]"
+        else:
+            link_text = f"📄 Datei hochgeladen: <code>{rel}</code>"
+        if user_caption:
+            link_text += f" — {user_caption}"
+        append_to_daily("Notizen & Gedanken", link_text)
+    except Exception as e:
+        log.warning(f"Daily-Link fuer Document fehlgeschlagen: {e}")
+
+
+def _build_upload_event_msg(filename: str, kind: str, rel: Path,
+                            wrapper_link: Optional[Path], md_id: Optional[str],
+                            body_preview: str) -> str:
+    """Baut die Upload-Event-Message für die LLM-History."""
+    msg = f"[Upload-Event] User hat Datei \"{filename}\" hochgeladen ({kind}), gespeichert als `{rel}`."
+    if wrapper_link and md_id:
+        msg += f" PDF-Wrapper: `{wrapper_link}` (id: `{md_id}`)."
+    if body_preview:
+        msg += f"\nInhalts-Auszug:\n{body_preview[:400]}"
+    return msg
+
+
 @require_auth
 async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Datei-Upload (.md, .txt, .pdf, oder beliebige Binärdatei) ins Vault speichern."""
+    """Datei-Upload ins Vault speichern. Orchestriert Download → Save → ggf
+    PDF-Wrap → Daily-Eintrag → Reply → History → Caption-an-LLM-Routing."""
     doc = update.message.document
     if not doc:
         return
@@ -4022,7 +4129,7 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     tmp_path = None
     try:
-        # Download
+        # 1. Download nach tmp
         file = await doc.get_file()
         suffix = Path(doc.file_name or "upload").suffix
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
@@ -4030,126 +4137,47 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await file.download_to_drive(tmp_path)
 
         filename = doc.file_name or f"upload-{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        ext = Path(filename).suffix.lower()
 
-        # Ziel-Verzeichnis nach Typ
-        if ext in (".md", ".markdown", ".txt"):
-            dest_dir = VAULT / "01_Raw" / "uploads"
-            kind = "Text/Markdown"
-        elif ext in (".pdf",):
-            dest_dir = VAULT / "01_Raw" / "papers"
-            kind = "PDF"
-        else:
-            dest_dir = VAULT / "09_Attachments"
-            kind = "Datei"
-
-        dest_dir.mkdir(parents=True, exist_ok=True)
-
-        # Konflikt-handling: bei Duplikat Suffix
-        dest = dest_dir / filename
-        counter = 1
-        while dest.exists():
-            stem = Path(filename).stem
-            dest = dest_dir / f"{stem}-{counter}{ext}"
-            counter += 1
-
-        shutil.move(tmp_path, dest)
-        tmp_path = None  # nicht mehr cleanup-pflichtig
+        # 2. In Vault verschieben (sync, schnell)
+        dest, kind, body_preview = await asyncio.to_thread(
+            _save_uploaded_doc, tmp_path, filename
+        )
+        tmp_path = None  # ownership transferred → kein cleanup mehr nötig
         rel = dest.relative_to(VAULT)
 
-        # Bei Text-Files: Inhalt lesen für Echo
-        body_preview = ""
-        if ext in (".md", ".markdown", ".txt"):
-            try:
-                content = dest.read_text(encoding="utf-8", errors="replace")
-                body_preview = content[:1500]
-            except Exception:
-                body_preview = "(Inhalt nicht lesbar)"
-
-        # PDF-Sonderfall: Text extrahieren + .md-Wrapper anlegen
-        wrapper_link = None
-        pdf_extra = ""
-        if ext == ".pdf":
+        # 3. PDF-Sonderfall: .md-Wrapper für Volltext-Suche
+        wrapper_link, md_id, pdf_extra = None, None, ""
+        if dest.suffix.lower() == ".pdf":
             await update.message.chat.send_action(constants.ChatAction.TYPING)
-            pdf_text, pdf_meta, total_pages = await asyncio.to_thread(extract_pdf_text, dest)
-            pdf_title = pdf_meta.get("title") or Path(filename).stem
-            pdf_author = pdf_meta.get("author") or "unknown"
-
-            # .md-Sibling anlegen → wird volltext-suchbar via vault_search.py
-            md_path = dest.with_suffix(".md")
-            n = 1
-            while md_path.exists():
-                md_path = dest.with_name(f"{dest.stem}-{n}.md")
-                n += 1
-
-            md_id = slugify(f"paper-{pdf_title}")
-            md_body = (
-                f"# {pdf_title}\n\n"
-                f"📎 [Original PDF: {dest.name}](./{dest.name})\n\n"
-                f"**Autor**: {pdf_author} · **Seiten**: {total_pages}"
-                + (f" · **Subject**: {pdf_meta['subject']}" if pdf_meta.get('subject') else "")
-                + "\n\n---\n\n"
-                + (pdf_text or "(Text-Extraktion ergab keinen Inhalt)")
+            md_path, md_id, pdf_text, total_pages = await asyncio.to_thread(
+                _create_pdf_wrapper, dest, filename
             )
-            md_post = frontmatter.Post(
-                md_body,
-                id=md_id,
-                title=pdf_title,
-                type="paper",
-                source=str(dest.relative_to(VAULT)),
-                author=pdf_author,
-                captured=today_iso(),
-                pages=total_pages,
-                tags=[],
-            )
-            atomic_write(md_path, frontmatter.dumps(md_post) + "\n")
-
             wrapper_link = md_path.relative_to(VAULT)
             body_preview = pdf_text[:1500] if pdf_text else ""
             pdf_extra = f"\n📑 Wrapper: <code>{wrapper_link}</code> ({total_pages} S., id <code>{md_id}</code>)"
 
-        # Eintrag in heutige Daily
-        try:
-            if wrapper_link:
-                link_text = f"📄 PDF hochgeladen: <code>{rel}</code> → durchsuchbar als [[{md_id}]]"
-            else:
-                link_text = f"📄 Datei hochgeladen: <code>{rel}</code>"
-            if user_caption:
-                link_text += f" — {user_caption}"
-            append_to_daily("Notizen & Gedanken", link_text)
-        except Exception as e:
-            log.warning(f"Daily-Link fuer Document fehlgeschlagen: {e}")
+        # 4. Daily-Eintrag (sync, schnell)
+        _record_upload_in_daily(rel, wrapper_link, md_id, user_caption)
 
-        # Antwort an User (kompakter wenn Caption vorhanden — LLM antwortet danach)
+        # 5. Antwort an User (kompakter falls Caption — LLM antwortet danach detailliert)
         reply = f"📄 <b>{kind}</b> gespeichert: <code>{rel}</code>"
         if pdf_extra:
             reply += pdf_extra
         if body_preview and not user_caption:
-            preview_html = _esc_html(body_preview[:600])
-            reply += f"\n\n<b>Inhalt (Vorschau):</b>\n<pre><code>{preview_html}</code></pre>"
+            reply += f"\n\n<b>Inhalt (Vorschau):</b>\n<pre><code>{_esc_html(body_preview[:600])}</code></pre>"
         await update.message.reply_text(reply, parse_mode=constants.ParseMode.HTML)
 
-        # ─── Upload-Event in LLM-History injizieren ───
-        # So weiß das LLM bei späteren Anfragen ("lege das als Projekt an")
-        # was kürzlich hochgeladen wurde.
+        # 6. Upload-Event in LLM-History (für spätere "lege als Projekt an"-Anfragen)
         try:
-            history_msg = (
-                f"[Upload-Event] User hat Datei \"{filename}\" hochgeladen "
-                f"({kind}), gespeichert als `{rel}`."
-            )
-            if wrapper_link:
-                history_msg += f" PDF-Wrapper: `{wrapper_link}` (id: `{md_id}`)."
-            if body_preview:
-                history_msg += f"\nInhalts-Auszug:\n{body_preview[:400]}"
+            history_msg = _build_upload_event_msg(filename, kind, rel, wrapper_link, md_id, body_preview)
             await update_history(update.effective_user.id, [
                 {"role": "user", "content": history_msg}
             ])
         except Exception as e:
             log.warning(f"Upload-Event nicht in History: {e}")
 
-        # ─── Wenn Caption vorhanden: als Anweisung an LLM weiterreichen ───
-        # Damit "Lege als Projekt an"-artige Captions auch wirklich ausgeführt werden.
-        if user_caption and user_caption.strip():
+        # 7. Caption als LLM-Anweisung weiterreichen ("Lege als Projekt an" etc.)
+        if user_caption.strip():
             await update.message.chat.send_action(constants.ChatAction.TYPING)
             try:
                 llm_reply = await llm_loop(user_caption.strip(), update.effective_user.id)
@@ -4163,8 +4191,10 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Document-Fehler: {e}")
     finally:
         if tmp_path:
-            try: os.unlink(tmp_path)
-            except Exception: pass
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
 
 
 def compute_briefing() -> str:
