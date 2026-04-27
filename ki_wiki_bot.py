@@ -100,6 +100,31 @@ logging.basicConfig(
 )
 log = logging.getLogger("ki_wiki_bot")
 
+
+# ─── Log-Sanitization: TG_TOKEN aus HTTPX-INFO-Logs maskieren ───────────────
+# python-telegram-bot embeddet den Token in die HTTP-URL. httpx loggt URLs
+# bei INFO-Level → Token leakt in Log-Files / Container-Output / Bug-Reports.
+# Filter wandelt /bot<TOKEN>/method → /bot[REDACTED]/method.
+class _TokenMaskingFilter(logging.Filter):
+    _TG_TOKEN_RE = re.compile(r"/bot\d{7,15}:[A-Za-z0-9_\-]{30,}/")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+            if "/bot" in msg:
+                masked = self._TG_TOKEN_RE.sub("/bot[REDACTED]/", msg)
+                if masked != msg:
+                    record.msg = masked
+                    record.args = ()
+        except Exception:
+            pass
+        return True
+
+
+# Auf root-Handler hängen → fängt alle Logger inkl. httpx + telegram.ext
+for _h in logging.getLogger().handlers:
+    _h.addFilter(_TokenMaskingFilter())
+
 # ============================================================================
 # LLM client (OpenRouter, OpenAI-API-kompatibel)
 # ============================================================================
