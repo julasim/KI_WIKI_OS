@@ -3155,6 +3155,20 @@ TOOLS = [
         },
     }},
     {"type": "function", "function": {
+        "name": "apply_health_action",
+        "description": (
+            "Verarbeitet User-Antwort auf pending Vault-Health-Aktionen (aus dem nightly "
+            "Health-Job 02:00). Triggers: 'health 1', 'health alle', 'health 0', oder einfach "
+            "'1 2' wenn pending-health-actions.json existiert UND Briefing zeigte Vault-Pflege-Sektion. "
+            "Action-Formate: '1 2' (Aktionen 1+2 ausführen), 'alle'/'ja', '0'/'nein' (skip alle)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"action": {"type": "string"}},
+            "required": ["action"],
+        },
+    }},
+    {"type": "function", "function": {
         "name": "log_correction",
         "description": (
             "Speichert eine Korrektur in corrections.jsonl. RUFE DAS AUF wenn der "
@@ -3377,6 +3391,7 @@ TOOL_HANDLERS = {
     "update_project_context": update_project_context,
     "log_correction": log_correction,
     "apply_memory_suggestion": apply_memory_suggestion,
+    "apply_health_action": apply_health_action,
     "create_project": create_project,
     "create_reminder": create_reminder,
     "list_reminders": list_reminders,
@@ -3477,6 +3492,11 @@ Drei Memory-Typen (alle automatisch im System-Prompt eingespeist):
 Jede Nacht schickt ein Job nummerierte Vorschläge (1./2./3./...). User-Antwort-Patterns:
 - "1 3" / "1,3" — Auswahl · "alle" / "ja" — alle · "0" / "nein" — verwerfen · "erkläre 2" — Detail
 → SOFORT `apply_memory_suggestion(action)` mit EXAKTEM User-String. Auch bei sehr kurzen Antworten (nur Zahlen) — NICHT als Task-Index missverstehen. Disambiguierung: wenn `pending-suggestions.json` existiert UND letzte Konversation enthielt das Briefing → es ist eine Memory-Antwort.
+
+# VAULT-HEALTH-AKTIONEN — KRITISCHER TRIGGER
+Jede Nacht 02:00 läuft ein Health-Check. Auto-Fixes (Frontmatter, Tags, alte Done-Tasks, Tag-Konsolidierung, etc.) passieren still. Wenn pending Approvals offen sind, taucht im Briefing eine "🔧 Vault-Pflege"-Sektion mit nummerierten Aktionen auf. User-Antwort-Patterns:
+- "health 1" / "health 1 2" — Aktionen ausführen · "health alle" — alle · "health 0" / "health nein" — alles skippen
+→ SOFORT `apply_health_action(action)` mit dem User-String (das "health"-Präfix darf bleiben oder weg). Disambiguierung gegen Memory-Antworten: wenn Antwort mit "health" beginnt ODER `pending-health-actions.json` existiert UND `pending-suggestions.json` NICHT existiert → Health-Antwort.
 
 # AUTO-TAGGING
 Bei `create_task/note/meeting`: 2-5 thematische Tags via `tags`-Parameter (kebab-case Deutsch, z.B. `gesundheit`, `kunde-mueller`). TOPISCH, nicht strukturell (NICHT `task`/`note`). Bei vage Kontext lieber `[]` als schlechte Tags. Optional vorher `list_existing_tags` für Vokabular-Konsistenz.
@@ -4197,6 +4217,946 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 pass
 
 
+# ============================================================================
+# Vault Health-Check (nightly 02:00)
+# ============================================================================
+# Dreischichtig:
+#   1. CHECKS         — read-only, immer (10 Items, in collect_health_data)
+#   2. AUTO-FIX       — silent ohne Approval (10 Items, ab Tag 4)
+#   3. PROPOSALS      — User-Approval (3 Items: Inbox-Triage, Broken-Links,
+#                       Recurring-stuck) — analog zu nightly_suggestion_job
+
+HEALTH_REPORTS_DIR = VAULT / "06_Meta" / "health-reports"
+TAG_ALIASES_FILE = VAULT / "06_Meta" / "tag-aliases.json"
+PENDING_HEALTH_ACTIONS_FILE = VAULT / "06_Meta" / "pending-health-actions.json"
+
+HEALTH_FIRST_RUN_GRACE_DAYS = 3       # 3 Tage Report-only, ab Tag 4 Auto-Fix
+HEALTH_DONE_TASK_AGE_DAYS = 30        # Done-Tasks >30d → archivieren
+HEALTH_STALE_INBOX_DAYS = 7           # Inbox-Files >7d → Proposal
+HEALTH_RECURRING_STUCK_DAYS = 14      # Recurring nicht aktiviert >14d → Proposal
+HEALTH_TAG_TYPO_LEVENSHTEIN = 1       # Schwelle für Tippfehler-Cluster
+HEALTH_TAG_MAJORITY_RATIO = 5         # 5:1-Verhältnis für Stufe-C-Konsolidierung
+
+# Auto-Fix darf NUR in diesen Pfaden Files mutieren (außer Lint-Fixes die
+# überall passieren können — die sind Frontmatter-Hygiene und immer sicher)
+HEALTH_AUTO_LINK_DIRS = (LIFE,)        # Auto-Linking nur in 10_Life/
+
+# Auto-Fix-Codes für Reports + Approval-Identifizierung
+FIX_TAGS_EMPTY = "tags-empty"
+FIX_UPDATED_DATE = "updated-date"
+FIX_MISSING_ID = "missing-id"
+FIX_KEBAB_ID = "kebab-id"
+FIX_DATE_FORMAT = "date-iso"
+FIX_FRONTMATTER_ORDER = "fm-order"
+FIX_EMPTY_DAILY = "empty-daily"
+FIX_AUTO_LINK = "auto-link"
+FIX_DONE_ARCHIVE = "done-archive"
+FIX_TAG_CONSOLIDATE = "tag-consolidate"
+
+
+def _levenshtein(a: str, b: str) -> int:
+    """Standard Levenshtein-Distanz (case-insensitive Vergleich erfordert pre-lower)."""
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    m, n = len(a) + 1, len(b) + 1
+    cur = list(range(n))
+    for i in range(1, m):
+        prev, cur = cur, [i] + [0] * (n - 1)
+        for j in range(1, n):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+    return cur[-1]
+
+
+def _is_health_first_run() -> bool:
+    """True während der ersten N Tage nach erstem Lauf — Auto-Fix dann disabled.
+
+    Verhindert "alles auf einmal verschwindet"-Schock beim ersten Health-Lauf.
+    """
+    if not HEALTH_REPORTS_DIR.exists():
+        return True
+    reports = sorted(HEALTH_REPORTS_DIR.glob("*.md"))
+    return len(reports) < HEALTH_FIRST_RUN_GRACE_DAYS
+
+
+def _load_tag_aliases() -> dict:
+    """Liest 06_Meta/tag-aliases.json (Format: {"alt": "neu"})."""
+    if not TAG_ALIASES_FILE.exists():
+        return {}
+    try:
+        return json.loads(TAG_ALIASES_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        log.warning(f"tag-aliases.json korrupt: {e}")
+        return {}
+
+
+def collect_health_data() -> dict:
+    """Single Source: alle Vault-Health-Probleme erkennen (read-only).
+
+    Walks alle .md-Files EINMAL und sammelt parallel alle 10 Check-Ergebnisse.
+    Returns dict mit Issue-Listen je Kategorie.
+    """
+    today = datetime.now(TIMEZONE).date()
+    today_str = today.strftime("%Y-%m-%d")
+
+    # Sammelbuckets
+    lint_issues = []           # (rel_path, problem)
+    broken_links = []          # (rel_path, target)
+    orphans = []               # rel_path (Wiki-Files ohne Backlinks)
+    duplicate_ids = []         # (id, [rel_paths])
+    daily_gaps = []            # ISO-Date-Strings (Werktage ohne Daily)
+    stale_inbox = []           # (rel_path, age_days)
+    stale_uploads = []         # rel_path (uploads ohne Wrapper-Bezug)
+    done_old_tasks = []        # task-Dicts (status=done, >30d, nicht-recurring)
+    recurring_stuck = []       # task-Dicts (recurring, last_completed > 2× Periode her)
+    tag_clusters = []          # (canonical, [variants_with_counts])
+
+    # Walk: alle non-noise .md mit Frontmatter
+    all_notes = []  # [(path, post)]
+    id_to_paths: dict = {}  # für duplicate-detection
+    backlinks_count: dict = {}  # id → count
+    all_tags: dict = {}  # tag → count
+
+    for path, post in iter_vault_md():
+        all_notes.append((path, post))
+        meta = post.metadata
+        rel = path.relative_to(VAULT).as_posix()
+
+        # ── Check 1: Schema-Lint (Pflichtfelder, Type-Folder-Konformität) ──
+        if not meta:
+            lint_issues.append((rel, "kein Frontmatter"))
+            continue
+        t = meta.get("type")
+        if not t:
+            lint_issues.append((rel, "type fehlt"))
+            continue
+
+        # ── Check 7: Doppel-IDs sammeln ──
+        fid = meta.get("id")
+        if fid and isinstance(fid, str):
+            id_to_paths.setdefault(fid, []).append(rel)
+
+        # ── Check 6: Tag-Counter füllen ──
+        tags = meta.get("tags") or []
+        if isinstance(tags, list):
+            for tg in tags:
+                if isinstance(tg, str) and tg.strip():
+                    all_tags[tg.strip().lower()] = all_tags.get(tg.strip().lower(), 0) + 1
+
+        # ── Wikilinks für Broken-Link + Orphan-Check ──
+        body = post.content or ""
+        # Code-Spans + already-wikilinks rausfiltern
+        body_clean = re.sub(r"```.*?```", "", body, flags=re.DOTALL)
+        body_clean = re.sub(r"`[^`\n]+`", "", body_clean)
+        for m in re.finditer(r"\[\[([^\]|#]+?)(?:\|[^\]]*)?\]\]", body_clean):
+            target = m.group(1).strip()
+            backlinks_count[target] = backlinks_count.get(target, 0) + 1
+
+    # ── Check 2: Broken Wikilinks (Pass 2 nach komplettem Walk) ──
+    all_ids = {p.metadata.get("id") for _, p in all_notes if p.metadata.get("id")}
+    for path, post in all_notes:
+        body = post.content or ""
+        body_clean = re.sub(r"```.*?```", "", body, flags=re.DOTALL)
+        body_clean = re.sub(r"`[^`\n]+`", "", body_clean)
+        rel = path.relative_to(VAULT).as_posix()
+        for m in re.finditer(r"\[\[([^\]|#]+?)(?:\|[^\]]*)?\]\]", body_clean):
+            target = m.group(1).strip()
+            if target not in all_ids:
+                broken_links.append((rel, target))
+
+    # ── Check 3: Orphans (Wiki-Files ohne incoming Backlinks) ──
+    for path, post in all_notes:
+        meta = post.metadata
+        t = meta.get("type", "")
+        # Nur Wiki-Typen: andere haben legitim oft keine Backlinks
+        if t not in ("concept", "topic", "person", "organization", "tool", "method", "glossary"):
+            continue
+        fid = meta.get("id")
+        if fid and backlinks_count.get(fid, 0) == 0:
+            orphans.append(path.relative_to(VAULT).as_posix())
+
+    # ── Check 7: Duplicate IDs ──
+    for fid, paths in id_to_paths.items():
+        if len(paths) > 1:
+            duplicate_ids.append((fid, paths))
+
+    # ── Check 4: Daily-Gaps (Werktage der letzten 7 Tage ohne Daily) ──
+    for delta in range(1, 8):  # gestern bis vor 7 Tagen
+        d = today - timedelta(days=delta)
+        if d.weekday() >= 5:  # Samstag/Sonntag → kein Werktag, kein Gap
+            continue
+        daily_path = DAILY_DIR / f"{d.isoformat()}.md"
+        if not daily_path.exists():
+            daily_gaps.append(d.isoformat())
+
+    # ── Check 5: Stale Inbox ──
+    inbox_dir = VAULT / "00_Inbox"
+    if inbox_dir.exists():
+        for f in inbox_dir.iterdir():
+            if not f.is_file() or f.name.startswith("."):
+                continue
+            try:
+                mtime = datetime.fromtimestamp(f.stat().st_mtime, TIMEZONE).date()
+                age_days = (today - mtime).days
+                if age_days > HEALTH_STALE_INBOX_DAYS:
+                    stale_inbox.append((f.relative_to(VAULT).as_posix(), age_days))
+            except Exception:
+                continue
+
+    # ── Check: Stale Uploads (PDFs ohne .md-Wrapper-Sibling) ──
+    uploads_dir = VAULT / "01_Raw" / "uploads"
+    if uploads_dir.exists():
+        for f in uploads_dir.glob("*.pdf"):
+            md_sibling = f.with_suffix(".md")
+            if not md_sibling.exists():
+                stale_uploads.append(f.relative_to(VAULT).as_posix())
+
+    # ── Check 8: Done-Tasks >30d (nicht recurring) ──
+    cutoff_done = today - timedelta(days=HEALTH_DONE_TASK_AGE_DAYS)
+    for path, post in all_notes:
+        meta = post.metadata
+        if meta.get("type") != "task":
+            continue
+        if meta.get("status") != "done":
+            continue
+        if meta.get("recurrence"):  # recurring NIE auto-archivieren
+            continue
+        # Nutze last_completed wenn vorhanden, sonst updated
+        ref_date_raw = meta.get("last_completed") or meta.get("updated")
+        ref_date = _due_to_date(ref_date_raw)
+        if ref_date is None or ref_date > cutoff_done:
+            continue
+        done_old_tasks.append({
+            "path": path.relative_to(VAULT).as_posix(),
+            "id": meta.get("id", path.stem),
+            "title": meta.get("title", path.stem),
+            "ref_date": ref_date.isoformat(),
+            "age_days": (today - ref_date).days,
+        })
+
+    # ── Check 9: Recurring stuck (Task hat recurrence aber wurde lange nicht aktiviert) ──
+    for path, post in all_notes:
+        meta = post.metadata
+        if meta.get("type") != "task" or not meta.get("recurrence"):
+            continue
+        if meta.get("status") != "done":
+            continue  # nur done-Tasks die auf Reset warten
+        last = _due_to_date(meta.get("last_completed"))
+        if last is None:
+            continue  # noch nie done — unkritisch
+        days_since = (today - last).days
+        # Schwelle: 2× Pattern-Periode oder 14d minimum
+        rec = meta.get("recurrence")
+        threshold = {
+            "daily": 3,         # >3d nach done = stuck
+            "weekdays": 4,
+            "weekly": 14,       # >2 Wochen
+            "monthly": 60,      # >2 Monate
+        }.get(rec, HEALTH_RECURRING_STUCK_DAYS)
+        if days_since > threshold:
+            recurring_stuck.append({
+                "path": path.relative_to(VAULT).as_posix(),
+                "id": meta.get("id", path.stem),
+                "title": meta.get("title", path.stem),
+                "recurrence": rec,
+                "last_completed": last.isoformat(),
+                "days_since": days_since,
+            })
+
+    # ── Check 10: Tag-Drift (Cluster-Vorschläge) ──
+    aliases = _load_tag_aliases()
+    # Alias-Map auflösen: wenn 'work' in Aliases → wird zu aliases['work']
+    sorted_tags = sorted(all_tags.items(), key=lambda x: -x[1])  # häufigste zuerst
+    seen = set()
+    for tag, count in sorted_tags:
+        if tag in seen:
+            continue
+        cluster = [(tag, count)]
+        for other_tag, other_count in sorted_tags:
+            if other_tag == tag or other_tag in seen:
+                continue
+            # Stufe A: User-Alias
+            if aliases.get(other_tag) == tag:
+                cluster.append((other_tag, other_count))
+                continue
+            # Stufe B: Tippfehler (Levenshtein ≤ 1, kleinerer ist seltener)
+            if (_levenshtein(tag, other_tag) <= HEALTH_TAG_TYPO_LEVENSHTEIN
+                    and other_count <= 2 and count >= 3):
+                cluster.append((other_tag, other_count))
+                continue
+            # Stufe C: 5:1-Mehrheit (Plural/Singular oder DE/EN-Varianten)
+            if other_count >= 1 and count >= other_count * HEALTH_TAG_MAJORITY_RATIO:
+                # Heuristik: gemeinsame 4+ Anfangs-Buchstaben (Plural-Singular-Detektor)
+                # ODER explizites Alias
+                shared_prefix = sum(1 for x, y in zip(tag, other_tag) if x == y)
+                if shared_prefix >= 4 or aliases.get(other_tag) == tag:
+                    cluster.append((other_tag, other_count))
+        if len(cluster) > 1:
+            tag_clusters.append((tag, cluster))
+            seen.update(t for t, _ in cluster)
+
+    return {
+        "today": today,
+        "today_str": today_str,
+        "first_run": _is_health_first_run(),
+        "lint_issues": lint_issues,
+        "broken_links": broken_links,
+        "orphans": orphans,
+        "duplicate_ids": duplicate_ids,
+        "daily_gaps": daily_gaps,
+        "stale_inbox": stale_inbox,
+        "stale_uploads": stale_uploads,
+        "done_old_tasks": done_old_tasks,
+        "recurring_stuck": recurring_stuck,
+        "tag_clusters": tag_clusters,
+        "total_notes": len(all_notes),
+        "all_tags": all_tags,
+    }
+
+
+# ─── Auto-Fix-Funktionen ────────────────────────────────────────────────────
+# Jede gibt zurück: list[(fix_code, rel_path, beschreibung)]
+# Bei dry_run=True wird nichts geschrieben, nur die Liste zurückgegeben.
+
+# Welche Types haben tags als Pflichtfeld (siehe SCHEMA.md)
+REQUIRED_TYPES_WITH_TAGS = {
+    "concept", "topic", "person", "organization", "tool", "method",
+    "glossary", "timeline", "article", "paper", "repo", "video", "book",
+    "dataset", "summary", "report", "slides", "query", "project",
+    "daily", "task", "note", "meeting", "area",
+}
+
+
+def _autofix_frontmatter_hygiene(dry_run: bool) -> list:
+    """Sammelfix für Frontmatter-Kleinkram: tags=[] ergänzen, updated nachtragen,
+    id aus Filename ableiten, kebab-case, ISO-Date. Pro File ein Save."""
+    fixes = []
+    today_str = datetime.now(TIMEZONE).date().isoformat()
+    for path, post in iter_vault_md():
+        meta = post.metadata
+        if not meta:
+            continue
+        rel = path.relative_to(VAULT).as_posix()
+        changed = False
+
+        # Fix 1: tags=[] wenn Pflichtfeld fehlt
+        if "tags" not in meta and meta.get("type") in REQUIRED_TYPES_WITH_TAGS:
+            if not dry_run:
+                post["tags"] = []
+            fixes.append((FIX_TAGS_EMPTY, rel, "tags: [] ergänzt"))
+            changed = True
+
+        # Fix 2: id aus Filename ableiten
+        if "id" not in meta or not meta.get("id"):
+            derived = path.stem
+            # Bei Daily-Notes: id = "daily-YYYY-MM-DD"
+            if path.parent == DAILY_DIR:
+                derived = f"daily-{path.stem}"
+            if not dry_run:
+                post["id"] = derived
+            fixes.append((FIX_MISSING_ID, rel, f"id: {derived} (aus Filename)"))
+            changed = True
+
+        # Fix 3: ISO-Date-Format normalisieren (created/updated/date/captured)
+        for date_field in ("created", "updated", "date", "captured", "started", "due"):
+            v = meta.get(date_field)
+            if not isinstance(v, str):
+                continue
+            # Versuche zu normalisieren wenn nicht-ISO
+            if not re.match(r"^\d{4}-\d{2}-\d{2}$", v):
+                # Häufige Varianten: 2026/04/27, 27.04.2026, 27-04-2026
+                fixed = None
+                for fmt in ("%Y/%m/%d", "%d.%m.%Y", "%d-%m-%Y", "%Y.%m.%d"):
+                    try:
+                        fixed = datetime.strptime(v, fmt).date().isoformat()
+                        break
+                    except ValueError:
+                        continue
+                if fixed:
+                    if not dry_run:
+                        post[date_field] = fixed
+                    fixes.append((FIX_DATE_FORMAT, rel, f"{date_field}: {v} → {fixed}"))
+                    changed = True
+
+        # Fix 4: updated nachtragen wenn fehlt aber created vorhanden
+        if "updated" not in meta and meta.get("created"):
+            try:
+                mtime_iso = datetime.fromtimestamp(path.stat().st_mtime).date().isoformat()
+                if not dry_run:
+                    post["updated"] = mtime_iso
+                fixes.append((FIX_UPDATED_DATE, rel, f"updated: {mtime_iso} (aus mtime)"))
+                changed = True
+            except Exception:
+                pass
+
+        if changed and not dry_run:
+            try:
+                atomic_write(path, frontmatter.dumps(post) + "\n")
+            except Exception as e:
+                log.warning(f"autofix write failed for {rel}: {e}")
+    return fixes
+
+
+def _autofix_empty_dailies(dry_run: bool) -> list:
+    """Löscht Daily-Notes die nur Template-Platzhalter enthalten + älter als 7d sind."""
+    fixes = []
+    today = datetime.now(TIMEZONE).date()
+    cutoff = today - timedelta(days=7)
+    if not DAILY_DIR.exists():
+        return fixes
+    placeholder_lines = {
+        "- [ ]", "- [x]", "-", "•",
+        "- Was lief gut?", "- Was nehme ich mit?",
+    }
+    for path in DAILY_DIR.glob("*.md"):
+        try:
+            d = datetime.strptime(path.stem, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        if d > cutoff:
+            continue  # zu jung, nicht löschen
+        try:
+            post = frontmatter.load(path)
+            body = post.content or ""
+        except Exception:
+            continue
+        # Body ohne Headings + Whitespace prüfen
+        non_meta_lines = [
+            l.strip() for l in body.splitlines()
+            if l.strip() and not l.strip().startswith("#")
+        ]
+        meaningful = [l for l in non_meta_lines if l not in placeholder_lines]
+        if not meaningful:
+            rel = path.relative_to(VAULT).as_posix()
+            if not dry_run:
+                try:
+                    path.unlink()
+                except Exception as e:
+                    log.warning(f"empty-daily delete failed: {e}")
+                    continue
+            fixes.append((FIX_EMPTY_DAILY, rel, f"leere Daily ({d.isoformat()}) gelöscht"))
+    return fixes
+
+
+def _autofix_auto_link_existing(dry_run: bool) -> list:
+    """Geht durch 10_Life/notes/ + 10_Life/daily/ und linkt Klartext-Erwähnungen
+    zu mittlerweile existierenden IDs nach. Nur in 10_Life/ — Wiki + Projekte tabu.
+    """
+    fixes = []
+    pmap = _get_link_index()
+    if not pmap:
+        return fixes
+    for target_dir in (DAILY_DIR, NOTES_DIR):
+        if not target_dir.exists():
+            continue
+        for path, post in iter_vault_md(target_dir, recursive=False, skip_noise=False):
+            body = post.content or ""
+            # Eigene ID excluden um Self-Links zu vermeiden
+            self_id = post.metadata.get("id")
+            exclude = {self_id} if self_id else set()
+            new_body = auto_link(body, exclude_ids=exclude)
+            if new_body != body:
+                rel = path.relative_to(VAULT).as_posix()
+                # Differenz zählen für Reporting
+                added_links = new_body.count("[[") - body.count("[[")
+                if not dry_run:
+                    post.content = new_body
+                    try:
+                        atomic_write(path, frontmatter.dumps(post) + "\n")
+                    except Exception as e:
+                        log.warning(f"auto-link write failed: {e}")
+                        continue
+                fixes.append((FIX_AUTO_LINK, rel, f"{added_links} Wikilink(s) nachgetragen"))
+    return fixes
+
+
+def _autofix_archive_done_tasks(done_old_tasks: list, dry_run: bool) -> list:
+    """Verschiebt Done-Tasks (>30d, nicht-recurring) nach 99_Archive/10_Life/tasks/."""
+    fixes = []
+    if not done_old_tasks:
+        return fixes
+    archive_dir = VAULT / "99_Archive" / "10_Life" / "tasks"
+    today_str = datetime.now(TIMEZONE).date().isoformat()
+    if not dry_run:
+        archive_dir.mkdir(parents=True, exist_ok=True)
+    for t in done_old_tasks:
+        src = VAULT / t["path"]
+        if not src.exists():
+            continue
+        dst = archive_dir / src.name
+        n = 1
+        while dst.exists():
+            dst = archive_dir / f"{src.stem}-{n}{src.suffix}"
+            n += 1
+        if not dry_run:
+            try:
+                # Frontmatter-Update: archived-Datum hinzufügen
+                post = frontmatter.load(src)
+                post["archived"] = today_str
+                # Erst neue Frontmatter schreiben, dann verschieben
+                src.write_text(frontmatter.dumps(post) + "\n", encoding="utf-8")
+                shutil.move(str(src), str(dst))
+            except Exception as e:
+                log.warning(f"archive-done failed for {src.name}: {e}")
+                continue
+        fixes.append((FIX_DONE_ARCHIVE, t["path"],
+                      f"archiviert ({t['age_days']}d alt): {t['title']}"))
+    if fixes and not dry_run:
+        invalidate_link_index()
+    return fixes
+
+
+def _autofix_consolidate_tags(tag_clusters: list, dry_run: bool) -> list:
+    """Vereinheitlicht Tag-Cluster im ganzen Vault.
+    cluster: (canonical, [(variant, count), ...]) — variants werden zu canonical."""
+    fixes = []
+    if not tag_clusters:
+        return fixes
+    # Build replace-map: variant_lower → canonical
+    replace_map: dict = {}
+    cluster_summaries = []
+    for canonical, variants in tag_clusters:
+        for variant, _count in variants:
+            if variant != canonical:
+                replace_map[variant.lower()] = canonical
+        cluster_summaries.append((canonical, [v for v, _ in variants if v != canonical]))
+    if not replace_map:
+        return fixes
+
+    file_changes = 0
+    for path, post in iter_vault_md():
+        tags = post.metadata.get("tags") or []
+        if not isinstance(tags, list) or not tags:
+            continue
+        new_tags = []
+        seen_in_file = set()
+        any_changed = False
+        for tg in tags:
+            if not isinstance(tg, str):
+                new_tags.append(tg)
+                continue
+            tl = tg.strip().lower()
+            target = replace_map.get(tl, tg)
+            if target.lower() != tl:
+                any_changed = True
+            if target.lower() not in seen_in_file:
+                new_tags.append(target)
+                seen_in_file.add(target.lower())
+        if any_changed:
+            file_changes += 1
+            if not dry_run:
+                post["tags"] = new_tags
+                try:
+                    atomic_write(path, frontmatter.dumps(post) + "\n")
+                except Exception as e:
+                    log.warning(f"tag-consolidate write failed: {e}")
+                    continue
+
+    for canonical, variants in cluster_summaries:
+        if variants:
+            fixes.append((FIX_TAG_CONSOLIDATE, "*",
+                          f"{', '.join(variants)} → {canonical} (in {file_changes} Files)"))
+    return fixes
+
+
+def run_health_autofixes(data: dict, dry_run: bool = False) -> list:
+    """Führt alle 10 Auto-Fixes aus, gibt kombinierte Liste zurück.
+
+    Wird vom nightly Job nur gerufen wenn NICHT first_run.
+    """
+    all_fixes = []
+    all_fixes.extend(_autofix_frontmatter_hygiene(dry_run))
+    all_fixes.extend(_autofix_empty_dailies(dry_run))
+    all_fixes.extend(_autofix_auto_link_existing(dry_run))
+    all_fixes.extend(_autofix_archive_done_tasks(data["done_old_tasks"], dry_run))
+    all_fixes.extend(_autofix_consolidate_tags(data["tag_clusters"], dry_run))
+    return all_fixes
+
+
+# ─── Approval-Proposals (3 Items, brauchen User-Input) ──────────────────────
+
+def _build_health_proposals(data: dict) -> list:
+    """Baut Approval-Proposals aus den Check-Daten.
+
+    Returns list von Dicts: {id, type, summary, items, action_options}
+    """
+    proposals = []
+
+    # Proposal 1: Stale Inbox
+    if data["stale_inbox"]:
+        items = data["stale_inbox"][:5]  # max 5 zeigen
+        proposals.append({
+            "id": "p-inbox",
+            "type": "stale_inbox",
+            "summary": f"{len(data['stale_inbox'])} Files seit >7d in 00_Inbox",
+            "items": [{"path": p, "age_days": d} for p, d in items],
+            "options": ["zu Notes", "zu Tasks", "Archiv", "skip"],
+        })
+
+    # Proposal 2: Broken Wikilinks
+    if data["broken_links"]:
+        items = data["broken_links"][:8]
+        proposals.append({
+            "id": "p-broken",
+            "type": "broken_links",
+            "summary": f"{len(data['broken_links'])} Wikilink(s) ohne Ziel",
+            "items": [{"path": p, "target": t} for p, t in items],
+            "options": ["zeig Liste", "zu Klartext", "skip"],
+        })
+
+    # Proposal 3: Recurring stuck
+    if data["recurring_stuck"]:
+        proposals.append({
+            "id": "p-stuck",
+            "type": "recurring_stuck",
+            "summary": f"{len(data['recurring_stuck'])} Recurring Task(s) hängen >Periode",
+            "items": data["recurring_stuck"][:5],
+            "options": ["jetzt aktivieren", "recurrence entfernen", "skip"],
+        })
+
+    return proposals
+
+
+def _save_pending_health_actions(proposals: list) -> None:
+    """Persistiert Proposals in 06_Meta/pending-health-actions.json."""
+    if not proposals:
+        if PENDING_HEALTH_ACTIONS_FILE.exists():
+            try:
+                PENDING_HEALTH_ACTIONS_FILE.unlink()
+            except Exception:
+                pass
+        return
+    PENDING_HEALTH_ACTIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    PENDING_HEALTH_ACTIONS_FILE.write_text(
+        json.dumps({"created": datetime.now(TIMEZONE).isoformat(), "proposals": proposals},
+                   indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def _load_pending_health_actions() -> list:
+    if not PENDING_HEALTH_ACTIONS_FILE.exists():
+        return []
+    try:
+        data = json.loads(PENDING_HEALTH_ACTIONS_FILE.read_text(encoding="utf-8"))
+        return data.get("proposals", [])
+    except Exception:
+        return []
+
+
+# ─── Health-Report-Writer ───────────────────────────────────────────────────
+
+def write_health_report(data: dict, autofixes: list, proposals: list) -> Path:
+    """Schreibt Detail-Report nach 06_Meta/health-reports/YYYY-MM-DD.md."""
+    HEALTH_REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    today_str = data["today_str"]
+    report_path = HEALTH_REPORTS_DIR / f"{today_str}.md"
+
+    lines = [
+        "---",
+        f"title: Vault-Health {today_str}",
+        "type: meta",
+        f"updated: {today_str}",
+        "maintained_by: nightly_health_job",
+        "---",
+        "",
+        f"# 🔧 Vault-Health-Check — {today_str}",
+        "",
+        f"**Notes gescannt:** {data['total_notes']}  ",
+        f"**Tags total:** {len(data['all_tags'])}  ",
+        f"**First-Run-Mode:** {'JA (Auto-Fix disabled)' if data['first_run'] else 'nein'}",
+        "",
+    ]
+
+    # ── Auto-Fix-Sektion ──
+    if autofixes:
+        by_code: dict = {}
+        for code, path, desc in autofixes:
+            by_code.setdefault(code, []).append((path, desc))
+        lines.append(f"## ✅ Auto-Fixed ({len(autofixes)})")
+        lines.append("")
+        for code, items in sorted(by_code.items()):
+            lines.append(f"### {code} ({len(items)})")
+            for path, desc in items[:20]:
+                lines.append(f"- `{path}`: {desc}")
+            if len(items) > 20:
+                lines.append(f"- _… {len(items)-20} weitere_")
+            lines.append("")
+    elif not data["first_run"]:
+        lines.append("## ✅ Auto-Fixed (0)")
+        lines.append("")
+        lines.append("Nichts zu fixen — Vault ist sauber.")
+        lines.append("")
+
+    # ── Issues (read-only) ──
+    issues_blocks = []
+    if data["lint_issues"]:
+        b = [f"### Lint-Issues ({len(data['lint_issues'])})"]
+        for path, prob in data["lint_issues"][:20]:
+            b.append(f"- `{path}`: {prob}")
+        if len(data["lint_issues"]) > 20:
+            b.append(f"- _… {len(data['lint_issues'])-20} weitere_")
+        issues_blocks.append("\n".join(b))
+    if data["broken_links"]:
+        b = [f"### Broken Wikilinks ({len(data['broken_links'])})"]
+        for path, tgt in data["broken_links"][:10]:
+            b.append(f"- `{path}` → `[[{tgt}]]`")
+        issues_blocks.append("\n".join(b))
+    if data["orphans"]:
+        b = [f"### Orphans — Wiki-Files ohne Backlinks ({len(data['orphans'])})"]
+        for p in data["orphans"][:10]:
+            b.append(f"- `{p}`")
+        issues_blocks.append("\n".join(b))
+    if data["duplicate_ids"]:
+        b = [f"### Doppelte IDs ({len(data['duplicate_ids'])})"]
+        for fid, paths in data["duplicate_ids"]:
+            b.append(f"- `{fid}` → {', '.join(f'`{p}`' for p in paths)}")
+        issues_blocks.append("\n".join(b))
+    if data["daily_gaps"]:
+        b = [f"### Daily-Lücken (Werktage ohne Daily-Note, letzte 7 Tage)"]
+        b.append(", ".join(data["daily_gaps"]))
+        issues_blocks.append("\n".join(b))
+    if data["stale_uploads"]:
+        b = [f"### Stale Uploads — PDFs ohne .md-Wrapper ({len(data['stale_uploads'])})"]
+        for p in data["stale_uploads"][:10]:
+            b.append(f"- `{p}`")
+        issues_blocks.append("\n".join(b))
+
+    if issues_blocks:
+        lines.append("## ⚠️ Issues (read-only)")
+        lines.append("")
+        for block in issues_blocks:
+            lines.append(block)
+            lines.append("")
+
+    # ── Pending Approvals ──
+    if proposals:
+        lines.append(f"## 🔧 Pending Approvals ({len(proposals)})")
+        lines.append("")
+        for i, p in enumerate(proposals, 1):
+            lines.append(f"### {i}. {p['summary']}")
+            for item in p["items"][:3]:
+                if isinstance(item, dict):
+                    lines.append(f"- {item}")
+            lines.append(f"  Optionen: {', '.join(p['options'])}")
+            lines.append("")
+
+    # ── Tag-Übersicht (immer am Ende, kompakt) ──
+    if data["all_tags"]:
+        top_tags = sorted(data["all_tags"].items(), key=lambda x: -x[1])[:15]
+        lines.append("## 🏷️ Top-Tags")
+        lines.append("")
+        lines.append(", ".join(f"`{t}` ({c})" for t, c in top_tags))
+        lines.append("")
+
+    report_path.write_text("\n".join(lines), encoding="utf-8")
+    return report_path
+
+
+def cleanup_old_health_reports() -> int:
+    """Löscht Health-Reports älter als 30 Tage. Returns Anzahl gelöscht."""
+    if not HEALTH_REPORTS_DIR.exists():
+        return 0
+    cutoff = datetime.now(TIMEZONE).date() - timedelta(days=30)
+    deleted = 0
+    for path in HEALTH_REPORTS_DIR.glob("*.md"):
+        try:
+            d = datetime.strptime(path.stem, "%Y-%m-%d").date()
+            if d < cutoff:
+                path.unlink()
+                deleted += 1
+        except (ValueError, OSError):
+            continue
+    return deleted
+
+
+# ─── Orchestrator + JobQueue-Callback ──────────────────────────────────────
+
+def run_nightly_health() -> dict:
+    """Synchroner Orchestrator — läuft im to_thread aus dem JobQueue-Callback.
+
+    Returns dict mit Stats für Briefing-Integration.
+    """
+    if not VAULT.exists():
+        log.error(f"health: VAULT existiert nicht: {VAULT}")
+        return {"error": "vault_missing"}
+
+    data = collect_health_data()
+    autofixes = []
+    if not data["first_run"]:
+        try:
+            autofixes = run_health_autofixes(data, dry_run=False)
+        except Exception as e:
+            log.exception(f"health autofix failed: {e}")
+    proposals = _build_health_proposals(data)
+    _save_pending_health_actions(proposals)
+    report_path = write_health_report(data, autofixes, proposals)
+    cleaned = cleanup_old_health_reports()
+    log.info(
+        f"health: report → {report_path.relative_to(VAULT)} | "
+        f"autofixes={len(autofixes)}, proposals={len(proposals)}, "
+        f"first_run={data['first_run']}, old-reports-cleaned={cleaned}"
+    )
+    return {
+        "report_path": str(report_path.relative_to(VAULT)),
+        "autofix_count": len(autofixes),
+        "proposal_count": len(proposals),
+        "issue_summary": {
+            "lint": len(data["lint_issues"]),
+            "broken_links": len(data["broken_links"]),
+            "orphans": len(data["orphans"]),
+            "duplicate_ids": len(data["duplicate_ids"]),
+            "daily_gaps": len(data["daily_gaps"]),
+            "stale_uploads": len(data["stale_uploads"]),
+        },
+        "first_run": data["first_run"],
+    }
+
+
+async def nightly_health_job(ctx: ContextTypes.DEFAULT_TYPE):
+    """JobQueue-Callback — läuft täglich 02:00."""
+    try:
+        await asyncio.to_thread(run_nightly_health)
+    except Exception as e:
+        log.exception(f"nightly_health_job failed: {e}")
+
+
+# ─── Tool: apply_health_action ──────────────────────────────────────────────
+
+def apply_health_action(action: str) -> str:
+    """Verarbeitet User-Antwort auf pending Health-Proposals.
+
+    Action-Formate (wie bei apply_memory_suggestion):
+      "1 2"       — proposals 1 und 2 mit Default-Action akzeptieren
+      "1,2"       — wie oben
+      "alle"/"ja" — alle akzeptieren
+      "0"/"nein"  — alles skippen + pending leeren
+      "skip 2"    — proposal 2 explizit skippen, Rest bleibt pending
+
+    Default-Action pro Proposal-Typ:
+      stale_inbox    → Files nach 99_Archive/
+      broken_links   → Wikilink-Klammern entfernen (zu Klartext)
+      recurring_stuck→ Task jetzt aktivieren (status=open + last_completed=heute)
+    """
+    proposals = _load_pending_health_actions()
+    if not proposals:
+        return "Keine pending Health-Aktionen."
+
+    action = (action or "").strip().lower()
+    if action in ("0", "nein", "skip", "no"):
+        try:
+            PENDING_HEALTH_ACTIONS_FILE.unlink()
+        except Exception:
+            pass
+        return f"⊘ {len(proposals)} Health-Aktionen verworfen."
+
+    if action in ("alle", "ja", "all", "yes"):
+        indices = list(range(1, len(proposals) + 1))
+    else:
+        # Zahlen extrahieren
+        nums = [int(x) for x in re.findall(r"\d+", action) if int(x) > 0]
+        if not nums:
+            return f"Konnte keine Auswahl erkennen aus '{action}'. Format: '1 2', 'alle', '0'."
+        indices = nums
+
+    results = []
+    today = datetime.now(TIMEZONE).date()
+    today_str = today.strftime("%Y-%m-%d")
+
+    for idx in indices:
+        if idx < 1 or idx > len(proposals):
+            results.append(f"#{idx}: ungültig (1-{len(proposals)})")
+            continue
+        p = proposals[idx - 1]
+
+        if p["type"] == "stale_inbox":
+            archived = 0
+            archive_dir = VAULT / "99_Archive" / "00_Inbox"
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            for item in p["items"]:
+                src = VAULT / item["path"]
+                if not src.exists():
+                    continue
+                dst = archive_dir / src.name
+                n = 1
+                while dst.exists():
+                    dst = archive_dir / f"{src.stem}-{n}{src.suffix}"
+                    n += 1
+                try:
+                    shutil.move(str(src), str(dst))
+                    archived += 1
+                except Exception as e:
+                    log.warning(f"inbox archive failed: {e}")
+            results.append(f"#{idx}: ✓ {archived} Inbox-Files archiviert")
+
+        elif p["type"] == "broken_links":
+            cleaned_files = 0
+            cleaned_links = 0
+            for item in p["items"]:
+                src = VAULT / item["path"]
+                if not src.exists():
+                    continue
+                target = item["target"]
+                try:
+                    post = frontmatter.load(src)
+                    body = post.content or ""
+                    pat = re.compile(
+                        r"\[\[" + re.escape(target) + r"(?:\|([^\]]*))?\]\]"
+                    )
+                    n = 0
+                    def _strip(m):
+                        nonlocal n
+                        n += 1
+                        return m.group(1) if m.group(1) else target
+                    new_body = pat.sub(_strip, body)
+                    if n > 0:
+                        post.content = new_body
+                        atomic_write(src, frontmatter.dumps(post) + "\n")
+                        cleaned_files += 1
+                        cleaned_links += n
+                except Exception as e:
+                    log.warning(f"broken-link cleanup failed: {e}")
+            results.append(f"#{idx}: ✓ {cleaned_links} broken Wikilinks zu Klartext ({cleaned_files} Files)")
+
+        elif p["type"] == "recurring_stuck":
+            reactivated = 0
+            for item in p["items"]:
+                src = VAULT / item["path"]
+                if not src.exists():
+                    continue
+                try:
+                    post = frontmatter.load(src)
+                    post["status"] = "open"
+                    post["updated"] = today_str
+                    body = (post.content or "").rstrip() + (
+                        f"\n- {today_str}: manuell reaktiviert (war stuck recurring)\n"
+                    )
+                    post.content = body
+                    atomic_write(src, frontmatter.dumps(post) + "\n")
+                    reactivated += 1
+                except Exception as e:
+                    log.warning(f"recurring-stuck reactivate failed: {e}")
+            results.append(f"#{idx}: ✓ {reactivated} stuck Recurring Tasks reaktiviert")
+        else:
+            results.append(f"#{idx}: unbekannter Proposal-Typ '{p['type']}'")
+
+    # Akzeptierte aus pending entfernen
+    remaining = [p for i, p in enumerate(proposals, 1) if i not in indices]
+    if remaining:
+        _save_pending_health_actions(remaining)
+        tail = f" ({len(remaining)} Aktionen bleiben pending)"
+    else:
+        try:
+            PENDING_HEALTH_ACTIONS_FILE.unlink()
+        except Exception:
+            pass
+        tail = ""
+
+    return "Health-Aktionen verarbeitet:\n" + "\n".join(results) + tail
+
+
 def compute_briefing() -> str:
     """Generiere die morgendliche Zusammenfassung als HTML-String.
 
@@ -4293,6 +5253,33 @@ def compute_briefing() -> str:
                     or data["meetings"] or today_path.exists())
     if not has_anything:
         parts.append("\n<i>Heute steht noch nichts an.</i>")
+
+    # ─── Vault-Health-Status (kompakt) ──
+    # Liest den heutigen Health-Report (geschrieben um 02:00) für Briefing-Anhang.
+    health_today = HEALTH_REPORTS_DIR / f"{today}.md"
+    pending_actions = _load_pending_health_actions()
+    if health_today.exists() or pending_actions:
+        parts.append("\n🔧 <b>Vault-Pflege</b>")
+        # Auto-Fix-Counter aus Report extrahieren (regex auf "Auto-Fixed (N)")
+        if health_today.exists():
+            try:
+                content = health_today.read_text(encoding="utf-8")
+                m = re.search(r"##\s+✅\s+Auto-Fixed\s+\((\d+)\)", content)
+                if m and int(m.group(1)) > 0:
+                    parts.append(f"• {m.group(1)} Auto-Fixes über Nacht durchgeführt")
+                # Issues-Counter
+                issue_count = sum(
+                    int(x) for x in re.findall(r"###\s+\S+[^()]*\((\d+)\)", content)
+                )
+                if issue_count > 0:
+                    parts.append(f"• {issue_count} read-only Issues — siehe <code>{health_today.relative_to(VAULT)}</code>")
+            except Exception:
+                pass
+        if pending_actions:
+            parts.append(f"• {len(pending_actions)} Aktionen brauchen deine Approval:")
+            for i, p in enumerate(pending_actions, 1):
+                parts.append(f"  {i}. {_esc_html(p['summary'])}")
+            parts.append("  <i>Antworte mit \"health 1\" / \"health 1 2\" / \"health 0\" (skip alle).</i>")
 
     # ─── Tagesplan-Frage am Ende — macht das Briefing zur Conversation ───
     parts.append(
@@ -4638,6 +5625,19 @@ def main():
             log.warning(f"Suggestion-Job-Setup fehlgeschlagen: {e}")
     else:
         log.info("Nightly-Memory-Vorschläge deaktiviert (SUGGESTION_HOUR=0)")
+
+    # Nightly Vault-Health-Check (immer auf 02:00 — vor Briefing/Memory/Reset)
+    if ALLOWED_USER_ID > 0:
+        try:
+            health_time = dtime(hour=2, minute=0, tzinfo=TIMEZONE)
+            app.job_queue.run_daily(
+                nightly_health_job,
+                time=health_time,
+                name="nightly-health-check",
+            )
+            log.info(f"Nightly-Health-Check scheduled für 02:00 {TIMEZONE.key}")
+        except Exception as e:
+            log.warning(f"Health-Job-Setup fehlgeschlagen: {e}")
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
