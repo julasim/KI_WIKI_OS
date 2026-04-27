@@ -477,10 +477,33 @@ def _get_link_index() -> dict:
     return pmap
 
 
+_AUTO_LINK_INVALIDATE_FLOOR_SEC = 30  # Cache nach Mutation max so alt — nicht sofort reset
+
+
 def invalidate_link_index() -> None:
-    """Cache-Reset nach Schreibvorgang (neuer File könnte neuen Link-Kandidat sein)."""
+    """Cache-Reset nach Schreibvorgang — mit TTL-Floor (nicht sofort).
+
+    Vorher: jede Mutation → Cache komplett leer → nächster auto_link-Call
+    macht vollen Vault-Walk. Bei Bulk-Move (6 Files): 6× Invalidate = bei
+    nächsten 6 auto_link-Calls 6× Walk im Event-Loop.
+
+    Jetzt: Cache wird auf "läuft in 30s ab" markiert. Mehrfach-Invalidate
+    während dieser 30s = no-op. Bulk-Move mit nachfolgenden Reads → max
+    EIN Walk in 30s. Auto-Link tolerant gegen 30s-stale-Daten.
+
+    Plus: invalidiert today_data_cache (gleiche Trigger-Logik).
+    """
     global _AUTO_LINK_CACHE
-    _AUTO_LINK_CACHE = (0.0, {})
+    ts, pmap = _AUTO_LINK_CACHE
+    # Setze ts so, dass Cache in FLOOR Sekunden ungültig wird
+    target_ts = time.time() - _AUTO_LINK_TTL_SEC + _AUTO_LINK_INVALIDATE_FLOOR_SEC
+    # Nur "altern" wenn Cache aktuell jünger ist (verhindert paradoxes Reset)
+    if ts > target_ts:
+        _AUTO_LINK_CACHE = (target_ts, pmap)
+    # Forward-tolerant — invalidate_today_data_cache wird später definiert.
+    fn = globals().get("invalidate_today_data_cache")
+    if fn is not None:
+        fn()
 
 
 def auto_link(text: str, exclude_ids: Optional[set] = None) -> str:
@@ -729,7 +752,7 @@ def create_task(title: str, priority: str = "medium",
     except Exception as e:
         log.warning(f"Daily-Link für Task fehlgeschlagen: {e}")
 
-    invalidate_link_index()
+    invalidate_link_index()  # ruft auch invalidate_today_data_cache (siehe dort)
 
     extras = []
     if due:
@@ -1001,11 +1024,39 @@ def _sort_tasks_by_prio_due(lst: list) -> list:
                                       _due_to_date(t.get("due")) or date.max))
 
 
+# Cache für collect_today_data — vermeidet Vault-Walk bei jedem
+# /today, /tasks, get_today_agenda-Aufruf. 30s reicht für interaktive
+# Konversation, ist kurz genug für unmittelbare Reaktion auf Edits.
+_TODAY_DATA_CACHE: tuple = (0.0, None)
+_TODAY_DATA_TTL_SEC = 30
+
+
+def invalidate_today_data_cache() -> None:
+    """Cache-Reset nach Mutations die die Tagesansicht verändern."""
+    global _TODAY_DATA_CACHE
+    _TODAY_DATA_CACHE = (0.0, None)
+
+
 def collect_today_data() -> dict:
     """Single Source of Truth: aggregiert ALLE "heute"-Daten in einem Walk.
 
     Genutzt von compute_briefing (HTML-Render) UND get_today_agenda (Markdown).
     Vorher waren beide Renderer mit eigenem Aggregations-Code → Drift-Risiko.
+
+    Cached 30s — bei jedem create_task/mark_task_done/create_reminder
+    via invalidate_today_data_cache() invalidiert.
+    """
+    global _TODAY_DATA_CACHE
+    ts, cached = _TODAY_DATA_CACHE
+    if cached is not None and (time.time() - ts) <= _TODAY_DATA_TTL_SEC:
+        return cached
+    data = _collect_today_data_uncached()
+    _TODAY_DATA_CACHE = (time.time(), data)
+    return data
+
+
+def _collect_today_data_uncached() -> dict:
+    """Tatsächliche Berechnung — nur aus collect_today_data oder Tests rufen.
 
     Returns dict mit Keys:
       today: date · today_str: ISO-string · now: datetime
@@ -1834,6 +1885,8 @@ def create_reminder(when_iso: str, message: str, recurrence: Optional[str] = Non
     if BOT_APP is not None:
         _schedule_reminder(BOT_APP, reminder)
 
+    invalidate_today_data_cache()  # neuer Reminder kann heute feuern → Agenda neu
+
     rec_str = f", wiederholt {rec}" if rec else ""
     when_str = when_dt.strftime("%a %d.%m. %H:%M")
     return f"⏰ Erinnerung gesetzt: {when_str}{rec_str}\n→ \"{message.strip()[:80]}\""
@@ -1948,6 +2001,7 @@ def cancel_reminder(reminder_id: str) -> str:
             job.schedule_removal()
         except Exception:
             pass
+    invalidate_today_data_cache()
     return f"✓ Erinnerung gecancelt: {found['message'][:60]}"
 
 
@@ -2867,47 +2921,76 @@ def _maybe_compact_history() -> None:
         log.warning(f"history compact failed: {e}")
 
 
-def _get_history_unlocked(user_id: int) -> list:
-    """Interner Read — ohne Lock. Nur aus locked Context aufrufen.
+def _check_cache_fresh(user_id: int) -> tuple[Optional[list], bool]:
+    """Pure Read, no IO. Returns (cached_list_or_None, is_fresh).
 
-    BUG-FIX: TIMESTAMP wird IMMER gesetzt, auch bei loaded=[] (leere History).
-    Vorher: bei leerer History blieb timestamp=0 → JEDE User-Message reloadet
-    JSONL synchron unter Lock → handle_text hängt gefühlt minutenlang.
+    Wird ohne Lock aus async-Context gerufen (RAM-Read ist atomic in CPython).
+    Bei is_fresh=True kann der Caller direkt den Cache verwenden.
     """
     last = CONVERSATION_TIMESTAMPS.get(user_id, 0.0)
     cached = CONVERSATION_HISTORY.get(user_id)
-    if cached is None or (time.time() - last) > HISTORY_TIMEOUT:
-        loaded = _load_persistent_history(user_id)
+    is_fresh = cached is not None and (time.time() - last) <= HISTORY_TIMEOUT
+    return cached, is_fresh
+
+
+async def _ensure_history_loaded(user_id: int) -> list:
+    """Stellt sicher dass die History für user_id im Cache ist.
+
+    Disk-IO läuft via to_thread → blockiert NICHT den event-loop. Cache-
+    Update unter Lock damit konkurrierende Calls keine inkonsistenten
+    Reads sehen. Returns die geladene Liste (nicht aus Cache, da andere
+    Tasks zwischenzeitlich verändert haben könnten).
+    """
+    cached, is_fresh = _check_cache_fresh(user_id)
+    if is_fresh:
+        return list(cached)
+    # Disk-IO AUSSERHALB Lock — blockiert event loop nicht
+    loaded = await asyncio.to_thread(_load_persistent_history, user_id)
+    async with _HISTORY_LOCK:
+        # Recheck — ein anderer Task könnte schon geladen+mutiert haben
+        cached, is_fresh = _check_cache_fresh(user_id)
+        if is_fresh:
+            return list(cached)
         CONVERSATION_HISTORY[user_id] = loaded
-        CONVERSATION_TIMESTAMPS[user_id] = time.time()  # IMMER setzen, nicht nur bei loaded
-        return loaded
-    return cached
+        CONVERSATION_TIMESTAMPS[user_id] = time.time()
+    return list(loaded)
 
 
 async def get_history(user_id: int) -> list:
-    """History für User. Bei Cache-Miss/Timeout: lazy-load aus JSONL.
+    """History für User. Bei Cache-Miss/Timeout: async lazy-load aus JSONL.
 
-    Lock-protected gegen race conditions zwischen User-Messages + nightly Job.
+    Disk-IO läuft via to_thread → blockiert event-loop nicht mehr.
     """
-    async with _HISTORY_LOCK:
-        return list(_get_history_unlocked(user_id))  # Copy → kein Mutation-Risiko
+    return await _ensure_history_loaded(user_id)
 
 
 async def update_history(user_id: int, new_messages: list) -> None:
     """History anhängen + persistieren + auf Max-Länge trimmen.
 
-    Lock-protected: read+modify+write atomic, JSONL-Append innerhalb Lock.
+    Hot-Path: RAM-Mutation unter Lock (schnell). Disk-Append + Compaction
+    via to_thread AUSSERHALB Lock — JSONL-Append ist append-only, Race
+    zwischen mehreren Schreibern wäre nur Reihenfolge-Issue (für Single-
+    User-Bot irrelevant).
     """
+    # Sicherstellen dass Cache da ist (lädt wenn nötig, async)
+    await _ensure_history_loaded(user_id)
+    # RAM-Update unter Lock (sehr schnell — keine Disk-IO)
     async with _HISTORY_LOCK:
-        history = list(_get_history_unlocked(user_id))
+        history = list(CONVERSATION_HISTORY.get(user_id, []))
         history.extend(new_messages)
         if len(history) > HISTORY_MAX_MESSAGES:
             history = history[-HISTORY_MAX_MESSAGES:]
         CONVERSATION_HISTORY[user_id] = history
         CONVERSATION_TIMESTAMPS[user_id] = time.time()
-        for msg in new_messages:
-            _save_history_line(user_id, msg)
-        _maybe_compact_history()
+    # Disk-Append + ggf Compaction via to_thread, kein Lock
+    await asyncio.to_thread(_persist_history_changes, user_id, new_messages)
+
+
+def _persist_history_changes(user_id: int, new_messages: list) -> None:
+    """Sync helper für update_history — schreibt JSONL-Append + ggf compact."""
+    for msg in new_messages:
+        _save_history_line(user_id, msg)
+    _maybe_compact_history()
 
 
 async def reset_history(user_id: int) -> None:
@@ -3610,6 +3693,32 @@ Wenn vorhin ein Projekt erstellt/aktiviert wurde und User danach Tasks anlegt di
 # LLM tool-use loop
 # ============================================================================
 
+# Sensitive-Pattern-Maskierung für Error-Messages die in History/User landen
+_SENSITIVE_PATTERNS = [
+    (re.compile(r"sk-[A-Za-z0-9_\-]{20,}"), "[REDACTED-API-KEY]"),       # OpenAI/Anthropic
+    (re.compile(r"Bearer\s+[A-Za-z0-9_\-\.]{20,}"), "Bearer [REDACTED]"),
+    # Telegram-Bot-Token: <8-12 digits>:<base64-ish 35 chars>
+    (re.compile(r"\b\d{7,15}:[A-Za-z0-9_\-]{30,}"), "[REDACTED-TG-TOKEN]"),
+    (re.compile(r"ghp_[A-Za-z0-9]{30,}"), "[REDACTED-GH-PAT]"),           # GitHub PAT classic
+    (re.compile(r"github_pat_[A-Za-z0-9_]{50,}"), "[REDACTED-GH-PAT]"),   # GitHub fine-grained
+    (re.compile(r"https://[^@\s]+:[^@\s]+@"), "https://[REDACTED]@"),     # URL-mit-Credentials
+]
+
+
+def _sanitize_error(msg: str) -> str:
+    """Maskiert Tokens/Keys/Credentials in Error-Strings.
+
+    Wird auf Tool-Fehler-Messages angewandt bevor sie in History oder User-
+    Reply landen. Verhindert dass Stack-Traces oder Lib-Errors versehentlich
+    Bearer-Tokens, OpenAI-Keys, Telegram-Bot-Tokens leaken.
+    """
+    if not isinstance(msg, str):
+        msg = str(msg)
+    for pat, replacement in _SENSITIVE_PATTERNS:
+        msg = pat.sub(replacement, msg)
+    return msg
+
+
 async def llm_loop(user_text: str, user_id: int) -> str:
     """Run tool-use loop until final answer or limit reached.
 
@@ -3697,7 +3806,9 @@ async def llm_loop(user_text: str, user_id: int) -> str:
                     completed_tool_calls.append(tc.function.name)
             except Exception as e:
                 log.exception(f"Tool {tc.function.name} failed")
-                result = f"Tool-Fehler: {e}"
+                # Token/Credential-Maskierung — Error landet in LLM-History
+                # und ggf in User-Reply, darf keine API-Keys leaken
+                result = _sanitize_error(f"Tool-Fehler: {e}")
             tool_msg = {
                 "role": "tool",
                 "tool_call_id": tc.id,
@@ -4058,9 +4169,12 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         filename = f"photo_{ts}.{ext}"
         save_path = ATTACHMENTS_DIR / filename
         await file.download_to_drive(str(save_path))
-        # Vision-Caption
-        with open(save_path, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode()
+        # Vision-Caption — Base64-Encode in Threadpool (sync read+encode auf
+        # 5MB-Photos kann Event-Loop spürbar blockieren)
+        def _read_and_encode():
+            with open(save_path, "rb") as f:
+                return base64.b64encode(f.read()).decode()
+        b64 = await asyncio.to_thread(_read_and_encode)
         prompt_text = (
             "Beschreibe in 1-2 Sätzen knapp, was auf dem Bild ist."
             f" Kontext vom User: \"{user_caption}\"" if user_caption else
@@ -4816,14 +4930,23 @@ def _autofix_archive_done_tasks(done_old_tasks: list, dry_run: bool) -> list:
             n += 1
         if not dry_run:
             try:
-                # Frontmatter-Update: archived-Datum hinzufügen
+                # Atomar: lade Frontmatter, schreibe mit archived-Datum DIREKT
+                # zum dst-Pfad via atomic_write (tmp+rename), dann src löschen.
+                # Vorher: src.write_text + shutil.move = 2 Operationen, Crash
+                # dazwischen hinterließ src mit archived-Feld am Quellort.
                 post = frontmatter.load(src)
                 post["archived"] = today_str
-                # Erst neue Frontmatter schreiben, dann verschieben
-                src.write_text(frontmatter.dumps(post) + "\n", encoding="utf-8")
-                shutil.move(str(src), str(dst))
+                atomic_write(dst, frontmatter.dumps(post) + "\n")
+                src.unlink()
             except Exception as e:
                 log.warning(f"archive-done failed for {src.name}: {e}")
+                # Cleanup: wenn dst schon geschrieben aber src noch da, dst entfernen
+                # damit nächster Lauf nicht denkt der Task wäre schon archiviert
+                if dst.exists() and src.exists():
+                    try:
+                        dst.unlink()
+                    except Exception:
+                        pass
                 continue
         fixes.append((FIX_DONE_ARCHIVE, t["path"],
                       f"archiviert ({t['age_days']}d alt): {t['title']}"))
@@ -5334,11 +5457,19 @@ def compute_briefing() -> str:
             parts.append(f"• {_esc_html(str(m['title']))}")
 
     # ─── Überfällig + Heute fällig (kombiniert für Briefing-Übersicht) ───
+    today_date = data["today"]
     if data["overdue_tasks"]:
         parts.append("\n⚠️ <b>Überfällig</b>")
         for t in data["overdue_tasks"][:8]:
-            due_disp = t.get("due") or "—"
-            parts.append(f"• {_esc_html(str(t['title']))} <i>(seit {due_disp})</i>")
+            # Konsistente Date-Normalisierung — vorher konnten date-Objekte aus
+            # YAML-Frontmatter als rohe Repr im Telegram landen.
+            due_d = _due_to_date(t.get("due"))
+            if due_d is not None:
+                delta = (today_date - due_d).days
+                due_disp = f"vor {delta}d" if delta > 0 else due_d.isoformat()
+            else:
+                due_disp = "—"
+            parts.append(f"• {_esc_html(str(t['title']))} <i>({due_disp})</i>")
 
     # Andere offene Tasks (heute + nodate-high-prio + Rest, dedupliziert)
     seen_ids = {t["id"] for t in data["overdue_tasks"]}
@@ -5354,8 +5485,19 @@ def compute_briefing() -> str:
     if other_open:
         parts.append("\n✏️ <b>Offene Tasks</b>")
         for t in other_open[:8]:
-            due = t.get("due") or ""
-            due_str = f" <i>(bis {due})</i>" if due else ""
+            due_d = _due_to_date(t.get("due"))
+            if due_d is None:
+                due_str = ""
+            else:
+                delta = (due_d - today_date).days
+                if delta == 0:
+                    due_str = " <i>(heute)</i>"
+                elif delta == 1:
+                    due_str = " <i>(morgen)</i>"
+                elif 0 < delta <= 7:
+                    due_str = f" <i>(in {delta}d)</i>"
+                else:
+                    due_str = f" <i>(bis {due_d.isoformat()})</i>"
             prio_emoji = PRIO_SYMBOLS.get(t.get("priority"), PRIO_SYMBOLS["medium"])
             parts.append(f"{prio_emoji} {_esc_html(str(t['title']))}{due_str}")
         if len(other_open) > 8:
@@ -5518,6 +5660,8 @@ def reset_recurring_tasks() -> dict:
         except Exception as e:
             log.warning(f"recurring-reset: konnte {task_file.name} nicht schreiben: {e}")
 
+    if reactivated:
+        invalidate_today_data_cache()  # Tasks haben heute Status-Wechsel
     return {"checked": checked, "reactivated": reactivated}
 
 
