@@ -1645,36 +1645,40 @@ def move_project(slug: str, parent: Optional[str] = None) -> str:
     return f"✓ Projekt verschoben: `{src_rel}/` → `{dst_rel}/`{parent_info}"
 
 
-def move(src=None, dst: Optional[str] = None,
+def move(src: Optional[str] = None, srcs: Optional[list] = None,
+         dst: Optional[str] = None,
          project_slug: Optional[str] = None,
          parent: Optional[str] = None,
          overwrite: bool = False) -> str:
-    """Vereinheitlichtes Move-Tool für 3 Use-Cases:
+    """Vereinheitlichtes Move-Tool — drei Use-Cases mit getrennten Feldern:
 
-    a) Datei/Ordner einzeln umbenennen oder verschieben:
-       move(src='10_Life/notes/foo.md', dst='10_Life/notes/bar.md')
+    a) Einzeln: move(src='foo.md', dst='bar.md')
+    b) Bulk:    move(srcs=['a.md','b.md'], dst='ordner/')
+    c) Projekt: move(project_slug='matura', parent='dachboden-umbau')
 
-    b) Mehrere Dateien in einen Ziel-Ordner (Bulk):
-       move(src=['a.md', 'b.md', 'c.md'], dst='05_Projects/matura/')
+    Getrennte src/srcs-Felder statt anyOf — manche LLM-Provider
+    (OpenAI strict, Ollama-Cloud) lehnen anyOf in Tool-Schemas ab.
 
-    c) Projekt verschieben (mit Subprojekt-Logic, rekursiver Slug-Resolve):
-       move(project_slug='matura', parent='dachboden-umbau')
-       move(project_slug='foo')  → zurück zu Top-Level
-
-    Konsolidiert move_path + move_paths + move_project zu einem Tool.
-    Bei project_slug nicht None → Projekt-Modus (src/dst werden ignoriert).
-    Bei src=list → Bulk-Modus.
-    Bei src=str → Einzel-Modus.
+    Defensive: src kann auch eine Liste sein (Tippfehler vom LLM) →
+    behandelt wie srcs.
     """
     if project_slug:
         return move_project(project_slug, parent)
-    if src is None or dst is None:
-        return "Fehler: src und dst nötig (oder project_slug für Projekt-Move)."
-    if isinstance(src, list):
-        return move_paths(src, dst, overwrite)
-    if isinstance(src, str):
+    # Defensive: LLM könnte src statt srcs senden mit Liste
+    if isinstance(src, list) and not srcs:
+        srcs = src
+        src = None
+    if srcs:
+        if not dst:
+            return "Fehler: dst (Ziel-Ordner) nötig für Bulk-Move."
+        if not isinstance(srcs, list):
+            return "Fehler: srcs muss eine Liste sein."
+        return move_paths(srcs, dst, overwrite)
+    if src:
+        if not dst:
+            return "Fehler: dst nötig für Einzel-Move."
         return move_path(src, dst, overwrite)
-    return f"Fehler: src muss str oder list sein, nicht {type(src).__name__}."
+    return "Fehler: keiner der drei Modi erkannt — gib src+dst ODER srcs+dst ODER project_slug an."
 
 
 EDIT_FILE_MAX_BYTES = 5 * 1024 * 1024     # 5 MB — keine Massenfile-Edits
@@ -3536,25 +3540,24 @@ TOOLS = [
     {"type": "function", "function": {
         "name": "move",
         "description": (
-            "Vereinheitlichtes Move-Tool für 3 Use-Cases:\n"
-            "(1) EINE Datei/Ordner umbenennen/verschieben: src=str, dst=str.\n"
-            "(2) MEHRERE Files in einen Zielordner (bulk, spart Tool-Calls): src=list, dst=str.\n"
-            "(3) Projekt verschieben (mit Subprojekt-Logic): project_slug=str, parent=str|leer.\n"
-            "Für Multi-File-Upload IMMER Bulk-Mode nutzen statt N-mal einzeln."
+            "Vereinheitlichtes Move-Tool für 3 Use-Cases — nutze GENAU EINEN Modus:\n"
+            "(1) EINE Datei/Ordner: src='pfad', dst='ziel'.\n"
+            "(2) MEHRERE Files in Zielordner (bulk, spart Tool-Calls): srcs=['a','b'], dst='ordner/'.\n"
+            "(3) Projekt verschieben: project_slug='X', parent='Y' (oder leer für Top-Level).\n"
+            "Für Multi-File-Upload IMMER (2) statt N-mal (1)."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "src": {
-                    "description": "String (Einzel-Move) oder Liste (Bulk). Weglassen bei project_slug.",
-                    "anyOf": [
-                        {"type": "string"},
-                        {"type": "array", "items": {"type": "string"}},
-                    ],
+                "src": {"type": "string", "description": "Einzel-Move: Quell-Pfad (vault-relativ)."},
+                "srcs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Bulk-Move: Liste von Quell-Pfaden.",
                 },
-                "dst": {"type": "string", "description": "Ziel-Pfad oder Ziel-Ordner. Bei project_slug irrelevant."},
-                "project_slug": {"type": "string", "description": "Bei Projekt-Move: Slug des zu verschiebenden Projekts."},
-                "parent": {"type": "string", "description": "Nur bei project_slug: neuer Parent-Slug oder leer für Top-Level."},
+                "dst": {"type": "string", "description": "Ziel-Pfad/Ordner. Bei project_slug irrelevant."},
+                "project_slug": {"type": "string", "description": "Bei Projekt-Move: Slug."},
+                "parent": {"type": "string", "description": "Bei project_slug: neuer Parent oder leer für Top-Level."},
                 "overwrite": {"type": "boolean", "default": False},
             },
             "required": [],
