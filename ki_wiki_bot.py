@@ -4434,7 +4434,6 @@ async def safe_reply(update: Update, text: str) -> None:
             await update.message.reply_text(prefix + _strip_html(chunk))
 
 
-@require_auth
 def _detect_pending_reply_intent(text: str) -> Optional[str]:
     """Erkennt ob User-Message eine Antwort auf pending Memory/Health-Liste ist.
 
