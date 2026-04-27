@@ -161,6 +161,44 @@ def safe_path(rel_path: str) -> Path:
     return p
 
 
+def iter_vault_md(root: Optional[Path] = None,
+                  recursive: bool = True,
+                  skip_noise: bool = True):
+    """Generator über .md-Files mit geladenem Frontmatter.
+
+    Konsolidiert das Vault-Walk-Pattern aus 5+ Stellen — vorher überall
+    selbst implementiert, mit leicht unterschiedlichen Skip-Listen und
+    Error-Handling. Jetzt einheitlich.
+
+    root: Wurzel — Default VAULT (ganzes Vault). Bei z.B. TASKS_DIR genügt
+          recursive=False (flache Liste).
+    recursive: True → rglob, False → glob.
+    skip_noise: skippt VAULT_NOISE_DIRS (Templates/Tools/Meta/Archive).
+                Nur relevant wenn Pfade unter VAULT liegen.
+
+    Yields: (path, frontmatter.Post)-Tuples. Files mit kaputtem YAML werden
+            geloggt + übersprungen — kein Crash.
+    """
+    if root is None:
+        root = VAULT
+    iter_method = root.rglob if recursive else root.glob
+    vault_resolved = VAULT.resolve() if skip_noise else None
+    for path in iter_method("*.md"):
+        if skip_noise:
+            try:
+                rel = path.resolve().relative_to(vault_resolved)
+                if rel.parts and rel.parts[0] in VAULT_NOISE_DIRS:
+                    continue
+            except (ValueError, AttributeError):
+                pass  # Pfad nicht unter VAULT — kein Skip-Check möglich
+        try:
+            post = frontmatter.load(path)
+        except Exception as e:
+            log.warning(f"frontmatter parse failed: {path.name}: {e}")
+            continue
+        yield path, post
+
+
 def find_project_dir(slug: str) -> Optional[Path]:
     """Findet einen Projekt-Ordner via rekursiver Suche unter 05_Projects/.
 
@@ -322,9 +360,10 @@ _AUTO_LINK_CACHE: tuple = (0.0, {})
 _AUTO_LINK_TTL_SEC = 300  # 5 Min — bei Schreibvorgang explizit invalidiert
 _AUTO_LINK_LOCK = threading.Lock()
 
-# Verzeichnisse die NIE gescannt werden (Templates/Tools/Memory würden False-
-# Positives erzeugen und nichts Sinnvolles beitragen)
-_LINK_INDEX_SKIP_DIRS = {
+# Verzeichnisse die NIE für Auto-Link/Listings/Indexes gescannt werden
+# (Templates/Tools/Memory/Archive würden False-Positives erzeugen und
+# nichts Sinnvolles beitragen). Genutzt von iter_vault_md() + auto_link.
+VAULT_NOISE_DIRS = {
     ".obsidian", ".trash", "99_Archive",
     "06_Meta", "07_Tools", "08_Templates",
 }
@@ -366,14 +405,7 @@ def _build_link_index() -> dict:
     if not VAULT.exists():
         return phrase_map
 
-    for md_file in VAULT.rglob("*.md"):
-        rel = md_file.relative_to(VAULT)
-        if rel.parts and rel.parts[0] in _LINK_INDEX_SKIP_DIRS:
-            continue
-        try:
-            post = frontmatter.load(md_file)
-        except Exception:
-            continue
+    for md_file, post in iter_vault_md():
         meta = post.metadata
         file_id = meta.get("id")
         if not file_id or not isinstance(file_id, str):
@@ -747,11 +779,7 @@ def _read_open_tasks() -> list:
     if not TASKS_DIR.exists():
         return []
     out = []
-    for f in TASKS_DIR.glob("*.md"):
-        try:
-            post = frontmatter.load(f)
-        except Exception:
-            continue
+    for f, post in iter_vault_md(TASKS_DIR, recursive=False, skip_noise=False):
         meta = post.metadata
         status = meta.get("status", "")
         if status not in ("open", "in-progress", "blocked"):
@@ -1906,18 +1934,12 @@ def list_existing_tags(top_n: int = 30) -> str:
     """
     from collections import Counter
     counter: Counter = Counter()
-    for p in VAULT.rglob("*.md"):
-        if any(part in (".obsidian", "99_Archive", ".trash") for part in p.parts):
-            continue
-        try:
-            post = frontmatter.load(p)
-            tags = post.get("tags") or []
-            if isinstance(tags, list):
-                for t in tags:
-                    if isinstance(t, str) and t.strip():
-                        counter[t.strip().lower()] += 1
-        except Exception:
-            continue
+    for _, post in iter_vault_md():
+        tags = post.get("tags") or []
+        if isinstance(tags, list):
+            for t in tags:
+                if isinstance(t, str) and t.strip():
+                    counter[t.strip().lower()] += 1
     if not counter:
         return "Keine Tags im Vault — du legst die Konvention fest."
     top = counter.most_common(top_n)
@@ -4143,24 +4165,19 @@ def compute_briefing() -> str:
     # ─── Tasks-Scan: überfällig + offen ───
     open_tasks = []
     overdue = []
-    if TASKS_DIR.exists():
-        for tp in TASKS_DIR.glob("*.md"):
-            try:
-                tpost = frontmatter.load(tp)
-                status = str(tpost.get("status", "")).lower()
-                if status in ("done", "cancelled"):
-                    continue
-                title = str(tpost.get("title", tp.stem))
-                tid = str(tpost.get("id", f"t-{tp.stem}"))
-                prio = str(tpost.get("priority", "medium"))
-                due = str(tpost.get("due", "")).strip()
-                entry = (tid, title, prio, due)
-                if due and due < today:
-                    overdue.append(entry)
-                else:
-                    open_tasks.append(entry)
-            except Exception:
-                continue
+    for tp, tpost in iter_vault_md(TASKS_DIR, recursive=False, skip_noise=False):
+        status = str(tpost.get("status", "")).lower()
+        if status in ("done", "cancelled"):
+            continue
+        title = str(tpost.get("title", tp.stem))
+        tid = str(tpost.get("id", f"t-{tp.stem}"))
+        prio = str(tpost.get("priority", "medium"))
+        due = str(tpost.get("due", "")).strip()
+        entry = (tid, title, prio, due)
+        if due and due < today:
+            overdue.append(entry)
+        else:
+            open_tasks.append(entry)
 
     if overdue:
         overdue.sort(key=lambda x: x[3])
@@ -4308,13 +4325,8 @@ def reset_recurring_tasks() -> dict:
     checked = 0
     reactivated = []
 
-    for task_file in TASKS_DIR.glob("*.md"):
+    for task_file, post in iter_vault_md(TASKS_DIR, recursive=False, skip_noise=False):
         checked += 1
-        try:
-            post = frontmatter.load(task_file)
-        except Exception as e:
-            log.warning(f"recurring-reset: konnte {task_file.name} nicht laden: {e}")
-            continue
         meta = post.metadata
         recurrence = meta.get("recurrence")
         if not recurrence or recurrence not in VALID_TASK_RECURRENCE:
