@@ -2927,8 +2927,8 @@ Antworte AUSSCHLIESSLICH mit JSON-Array (kein Markdown, kein Erklärungs-Text):
 """
 
     try:
-        resp = await asyncio.to_thread(
-            llm.chat.completions.create,
+        resp = await _llm_call_with_retry(
+            llm,
             model=LLM_MODEL,
             messages=[
                 {"role": "system", "content": "Du bist Memory-Extractor. Antworte nur mit valid JSON."},
@@ -4090,6 +4090,127 @@ def _sanitize_error(msg: str) -> str:
     return msg
 
 
+# ─── LLM-API-Retry mit exponential backoff ──────────────────────────────────
+# Ollama/OpenRouter/OpenAI haben gelegentlich transiente Fehler (502, timeout,
+# rate-limit). Vorher: Exception bubble → llm_loop crashed → User muss neu
+# schreiben. Jetzt: 3 Versuche mit 1s/2s/4s Backoff, dann erst geben wir auf.
+
+LLM_RETRY_ATTEMPTS = 3
+LLM_RETRY_BASE_DELAY = 1.0  # 1s, 2s, 4s
+
+# Tool-Hard-Timeout: egal was ein Tool tut, nach 90s abbrechen.
+# Real-World-Anker: backup_vault dauert ~30s, extract_pdf_text ~10-20s
+# bei großem PDF, search_vault timeout intern auf 30s. 90s ist großzügig.
+TOOL_TIMEOUT_SEC = 90
+
+# Welche Exception-Typen retry-würdig sind (transient). Andere werfen direkt.
+def _is_retriable_llm_error(e: Exception) -> bool:
+    name = type(e).__name__
+    # OpenAI-SDK + httpx Standard-Errors die transient sein können
+    transient_names = (
+        "APIConnectionError", "APITimeoutError", "InternalServerError",
+        "RateLimitError", "ConnectionError", "TimeoutException",
+        "ReadTimeout", "ConnectTimeout", "RemoteProtocolError",
+    )
+    if name in transient_names:
+        return True
+    # HTTPStatusError: 408/429/500/502/503/504 → retry, alles andere nicht
+    status = getattr(e, "status_code", None) or getattr(getattr(e, "response", None), "status_code", None)
+    if status in (408, 429, 500, 502, 503, 504):
+        return True
+    # Generic check via String-Match (Fallback)
+    msg = str(e).lower()
+    if any(s in msg for s in ("timeout", "connection", "rate limit", "502", "503", "504")):
+        return True
+    return False
+
+
+# History-Token-Budget — verhindert Context-Overflow bei langen Sessions.
+# Konservativ: 80k von typisch 128k Context-Window, Rest für Tool-Schemas
+# (~3k) + Response (~8k) + Safety-Buffer.
+HISTORY_TOKEN_BUDGET = 80_000
+
+
+def _estimate_tokens(msg_list: list) -> int:
+    """Rough char-based estimate: ~4 chars/token. Schnell + ohne extra Dep."""
+    total = 0
+    for m in msg_list:
+        content = m.get("content", "")
+        if isinstance(content, list):
+            for c in content:
+                if isinstance(c, dict):
+                    total += len(str(c.get("text", "")))
+                elif isinstance(c, str):
+                    total += len(c)
+        else:
+            total += len(str(content))
+        # Tool-calls dranzählen (Args sind JSON-strings)
+        for tc in m.get("tool_calls", []) or []:
+            try:
+                total += len(json.dumps(tc, default=str))
+            except Exception:
+                pass
+    return total // 4
+
+
+def _truncate_history_for_budget(messages: list, budget: int = HISTORY_TOKEN_BUDGET) -> list:
+    """Trim älteste history-Messages bis Token-Budget passt.
+
+    Invarianten:
+      - messages[0] (system) immer behalten
+      - messages[-1] (neue user-message) immer behalten
+      - middle wird in 2er-Schritten getrimmt (pair-aware: assistant + tool)
+      - keine orphaned tool-Messages am middle-start (würde LLM verwirren)
+    """
+    if not messages or len(messages) <= 2:
+        return messages
+    if _estimate_tokens(messages) <= budget:
+        return messages
+
+    system = messages[0]
+    last = messages[-1]
+    middle = list(messages[1:-1])
+    dropped = 0
+
+    while middle and _estimate_tokens([system] + middle + [last]) > budget:
+        # 2 raus, plus orphaned tool-message am Anfang weg
+        middle = middle[2:]
+        dropped += 2
+        # Wenn middle[0] orphaned tool-message → auch raus
+        while middle and middle[0].get("role") == "tool":
+            middle = middle[1:]
+            dropped += 1
+
+    if dropped:
+        log.warning(f"history-truncate: {dropped} alte Messages gecuttet (Budget {budget} tokens)")
+    return [system] + middle + [last]
+
+
+async def _llm_call_with_retry(client, **kwargs):
+    """Wrapper um client.chat.completions.create mit Retry+Backoff.
+
+    Bei retry-würdigem Error: bis zu 3 Versuche, exponential backoff.
+    Bei nicht-retry-würdigem Error: sofort raise.
+    """
+    last_exc = None
+    for attempt in range(LLM_RETRY_ATTEMPTS):
+        try:
+            return await asyncio.to_thread(client.chat.completions.create, **kwargs)
+        except Exception as e:
+            last_exc = e
+            if not _is_retriable_llm_error(e):
+                raise
+            if attempt < LLM_RETRY_ATTEMPTS - 1:
+                delay = LLM_RETRY_BASE_DELAY * (2 ** attempt)
+                log.warning(
+                    f"LLM-Call fehlgeschlagen (attempt {attempt+1}/{LLM_RETRY_ATTEMPTS}, "
+                    f"retry in {delay}s): {type(e).__name__}: {str(e)[:200]}"
+                )
+                await asyncio.sleep(delay)
+    # Alle Versuche aufgebraucht
+    raise last_exc
+
+
 async def llm_loop(user_text: str, user_id: int) -> str:
     """Run tool-use loop until final answer or limit reached.
 
@@ -4132,6 +4253,12 @@ async def llm_loop(user_text: str, user_id: int) -> str:
         },
     ] + history + [new_user_msg]
 
+    # Token-Budget-Truncation: bei langen Sessions würde messages das
+    # Context-Window von Ollama (128k) sprengen. Wir trimmen ältere
+    # history-Messages BEFORE jedem LLM-Call (system + neueste user
+    # bleiben immer drin).
+    messages = _truncate_history_for_budget(messages)
+
     # Diese Messages werden am Ende zur History dazugefügt
     new_history_msgs = [new_user_msg]
 
@@ -4149,8 +4276,11 @@ async def llm_loop(user_text: str, user_id: int) -> str:
     consecutive_failures: dict = {}  # tool_name → fail-count in Folge
 
     for iteration in range(LOOP_LIMIT):
-        resp = await asyncio.to_thread(
-            llm.chat.completions.create,
+        # Innerhalb des Loops können messages durch Tool-Outputs wachsen
+        # (z.B. read_file mit 8KB content). Vor jedem LLM-Call re-trim.
+        messages = _truncate_history_for_budget(messages)
+        resp = await _llm_call_with_retry(
+            llm,
             model=LLM_MODEL,
             messages=messages,
             tools=TOOLS,
@@ -4189,13 +4319,30 @@ async def llm_loop(user_text: str, user_id: int) -> str:
                     # KRITISCH: handler in Threadpool — sonst blockiert
                     # backup_vault/clip_url/_build_link_index/extract_pdf_text
                     # den ganzen Telegram-Event-Loop minutenlang.
-                    result = await asyncio.to_thread(handler, **args)
-                    completed_tool_calls.append(tc.function.name)
-                    # Heuristic: Tool-Result der mit "Fehler"/"failed" anfängt → fail
-                    if isinstance(result, str) and re.match(
-                        r"^(Fehler|❌|Pfad-Fehler|Tool nicht|Ungültig)", result
-                    ):
+                    # PLUS: hard timeout pro Tool — egal was es tut, nach
+                    # TOOL_TIMEOUT_SEC ist Schluss. Verhindert dass ein
+                    # hängendes Tool den ganzen Bot lahmlegt.
+                    tool_start = time.time()
+                    try:
+                        result = await asyncio.wait_for(
+                            asyncio.to_thread(handler, **args),
+                            timeout=TOOL_TIMEOUT_SEC,
+                        )
+                    except asyncio.TimeoutError:
+                        result = (f"Tool-Timeout: `{tc.function.name}` lief länger "
+                                  f"als {TOOL_TIMEOUT_SEC}s und wurde abgebrochen.")
                         tool_failed = True
+                        log.warning(f"tool[{tc.function.name}] timeout after {TOOL_TIMEOUT_SEC}s")
+                    else:
+                        elapsed = time.time() - tool_start
+                        if elapsed > 5:
+                            log.info(f"tool[{tc.function.name}] dauerte {elapsed:.1f}s")
+                        completed_tool_calls.append(tc.function.name)
+                        # Heuristic: Tool-Result der mit "Fehler"/"failed" anfängt → fail
+                        if isinstance(result, str) and re.match(
+                            r"^(Fehler|❌|Pfad-Fehler|Tool nicht|Ungültig|Tool-Timeout)", result
+                        ):
+                            tool_failed = True
             except Exception as e:
                 log.exception(f"Tool {tc.function.name} failed")
                 # Token/Credential-Maskierung — Error landet in LLM-History
@@ -4663,8 +4810,8 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f" Kontext vom User: \"{user_caption}\"" if user_caption else
             "Beschreibe in 1-2 Sätzen knapp, was auf dem Bild ist."
         )
-        vision_resp = await asyncio.to_thread(
-            vision_llm.chat.completions.create,
+        vision_resp = await _llm_call_with_retry(
+            vision_llm,
             model=VISION_MODEL,
             messages=[{
                 "role": "user",
