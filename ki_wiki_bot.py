@@ -4624,11 +4624,29 @@ def _strip_html(text: str) -> str:
     return text
 
 
+def _strip_paren_wikilinks(text: str) -> str:
+    """Entfernt redundante Slug-Wikilinks in Klammern: 'Foo ([[t-foo]])' → 'Foo'.
+
+    Hintergrund: Bei Status-Bestätigungen (mark_task_done/delete/move) hängt
+    der LLM trotz Prompt-Regel oft noch '([[t-slug]])' an den Titel — purer
+    Lärm, weil der User den Task gerade selbst genannt hat. Wir strippen das
+    deterministisch raus. Bare Wikilinks (nicht in Klammern) bleiben erhalten,
+    weil das echte Klick-Anker zu Neu-Erstellungen sind.
+    """
+    if not text:
+        return text
+    # `([[...]])` mit optional Whitespace davor — Multi-line safe
+    return re.sub(r"[ \t]*\(\[\[[^\[\]\n]+\]\]\)", "", text)
+
+
 async def safe_reply(update: Update, text: str) -> None:
     """Split + send. HTML-Format mit Plain-Fallback bei Parse-Fehler."""
     if not text:
         await update.message.reply_text("(leer)")
         return
+
+    # Noise-Wikilinks rausstrippen, BEVOR Markdown→HTML konvertiert
+    text = _strip_paren_wikilinks(text)
 
     # Erst Markdown→HTML, dann splitten
     html = md_to_telegram_html(text)
