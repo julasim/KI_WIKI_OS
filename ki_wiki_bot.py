@@ -4546,6 +4546,20 @@ def md_to_telegram_html(text: str) -> str:
         stash.append(html_fragment)
         return f"\x00S{len(stash)-1}\x00"
 
+    # 0) LLM-HTML-Tags zu Newlines/Plain umwandeln, BEVOR escape rennt.
+    #    gpt-oss & Co. bauen trotz "NIE HTML"-Prompt-Regel <br>, <p>, <li> etc.
+    #    rein. Würde später als &lt;br&gt; im Telegram landen → unleserlich.
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"</?p\s*/?>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"</?div\s*/?>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<li\s*/?>", "\n• ", text, flags=re.IGNORECASE)
+    text = re.sub(r"</li>", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"</?[ou]l\s*/?>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<h[1-6]\s*/?>", "\n**", text, flags=re.IGNORECASE)
+    text = re.sub(r"</h[1-6]>", "**\n", text, flags=re.IGNORECASE)
+    # Kollabiere ≥3 Newlines zu max 2 (sonst tonnen Leerzeilen)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
     # 1) TABELLEN — Renderer entscheidet je nach Breite/Spaltenzahl:
     #    schmal → monospaced <pre>, 2-Spalten breit → "Key: Value"-Liste,
     #    ≥3 Spalten breit → Sektions-Layout. Renderer liefert fertiges HTML.
