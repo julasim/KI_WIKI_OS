@@ -1148,7 +1148,11 @@ def _format_task_line(t: dict, today: date) -> str:
                 due_str = f" · {dd.isoformat()}"
         else:
             due_str = f" · {d}"
-    return f"  {prio_sym} [[{t['id']}]] {t['title']}{proj}{due_str}{rec_sym}"
+    # Wikilink bewusst NICHT mehr in der Bullet-Zeile — der LLM kopiert ihn
+    # sonst stumpf in die Telegram-Antwort und User sieht den Slug-Lärm.
+    # ID steht weiter im Frontmatter und ist via search_vault auffindbar,
+    # falls der LLM auf einen Task per ID referenzieren muss.
+    return f"  {prio_sym} {t['title']}{proj}{due_str}{rec_sym}"
 
 
 def _due_to_date(d) -> Optional[date]:
