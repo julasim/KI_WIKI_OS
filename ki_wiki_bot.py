@@ -516,14 +516,15 @@ def _is_system_file(path: Path) -> bool:
             return True
     except Exception:
         pass
-    # README.md in Subordnern: skippen AUSSER unter 05_Projects/ (dort echtes
-    # Project-README mit Frontmatter type:project).
+    # README.md in Subordnern: skippen AUSSER es ist eine Project-README.
+    # Project-README liegt in 05_Projects/<slug>/README.md (parts ≥ 3),
+    # NICHT 05_Projects/README.md (parts == 2 — das ist Top-Level-Doku).
     if name == "README.md":
         try:
             rel = path.relative_to(VAULT)
-            if rel.parts and rel.parts[0] == "05_Projects":
-                return False  # Project-README → behalten
-            return True       # andere README → System-Doku, skip
+            if (len(rel.parts) >= 3 and rel.parts[0] == "05_Projects"):
+                return False  # echte Project-README → behalten
+            return True       # alle anderen README → System-Doku, skip
         except ValueError:
             return True
     return False
@@ -898,7 +899,10 @@ def create_task(title: str, priority: str = "medium",
 
     # Link in heutige Daily
     try:
-        append_to_daily("Heute", f"- [ ] [[{task_id}]] {title}")
+        # Pipe-Syntax: title ist im Stash von auto_link geschützt → kein
+        # nested-Wikilink-Bug wenn title Substring von einem anderen ID ist
+        # (vorher: "Matura" im Title → auto_link nested daraus [[project-matura|...]])
+        append_to_daily("Heute", f"- [ ] [[{task_id}|{title}]]")
     except Exception as e:
         log.warning(f"Daily-Link für Task fehlgeschlagen: {e}")
 
@@ -5096,7 +5100,22 @@ def collect_health_data() -> dict:
             backlinks_count[target] = backlinks_count.get(target, 0) + 1
 
     # ── Check 2: Broken Wikilinks (Pass 2 nach komplettem Walk) ──
+    # Wie Obsidian: Wikilink ist auflösbar wenn target == id ODER == filename-stem.
+    # Vorher nur id-Match → User-Files mit `[[Panama – Budget]]` (kein id-Frontmatter,
+    # aber File `Panama – Budget.md` existiert) wurden fälschlich als broken gemeldet.
     all_ids = {p.metadata.get("id") for _, p in all_notes if p.metadata.get("id")}
+    all_stems = {p.stem for p, _ in all_notes}
+    # Plus: System-File-Stems (CLAUDE/SCHEMA/PIPELINES/COMMANDS/MOC/README) —
+    # die werden in iter_vault_md geskippt, aber valide Wikilink-Targets:
+    # ein User-File darf `[[SCHEMA]]` schreiben ohne dass das als broken gilt.
+    system_stems = set()
+    for sysfile in _VAULT_ROOT_SYSTEM_DOCS:
+        if (VAULT / sysfile).exists():
+            system_stems.add(Path(sysfile).stem)
+    all_known = all_ids | all_stems | system_stems
+    # Plus: Wikilinks mit nested [[ am Ende des targets sind syntaktisch kaputt
+    # (z.B. "[[t-foo-[[bar]]" statt "[[t-foo|bar]]"). Werden trotzdem gemeldet
+    # weil das ein echter Bug im Source-File ist.
     for path, post in all_notes:
         body = post.content or ""
         body_clean = re.sub(r"```.*?```", "", body, flags=re.DOTALL)
@@ -5104,7 +5123,7 @@ def collect_health_data() -> dict:
         rel = path.relative_to(VAULT).as_posix()
         for m in re.finditer(r"\[\[([^\]|#]+?)(?:\|[^\]]*)?\]\]", body_clean):
             target = m.group(1).strip()
-            if target not in all_ids:
+            if target not in all_known:
                 broken_links.append((rel, target))
 
     # ── Check 3: Orphans (Wiki-Files ohne incoming Backlinks) ──
@@ -6153,7 +6172,7 @@ def reset_recurring_tasks() -> dict:
             # Link in heutige Daily damit User es im Briefing sieht
             try:
                 title = meta.get("title", slug)
-                append_to_daily("Heute", f"- [ ] [[t-{slug}]] {title} (wiederkehrend)")
+                append_to_daily("Heute", f"- [ ] [[t-{slug}|{title}]] (wiederkehrend)")
             except Exception as e:
                 log.warning(f"Daily-Link für reaktivierten Task fehlgeschlagen: {e}")
         except Exception as e:
