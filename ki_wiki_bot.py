@@ -198,7 +198,8 @@ def iter_vault_md(root: Optional[Path] = None,
     root: Wurzel — Default VAULT (ganzes Vault). Bei z.B. TASKS_DIR genügt
           recursive=False (flache Liste).
     recursive: True → rglob, False → glob.
-    skip_noise: skippt VAULT_NOISE_DIRS (Templates/Tools/Meta/Archive).
+    skip_noise: skippt VAULT_NOISE_DIRS (Templates/Tools/Meta/Archive)
+                UND VAULT_NOISE_FILE_NAMES (System-Doku, _index.md, CONTEXT.md).
                 Nur relevant wenn Pfade unter VAULT liegen.
 
     Yields: (path, frontmatter.Post)-Tuples. Files mit kaputtem YAML werden
@@ -209,9 +210,13 @@ def iter_vault_md(root: Optional[Path] = None,
     iter_method = root.rglob if recursive else root.glob
     for path in iter_method("*.md"):
         if skip_noise:
-            # BUG-FIX: kein path.resolve() — rglob/glob liefern bereits
-            # absolute Pfade unter root, resolve() ist nur ein zusätzlicher
-            # filesystem-call ohne Mehrwert (potentiell langsam bei NFS).
+            # System-Files überall skippen (CLAUDE/MOC/_index/CONTEXT etc.)
+            # — diese sind absichtlich ohne Frontmatter bzw. Doku-Files mit
+            # Wikilink-Beispielen die als "broken link" missverstanden würden.
+            # Project-READMEs werden hier NICHT geskippt (sind User-Content
+            # mit Frontmatter type:project).
+            if _is_system_file(path):
+                continue
             try:
                 rel = path.relative_to(VAULT)
                 if rel.parts and rel.parts[0] in VAULT_NOISE_DIRS:
@@ -486,6 +491,42 @@ VAULT_NOISE_DIRS = {
     ".obsidian", ".trash", "99_Archive",
     "06_Meta", "07_Tools", "08_Templates",
 }
+
+# Doku-Files im Vault-Root die KEIN Frontmatter haben sollen.
+_VAULT_ROOT_SYSTEM_DOCS = {
+    "README.md", "MOC.md", "CLAUDE.md", "SCHEMA.md", "COMMANDS.md", "PIPELINES.md",
+}
+
+
+def _is_system_file(path: Path) -> bool:
+    """True wenn Datei System/Doku/Auto-Generated und nicht User-Content.
+
+    Wird von iter_vault_md(skip_noise=True) genutzt.
+    Nuanciert: Project-READMEs (05_Projects/<slug>/README.md) sind echte
+    User-Content-Files mit Frontmatter (type:project) und werden NICHT geskippt.
+    """
+    name = path.name
+    # _index.md (auto-generiert von vault_toolkit) und CONTEXT.md (Projekt-
+    # Kontext, freier Text ohne Schema) überall skippen.
+    if name in ("_index.md", "CONTEXT.md"):
+        return True
+    # Vault-Root-Doku (CLAUDE/MOC/COMMANDS/SCHEMA/PIPELINES/README) skippen
+    try:
+        if path.parent == VAULT and name in _VAULT_ROOT_SYSTEM_DOCS:
+            return True
+    except Exception:
+        pass
+    # README.md in Subordnern: skippen AUSSER unter 05_Projects/ (dort echtes
+    # Project-README mit Frontmatter type:project).
+    if name == "README.md":
+        try:
+            rel = path.relative_to(VAULT)
+            if rel.parts and rel.parts[0] == "05_Projects":
+                return False  # Project-README → behalten
+            return True       # andere README → System-Doku, skip
+        except ValueError:
+            return True
+    return False
 
 # Häufige Wörter die Bot oft schreibt — würden sonst nervig auto-linked
 # wenn jemand zufällig ein Note/Task mit so einem Title hat
