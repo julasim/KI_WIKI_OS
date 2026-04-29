@@ -4362,6 +4362,9 @@ async def llm_loop(user_text: str, user_id: int) -> str:
             tool_msg = {
                 "role": "tool",
                 "tool_call_id": tc.id,
+                # name-Feld nötig für Gemini's OpenAI-Kompat-Endpoint —
+                # OpenRouter/Ollama akzeptieren auch ohne, Gemini wirft 400.
+                "name": tc.function.name,
                 "content": str(result),
             }
             messages.append(tool_msg)
