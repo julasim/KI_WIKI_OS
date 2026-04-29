@@ -3156,6 +3156,41 @@ def _read_tail_lines(path: Path, max_bytes: int) -> list[str]:
     return lines
 
 
+def _sanitize_loaded_history(msgs: list) -> list:
+    """Repariert alt-format-Records aus der JSONL für strenge Provider (Gemini).
+
+    - tool-Messages ohne 'name' bekommen den Namen aus der vorherigen
+      assistant-Message mit passender tool_call_id.
+    - Wenn keine Zuordnung möglich → tool-msg + zugehöriger assistant-Aufruf
+      werden DROP (sonst Gemini 400 INVALID_ARGUMENT).
+    """
+    # Map tool_call_id → tool_name aus assistant-Messages
+    id_to_name: dict[str, str] = {}
+    for m in msgs:
+        if m.get("role") == "assistant":
+            for tc in m.get("tool_calls") or []:
+                tc_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+                fn = (tc.get("function") if isinstance(tc, dict) else getattr(tc, "function", None)) or {}
+                fn_name = fn.get("name") if isinstance(fn, dict) else getattr(fn, "name", None)
+                if tc_id and fn_name:
+                    id_to_name[tc_id] = fn_name
+
+    out: list = []
+    for m in msgs:
+        if m.get("role") == "tool":
+            if not m.get("name"):
+                tc_id = m.get("tool_call_id")
+                fn_name = id_to_name.get(tc_id) if tc_id else None
+                if fn_name:
+                    m = dict(m)  # nicht mutieren
+                    m["name"] = fn_name
+                else:
+                    # Nicht reparierbar → skippen (sonst Gemini-400)
+                    continue
+        out.append(m)
+    return out
+
+
 def _load_persistent_history(user_id: int) -> list:
     """Letzte HISTORY_MAX_MESSAGES Messages für User aus JSONL laden.
 
@@ -3177,7 +3212,8 @@ def _load_persistent_history(user_id: int) -> list:
                     records.append(rec)
             except json.JSONDecodeError:
                 continue
-        return [r["msg"] for r in records[-HISTORY_MAX_MESSAGES:]]
+        msgs = [r["msg"] for r in records[-HISTORY_MAX_MESSAGES:]]
+        return _sanitize_loaded_history(msgs)
     except Exception as e:
         log.warning(f"history load failed: {e}")
         return []
