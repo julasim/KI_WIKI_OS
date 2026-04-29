@@ -62,6 +62,16 @@ if not LLM_API_KEY:
     raise RuntimeError("LLM_API_KEY (oder OPENROUTER_API_KEY) muss gesetzt sein.")
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://openrouter.ai/api/v1")
 LLM_MODEL = os.environ.get("LLM_MODEL", "anthropic/claude-sonnet-4-5")
+# Provider-Detection für Format-Kompatibilität:
+# - Anthropic-direkt + OpenRouter→Anthropic: cache_control + content-as-list erlaubt
+# - Gemini OpenAI-Compat + reine OpenAI: content muss String sein, kein cache_control
+# - Ollama: content muss String sein
+_LLM_BASE_LOWER = LLM_BASE_URL.lower()
+_LLM_MODEL_LOWER = LLM_MODEL.lower()
+USE_ANTHROPIC_CACHE = (
+    "anthropic" in _LLM_BASE_LOWER
+    or ("openrouter" in _LLM_BASE_LOWER and _LLM_MODEL_LOWER.startswith("anthropic/"))
+)
 # Vision kann optional ein anderer Provider sein (z.B. wenn Haupt-LLM kein Vision kann)
 VISION_API_KEY = os.environ.get("VISION_API_KEY", LLM_API_KEY)
 VISION_BASE_URL = os.environ.get("VISION_BASE_URL", LLM_BASE_URL)
@@ -1886,20 +1896,37 @@ PENDING_DELETIONS: dict[int, tuple[list[str], float, str]] = {}  # uid → (path
 DELETE_CONFIRM_TIMEOUT = 300  # Sekunden
 
 
-def request_delete(rel_paths, permanent: bool = False) -> str:
+def request_delete(rel_path=None, rel_paths=None, permanent: bool = False) -> str:
     """Merkt sich eine Lösch-Anfrage. Akkumuliert.
 
-    rel_paths: str oder list[str]
+    rel_path: einzelner Pfad (string) ODER
+    rel_paths: Liste von Pfaden (Bulk).
     permanent: False (Default) = ins 99_Archive/ verschieben (reversibel).
                True = WIRKLICH LÖSCHEN (irreversibel via rm).
+
+    Beide Parameter sind optional damit das Tool-Schema kein oneOf braucht
+    (Gemini/Ollama lehnen oneOf/anyOf in Tool-Params ab).
     """
-    # Input normalisieren
-    if isinstance(rel_paths, str):
-        paths_in = [rel_paths]
-    elif isinstance(rel_paths, list):
-        paths_in = rel_paths
-    else:
-        return f"request_delete: ungültiger Input-Typ {type(rel_paths)}"
+    # Input normalisieren — beide Parameter zusammenführen
+    paths_in: list[str] = []
+    if rel_path is not None:
+        if isinstance(rel_path, str):
+            paths_in.append(rel_path)
+        elif isinstance(rel_path, list):
+            # LLM hat trotz Schema doch Liste in rel_path gepackt → tolerieren
+            paths_in.extend(rel_path)
+        else:
+            return f"request_delete: rel_path ungültiger Typ {type(rel_path)}"
+    if rel_paths is not None:
+        if isinstance(rel_paths, list):
+            paths_in.extend(rel_paths)
+        elif isinstance(rel_paths, str):
+            # LLM hat trotz Schema String in rel_paths gepackt → tolerieren
+            paths_in.append(rel_paths)
+        else:
+            return f"request_delete: rel_paths ungültiger Typ {type(rel_paths)}"
+    if not paths_in:
+        return "request_delete: keine Pfade angegeben (rel_path oder rel_paths erforderlich)"
 
     # Pfade validieren + sammeln
     valid = []
@@ -3157,12 +3184,17 @@ def _read_tail_lines(path: Path, max_bytes: int) -> list[str]:
 
 
 def _sanitize_loaded_history(msgs: list) -> list:
-    """Repariert alt-format-Records aus der JSONL für strenge Provider (Gemini).
+    """Repariert Messages für strenge Provider (Gemini).
 
-    - tool-Messages ohne 'name' bekommen den Namen aus der vorherigen
-      assistant-Message mit passender tool_call_id.
-    - Wenn keine Zuordnung möglich → tool-msg + zugehöriger assistant-Aufruf
-      werden DROP (sonst Gemini 400 INVALID_ARGUMENT).
+    1. tool-Messages ohne 'name' bekommen den Namen aus der vorherigen
+       assistant-Message mit passender tool_call_id.
+    2. Wenn keine Zuordnung möglich → tool-msg DROP (sonst Gemini 400).
+    3. assistant-Messages mit tool_calls aber ohne content bekommen
+       content="" (Gemini lehnt fehlendes content ab wenn tool_calls da sind).
+    4. tool_calls werden auf {id, type, function:{name, arguments}} whitelisted
+       (entfernt provider-spezifische Extra-Felder die anderswo abgelehnt werden).
+    5. tool_call.function.arguments wird zu String normalisiert (manche Modelle
+       liefern Dict statt JSON-String → Provider-Validation crasht).
     """
     # Map tool_call_id → tool_name aus assistant-Messages
     id_to_name: dict[str, str] = {}
@@ -3177,16 +3209,62 @@ def _sanitize_loaded_history(msgs: list) -> list:
 
     out: list = []
     for m in msgs:
-        if m.get("role") == "tool":
+        role = m.get("role")
+        if role == "tool":
+            # Fix #1: name-Feld nachrüsten oder droppen
             if not m.get("name"):
                 tc_id = m.get("tool_call_id")
                 fn_name = id_to_name.get(tc_id) if tc_id else None
                 if fn_name:
-                    m = dict(m)  # nicht mutieren
+                    m = dict(m)
                     m["name"] = fn_name
                 else:
-                    # Nicht reparierbar → skippen (sonst Gemini-400)
-                    continue
+                    continue  # Nicht reparierbar
+            # Content muss String sein
+            if not isinstance(m.get("content"), str):
+                m = dict(m)
+                m["content"] = str(m.get("content", ""))
+        elif role == "assistant":
+            tcs = m.get("tool_calls")
+            if tcs:
+                m = dict(m)
+                # Fix #4: content="" wenn fehlt aber tool_calls da
+                if m.get("content") is None or "content" not in m:
+                    m["content"] = ""
+                # Fix #5: tool_calls whitelisten
+                clean_tcs = []
+                for tc in tcs:
+                    if not isinstance(tc, dict):
+                        continue
+                    tc_id = tc.get("id")
+                    fn = tc.get("function") or {}
+                    fn_name = fn.get("name") if isinstance(fn, dict) else None
+                    fn_args = fn.get("arguments") if isinstance(fn, dict) else None
+                    # Defensive: id + name müssen vorhanden sein
+                    if not tc_id or not fn_name:
+                        continue
+                    # arguments zu String (kann dict sein bei manchen Modellen)
+                    if isinstance(fn_args, (dict, list)):
+                        try:
+                            fn_args = json.dumps(fn_args, ensure_ascii=False)
+                        except Exception:
+                            fn_args = "{}"
+                    elif fn_args is None:
+                        fn_args = "{}"
+                    elif not isinstance(fn_args, str):
+                        fn_args = str(fn_args)
+                    clean_tcs.append({
+                        "id": tc_id,
+                        "type": "function",
+                        "function": {"name": fn_name, "arguments": fn_args},
+                    })
+                if clean_tcs:
+                    m["tool_calls"] = clean_tcs
+                else:
+                    # Alle tool_calls invalid → drop tool_calls, behalt content
+                    m.pop("tool_calls", None)
+                    if not m.get("content"):
+                        continue  # Komplett leer → skippen
         out.append(m)
     return out
 
@@ -3691,12 +3769,14 @@ TOOLS = [
         "parameters": {
             "type": "object",
             "properties": {
+                "rel_path": {
+                    "type": "string",
+                    "description": "Einzelner Pfad relativ zu Vault-Root. Für mehrere → rel_paths nutzen.",
+                },
                 "rel_paths": {
-                    "oneOf": [
-                        {"type": "string"},
-                        {"type": "array", "items": {"type": "string"}},
-                    ],
-                    "description": "Einzelner Pfad oder Liste von Pfaden, relativ zu Vault-Root",
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Liste von Pfaden relativ zu Vault-Root (Bulk-Delete).",
                 },
                 "permanent": {
                     "type": "boolean",
@@ -3704,7 +3784,9 @@ TOOLS = [
                     "default": False,
                 },
             },
-            "required": ["rel_paths"],
+            # Kein required — Handler akzeptiert rel_path ODER rel_paths.
+            # oneOf wäre semantisch sauberer aber Gemini/Ollama strikt lehnen
+            # oneOf/anyOf in Tool-Schemas ab → 400.
         },
     }},
     {"type": "function", "function": {
@@ -4280,8 +4362,11 @@ async def llm_loop(user_text: str, user_id: int) -> str:
     # System-Prompt + History + neue User-Message
     history = await get_history(user_id)
     new_user_msg = {"role": "user", "content": user_text}
-    messages = [
-        {
+    # Provider-aware System-Message-Format:
+    # Anthropic akzeptiert content-as-list mit cache_control (Prompt-Caching).
+    # Gemini/OpenAI/Ollama erwarten content als plain String — sonst 400.
+    if USE_ANTHROPIC_CACHE:
+        system_msg = {
             "role": "system",
             "content": [
                 {
@@ -4290,8 +4375,10 @@ async def llm_loop(user_text: str, user_id: int) -> str:
                     "cache_control": {"type": "ephemeral"},
                 }
             ],
-        },
-    ] + history + [new_user_msg]
+        }
+    else:
+        system_msg = {"role": "system", "content": sys_text}
+    messages = [system_msg] + history + [new_user_msg]
 
     # Token-Budget-Truncation: bei langen Sessions würde messages das
     # Context-Window von Ollama (128k) sprengen. Wir trimmen ältere
@@ -4319,6 +4406,11 @@ async def llm_loop(user_text: str, user_id: int) -> str:
         # Innerhalb des Loops können messages durch Tool-Outputs wachsen
         # (z.B. read_file mit 8KB content). Vor jedem LLM-Call re-trim.
         messages = _truncate_history_for_budget(messages)
+        # Sanitize-on-Send: Falls irgendwo eine kaputte tool-msg ohne
+        # name oder eine assistant-msg mit tool_calls aber content=None
+        # entstanden ist → reparieren bevor sie an den Provider geht.
+        # Idempotent + günstig, schützt vor Provider-400ern (besonders Gemini).
+        messages = _sanitize_loaded_history(messages)
         resp = await _llm_call_with_retry(
             llm,
             model=LLM_MODEL,
