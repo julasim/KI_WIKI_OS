@@ -2886,7 +2886,7 @@ async def compute_memory_suggestions() -> list:
         for c in corrections
     ) or "(keine Korrekturen)"
 
-    extraction_prompt = f"""Analysiere die folgende 24h-Konversation + Korrekturen und schlage konservativ neue Memory-Einträge vor.
+    extraction_prompt = f"""Analysiere die folgende 24h-Konversation + Korrekturen und schlage NUR DAUERHAFT WAHRE Memory-Einträge vor. Lieber 0 Vorschläge als Müll.
 
 KORREKTUREN:
 {corrections_text[:2000]}
@@ -2894,18 +2894,49 @@ KORREKTUREN:
 KONVERSATION:
 {history_text[:6000]}
 
-Drei Memory-Typen die du vorschlagen kannst:
-1. preference — Stil/Antwort-Regel die User mehrfach erwähnt hat (z.B. "antworte kürzer")
-2. fact — Bio/Setup-Fakt über User der mehrfach auftaucht (z.B. "Schule: HTL Villach")
-3. project_context — projektspezifische Regel (mit project_slug Feld)
+# 3 Memory-Typen
 
-REGELN:
-- KONSERVATIV: nur vorschlagen wenn klar/mehrfach/explizit. KEINE Halluzinationen.
-- Max 5 Vorschläge insgesamt.
-- Wenn nichts klar ist: leeres Array zurückgeben.
-- Nicht das vorschlagen was bereits in PRÄFERENZEN/FAKTEN-Sektion oben steht.
+| Typ | Was | Beispiel ✓ |
+|---|---|---|
+| `preference` | WIE Bot reagiert (Stil, Format, Tonalität) | "Antworte ohne 'Gerne!' am Anfang" |
+| `fact` | Stabiler Bio-/Setup-Fakt über User | "Studiert HTL Bauingenieur 4. Jahr" |
+| `project_context` | Dauerhaftes Projekt-Wissen (mit `project_slug`) | "Kiosk-Sanierung: Auftraggeber Schiemer, ÖNORM B 2061 relevant" |
 
-Antworte AUSSCHLIESSLICH mit JSON-Array (kein Markdown, kein Erklärungs-Text):
+# 3 PFLICHT-Filter (jeden Vorschlag VORHER prüfen!)
+
+## Filter 1 — DAUERHAFTIGKEIT
+Frage dich: "Wäre dieser Eintrag in 30 Tagen noch wahr/relevant?"
+- ✗ "Email morgen 16:00 schicken" → wird obsolet
+- ✗ "User hat heute X gemacht" → vergangene Handlung
+- ✗ "User möchte jetzt eine Notiz für Y" → einmaliger Auftrag
+- ✓ "User wohnt in Wieselburg" → dauerhaft
+- ✓ "Projekt Kiosk: Anschluss DN150" → dauerhafte Projekt-Spec
+
+## Filter 2 — MEHRFACH-NENNUNG
+Wenn etwas nur EINMAL in der Konversation auftauchte → KEIN Vorschlag.
+Ausnahme: explizite Selbstaussage ("Ich heiße X" / "Mein Beruf ist Y") — die zählt auch bei einmaliger Nennung.
+
+## Filter 3 — KEIN DOPPEL-SPEICHERN
+Wenn der Inhalt bereits abgedeckt ist durch:
+- bestehende Reminder (siehe Konversation: wurde `create_reminder` gerufen?)
+- bestehende Tasks (`create_task`)
+- bestehende Notes
+→ KEIN Memory-Vorschlag dafür. Memory ist für PERMANENTE Bot-Anpassung, nicht für Konversations-Echo.
+
+# Anti-Patterns die du NIEMALS vorschlägst
+
+- "User möchte gerade X erledigen" — temporäre Absicht
+- "User hat Email/Anruf an X gemacht" — vergangene Handlung
+- "User braucht heute/morgen Y" — Reminder/Task-Job
+- "User möchte dass Bot jetzt für Projekt X eine Notiz/Task macht" — einmalige Konversations-Anweisung
+- Alles was bereits als Reminder/Task/Note in derselben Konversation gelandet ist
+- Vage Wünsche ("User scheint X zu mögen")
+
+# Output
+
+Max 3 Vorschläge. Wenn nichts die 3 Filter überlebt: `[]`.
+
+Antworte AUSSCHLIESSLICH mit JSON-Array, kein Markdown, kein Erklärungs-Text:
 [
   {{"type": "preference", "text": "...", "evidence": "Grund (kurz, 1 Satz)"}},
   {{"type": "fact", "text": "...", "evidence": "..."}},
