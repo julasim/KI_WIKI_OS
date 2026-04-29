@@ -1388,17 +1388,45 @@ def create_meeting(title: str, attendees: Optional[list] = None,
     return f"Meeting angelegt: [[meeting-{today}-{slug}]]"
 
 
-def create_note(title: str, body: str, tags: Optional[list] = None) -> str:
-    """Create a free note in 10_Life/notes/. Body wird dynamisch gebaut, kein Template-Platzhalter."""
+def create_note(title: str, body: str, tags: Optional[list] = None,
+                project: Optional[str] = None) -> str:
+    """Create a free note. Routing-Logik:
+
+    - explizit `project=<slug>` ODER aktives Projekt im Bot-Kontext
+      → `05_Projects/<slug>/notes/YYYY-MM-DD_<slug>.md` (+ `project: <slug>`
+        im Frontmatter)
+    - sonst → `10_Life/notes/YYYY-MM-DD_<slug>.md` (Default)
+    """
     if not title or not title.strip():
         return "Fehler: Note-Titel darf nicht leer sein."
 
     today = today_iso()
     slug = slugify(title)
-    path = NOTES_DIR / f"{today}_{slug}.md"
+
+    # Project-Routing: explizit > aktives Projekt > generisch
+    project_slug: Optional[str] = None
+    target_dir = NOTES_DIR
+    if project:
+        proj_dir = find_project_dir(project)
+        if proj_dir is None:
+            return (f"Projekt '{project}' nicht gefunden in 05_Projects/. "
+                    f"Note nicht angelegt.")
+        project_slug = proj_dir.name
+        target_dir = proj_dir / "notes"
+    else:
+        active = get_active_project()
+        if active:
+            proj_dir = find_project_dir(active)
+            if proj_dir is not None:
+                project_slug = proj_dir.name
+                target_dir = proj_dir / "notes"
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    path = target_dir / f"{today}_{slug}.md"
     n = 2
     while path.exists():
-        path = NOTES_DIR / f"{today}_{slug}-{n}.md"
+        path = target_dir / f"{today}_{slug}-{n}.md"
         n += 1
 
     # Tags filtern (nur strings, nicht-leer, deduplizieren, lowercase)
@@ -1426,10 +1454,13 @@ def create_note(title: str, body: str, tags: Optional[list] = None) -> str:
         "status": "draft",
         "quelle": "telegram",
     }
+    if project_slug:
+        fm_data["project"] = project_slug
     post = frontmatter.Post(note_body, **fm_data)
     atomic_write(path, frontmatter.dumps(post) + "\n")
     invalidate_link_index()
-    return f"Notiz angelegt: [[{slug}]]"
+    suffix = f" → Projekt {project_slug}" if project_slug else ""
+    return f"Notiz angelegt: [[{slug}]]{suffix}"
 
 
 def search_vault(query: str, limit: int = 5) -> str:
@@ -3647,13 +3678,14 @@ TOOLS = [
     }},
     {"type": "function", "function": {
         "name": "create_note",
-        "description": "Legt eine freie Notiz in 10_Life/notes/ an. Für längere strukturierte Inhalte (>3 Sätze, eigenes Thema), die weder Task noch Tagesreflexion sind. tags: 2-5 thematische Schlagworte aus dem Inhalt.",
+        "description": "Legt eine freie Notiz an. Für längere strukturierte Inhalte (>3 Sätze, eigenes Thema), die weder Task noch Tagesreflexion sind. ROUTING: Wenn ein Projekt im Kontext aktiv ist ODER explizit `project=<slug>` gesetzt → landet in `05_Projects/<slug>/notes/`. Sonst in `10_Life/notes/`.",
         "parameters": {
             "type": "object",
             "properties": {
                 "title": {"type": "string"},
                 "body": {"type": "string"},
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "2-5 thematische Tags, kebab-case Deutsch (z.B. ['gesundheit', 'ernaehrung'])"},
+                "project": {"type": "string", "description": "Optional: Projekt-Slug für Projekt-bezogene Notizen. Note landet dann in 05_Projects/<slug>/notes/. Wenn nicht gesetzt aber aktives Projekt existiert, wird das automatisch verwendet."},
             },
             "required": ["title", "body"],
         },
@@ -4118,7 +4150,10 @@ Antworten auf Memory- oder Health-Listen ("1 3", "alle", "0", "erkläre 2", oder
 Bei `create_task/note/meeting`: 2-5 thematische Tags via `tags`-Parameter (kebab-case Deutsch, z.B. `gesundheit`, `kunde-mueller`). TOPISCH, nicht strukturell (NICHT `task`/`note`). Bei vage Kontext lieber `[]` als schlechte Tags. Optional vorher `list_existing_tags` für Vokabular-Konsistenz.
 
 # KONVERSATIONS-KONTEXT NUTZEN
-Wenn vorhin ein Projekt erstellt/aktiviert wurde und User danach Tasks anlegt die offensichtlich dazu gehören → `project=<slug>` AUTOMATISCH setzen, nicht nachfragen.
+Wenn vorhin ein Projekt erstellt/aktiviert wurde und User danach Tasks oder Notes anlegt die offensichtlich dazu gehören → `project=<slug>` AUTOMATISCH setzen, nicht nachfragen.
+
+# NOTE-ROUTING
+`create_note` routet automatisch: wenn aktives Projekt im Kontext → Note landet in `05_Projects/<slug>/notes/`. Wenn User explizit "Notiz für Kiosk" sagt aber Projekt nicht aktiv → `project=kiosk-sanierung` setzen, NICHT generische 10_Life-Note anlegen. Generische `10_Life/notes/` nur wenn kein Projekt-Bezug erkennbar ist.
 """
 
 # ============================================================================
