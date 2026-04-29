@@ -262,31 +262,6 @@ def find_project_dir(slug: str) -> Optional[Path]:
     return None  # 0 Treffer oder mehrdeutig
 
 
-def list_all_project_slugs() -> list[tuple[str, str]]:
-    """Liefert (slug, relative_path)-Liste aller Projekte (rekursiv).
-
-    Brauchen wir für Mehrdeutigkeits-Diagnose und List-Outputs.
-    """
-    if not PROJECTS_DIR.exists():
-        return []
-    out = []
-    for d in sorted(PROJECTS_DIR.rglob("*")):
-        if not d.is_dir():
-            continue
-        # Nur Projekt-Dirs zählen — die haben README.md mit type: project
-        readme = d / "README.md"
-        if not readme.exists():
-            continue
-        try:
-            post = frontmatter.load(readme)
-            if post.metadata.get("type") == "project":
-                rel = d.relative_to(VAULT).as_posix()
-                out.append((d.name, rel))
-        except Exception:
-            continue
-    return out
-
-
 def atomic_write(path: Path, content: str) -> None:
     """Write atomic: tmp + rename."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1636,41 +1611,6 @@ def move_paths(srcs: list, dst_dir: str, overwrite: bool = False) -> str:
     return "\n".join(parts)
 
 
-def delete_path(rel_path: str, recursive: bool = False) -> str:
-    """Löscht eine Datei oder einen leeren Ordner. recursive=True für Ordner mit Inhalt.
-
-    GEFÄHRLICH bei recursive=True — ruft erst nach expliziter User-Bestätigung.
-    Verschiebt nach 99_Archive/ statt zu löschen wäre sicherer; das ist
-    aber Sache des Callers (z.B. via move_path nach 99_Archive).
-    """
-    if not rel_path or not rel_path.strip():
-        return "Fehler: Pfad darf nicht leer sein."
-    try:
-        p = safe_path(rel_path)
-    except ValueError as e:
-        return f"Pfad-Fehler: {e}"
-    if not p.exists():
-        return f"Nicht gefunden: {rel_path}"
-    if p == VAULT.resolve():
-        return "Fehler: Vault-Root kann nicht gelöscht werden."
-    try:
-        was_dir = p.is_dir()
-        if was_dir:
-            if recursive:
-                shutil.rmtree(p)
-                msg = f"✓ Ordner rekursiv gelöscht: `{rel_path}`"
-            else:
-                p.rmdir()  # nur wenn leer
-                msg = f"✓ Leerer Ordner gelöscht: `{rel_path}`"
-        else:
-            p.unlink()
-            msg = f"✓ Datei gelöscht: `{rel_path}`"
-        invalidate_link_index()  # gelöschte ID darf nicht mehr verlinkt werden
-        return msg
-    except OSError as e:
-        return f"Löschen fehlgeschlagen: {e}"
-
-
 def move_project(slug: str, parent: Optional[str] = None) -> str:
     """Verschiebt ein bestehendes Projekt — entweder als Subprojekt unter `parent`,
     oder zurück auf Top-Level wenn parent=None oder parent='' angegeben wird.
@@ -2600,14 +2540,6 @@ def remember(fact: str) -> str:
     return f"✓ Gemerkt: {fact[:120]}"
 
 
-def list_facts() -> str:
-    """Zeigt alle gemerkten Fakten."""
-    facts = get_facts()
-    if not facts:
-        return "Keine persistenten Fakten gespeichert."
-    return f"Persistente Fakten:\n\n{facts[:3000]}"
-
-
 def forget_fact(pattern: str) -> str:
     """Entfernt Fakten die `pattern` enthalten (case-insensitive)."""
     if not FACTS_FILE.exists():
@@ -2679,13 +2611,6 @@ def set_preference(text: str) -> str:
     with PREFERENCES_FILE.open("a", encoding="utf-8") as f:
         f.write(line)
     return f"✓ Präferenz gemerkt: {text[:120]}"
-
-
-def list_preferences() -> str:
-    prefs = get_preferences()
-    if not prefs:
-        return "Keine Präferenzen gespeichert."
-    return f"Präferenzen:\n\n{prefs[:2000]}"
 
 
 def forget_preference(pattern: str) -> str:
@@ -4138,33 +4063,9 @@ VAULT
 - Mini-Input ohne Kontext ("ja", "?") → nachfragen.
 - Klarer Auftrag → direkt machen, kein "wo soll ich"-Loop.
 
-**KORREKTUR-PATTERN** (kritisch — sonst legst du falsche Tasks an):
-Wenn User mit "nein", "stopp", "falsch", "besser X statt Y", "tausch X zu Y aus",
-"X durch Y ersetzen" reagiert UND vorher gerade etwas erstellt/geschrieben wurde:
-→ Das ist eine KORREKTUR der LETZTEN Aktion, KEIN neuer Auftrag.
-→ NIEMALS "X zu Y aus" als Task-Titel interpretieren — das ist Imperativ "[tausche] X zu Y aus".
-→ Aktion: passende Datei mit `edit_file` korrigieren ODER `request_delete` der falschen Datei.
-→ Plus: `log_correction(was_falsch, was_richtig, kontext)` aufrufen für Lern-Material.
+**Korrekturen**: User-Reaktionen wie "nein/stopp/falsch/besser X statt Y" auf deine LETZTE Aktion → `edit_file` der bestehenden Datei (NICHT neu anlegen) + `log_correction`. Bei Frust → kurz entschuldigen, klärend nachfragen, KEINE blinde Folge-Aktion.
 
-Beispiele:
-- Vorher Task `t-foo` angelegt → User: "nein, das sollte 'bar' heißen" → edit_file Title+id, NICHT neue Task.
-- Vorher CONTEXT.md geschrieben "X" → User: "besser Y statt X" → edit_file CONTEXT.md, NICHT neuer Eintrag.
-- Vorher Reminder gesetzt → User: "stopp, falsche Uhrzeit" → cancel_reminder + neu erstellen.
-
-**FRAME-DISZIPLIN** (NIE verwechseln):
-- Du bist der Bot, User ist Julius. Antworte NIE in Ich-Form mit "Ja, bitte bestätigen"
-  oder "Ja, bitte löschen" — das wäre die User-Antwort, nicht deine.
-- Wenn du eine Bestätigung brauchst, FRAGE in 2.-Person: "Soll ich endgültig löschen? (ja/nein)"
-- Wenn du Tool-Output einbettest: präsentiere ihn, simuliere keine User-Antwort darauf.
-
-**FRUST-ERKENNUNG**:
-Bei klarer User-Frustration ("Bist du dumm?", "STOP", "nein!!!", "wieder falsch", mehrfache !!!,
-sarkastische Klammer-Fragen) → KURZ entschuldigen + klärend nachfragen statt blind weiter zu agieren.
-Beispiel: "Sorry, hab's verbockt. Was soll ich konkret tun?" — KEINE neue Aktion ohne Rückversicherung.
-Plus: `log_correction` aufrufen mit dem was schief lief.
-
-**MULTI-FILE-WORKFLOW** (kritisch — sonst läuft Tool-Loop voll):
-Bei Upload + "lege als Projekt X an": (1) `create_project`, (2) EINEN `move(src=[alle Pfade], dst='05_Projects/<slug>/')`-Call (NIEMALS N×einzeln), (3) optional `project_context(action='activate', slug=...)`. Max 3-4 Tool-Calls für N Files.
+**Multi-File-Upload + Projekt-Anlage**: `create_project` → EIN `move(src=[liste], dst='05_Projects/<slug>/')` → optional `activate`. Niemals N× einzelnen move bei mehreren Files.
 
 **TAGESPLAN-EXTRAKTION** (User listet mehrere Items, oft als Antwort aufs Morgens-Briefing):
 - Klare Uhrzeit + Aktivität → `create_reminder` (KEIN Reminder ohne Uhrzeit erfinden!)
@@ -4206,27 +4107,9 @@ Drei Memory-Typen (alle automatisch im System-Prompt eingespeist):
 | "lass uns über X reden / arbeite jetzt an X" | `project_context(action='activate', slug='X')` | — |
 | "fertig mit X / weg vom Projekt" | `project_context(action='deactivate')` | — |
 
-**MULTI-FAKT-KOMPRESSION**: Mehrere Fakten in einem Satz → EIN `remember`-Call mit `\n`-Trennung, NICHT 3× einzeln. Analog für `set_preference`.
+**Multi-Fakt**: Mehrere Fakten in einem Satz → EIN `remember`-Call mit `\n`-Trennung, nicht N× einzeln. Analog `set_preference`.
 
-**PRÄFERENZ-INVERSION-SCHUTZ** (kritisch — Beschwerden ≠ Anweisungen!):
-Wenn User negativ über dein Verhalten spricht ("du machst X", "du springst zu wild",
-"du reißt aus dem Kontext", "du verstehst nicht"), ist das eine BESCHWERDE über
-ungewolltes Verhalten — NIEMALS direkt als Regel speichern!
-
-Vor JEDEM `set_preference`-Call diese 2 Schritte:
-1. PARAPHRASIEREN als positive Verhaltens-Regel: "Beschwerde: 'du machst X' → Regel: 'Bot soll NICHT X tun' bzw. 'Bot soll Y tun statt X'"
-2. RÜCKBESTÄTIGEN: "Verstehe ich richtig: du willst dass ich künftig [paraphrasierte positive Regel]? Speichere ich es so?"
-
-Erst nach User-OK speichern. Beispiel-Falle:
-- User: "du springst wild zwischen Themen, bleib im Kontext!"
-- FALSCH: set_preference("Bot soll wild zwischen Themen springen.")
-- RICHTIG: nachfragen "Verstehe richtig: du willst dass ich im Konversationsfaden bleibe und Themen nicht abrupt wechsle? OK speichern?"
-
-# KORREKTUREN LERNEN
-Klare Korrektur-Trigger ("nein, anders", "das war falsch", "ich meinte X", "mach das anders",
-"stopp falsch", "besser X statt Y", "nein STOP", "Bist du dumm", mehrere "!!!") →
-`log_correction(was_falsch, was_richtig, kontext)`. Landet in corrections.jsonl für
-Fine-Tuning + Nightly-Vorschläge. RUFE DAS AUCH BEI FRUST-ERKENNUNG (siehe oben).
+**Beschwerden ≠ Anweisungen**: Wenn User über dein Verhalten meckert ("du machst X / springst wild / verstehst nicht"), erst als positive Regel paraphrasieren + rückbestätigen, dann erst speichern. Niemals die wörtliche Beschwerde als Präferenz ablegen.
 
 # NIGHTLY MEMORY/HEALTH-VORSCHLÄGE
 Antworten auf Memory- oder Health-Listen ("1 3", "alle", "0", "erkläre 2", oder mit Präfix "memory 1" / "health alle") werden DIREKT vom Bot-Loop verarbeitet, NICHT vom LLM. Du bekommst diese Pattern-Messages gar nicht zu sehen — wenn doch eine kommt heißt das Disambig war unklar (beide pending), dann frag User welche Liste gemeint ist.
