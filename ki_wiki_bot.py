@@ -3184,54 +3184,39 @@ def _read_tail_lines(path: Path, max_bytes: int) -> list[str]:
 
 
 def _sanitize_loaded_history(msgs: list) -> list:
-    """Repariert Messages für strenge Provider (Gemini).
+    """Repariert Messages für strenge Provider (Anthropic, Gemini).
 
-    1. tool-Messages ohne 'name' bekommen den Namen aus der vorherigen
-       assistant-Message mit passender tool_call_id.
-    2. Wenn keine Zuordnung möglich → tool-msg DROP (sonst Gemini 400).
-    3. assistant-Messages mit tool_calls aber ohne content bekommen
-       content="" (Gemini lehnt fehlendes content ab wenn tool_calls da sind).
-    4. tool_calls werden auf {id, type, function:{name, arguments}} whitelisted
-       (entfernt provider-spezifische Extra-Felder die anderswo abgelehnt werden).
-    5. tool_call.function.arguments wird zu String normalisiert (manche Modelle
-       liefern Dict statt JSON-String → Provider-Validation crasht).
+    Kritisch: Anthropic verlangt **strikte Adjazenz** — eine tool-Message
+    darf nur direkt nach einer assistant-Message mit tool_calls kommen,
+    und die tool_call_id muss dort auftauchen. Sonst:
+        400 'tool_call_id of X not found in tool_calls of previous message'.
+
+    Fixes:
+    1. tool_calls auf {id, type, function:{name, arguments}} whitelisten
+    2. tool_call.function.arguments zu String normalisieren
+    3. tool_call.id + function.name müssen vorhanden sein, sonst tc droppen
+    4. assistant-msg mit tool_calls ohne content → content=""
+    5. **Strikte Adjazenz**: tool-msgs müssen IMMEDIATELY auf assistant
+       mit matching tool_call_id folgen. Orphans → DROP.
+    6. assistant-msg mit tool_calls braucht passende tool-replies direkt
+       danach. Wenn replies fehlen → tool_calls droppen (sonst Anthropic
+       beschwert sich beim NÄCHSTEN Turn).
     """
-    # Map tool_call_id → tool_name aus assistant-Messages
-    id_to_name: dict[str, str] = {}
-    for m in msgs:
-        if m.get("role") == "assistant":
-            for tc in m.get("tool_calls") or []:
-                tc_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
-                fn = (tc.get("function") if isinstance(tc, dict) else getattr(tc, "function", None)) or {}
-                fn_name = fn.get("name") if isinstance(fn, dict) else getattr(fn, "name", None)
-                if tc_id and fn_name:
-                    id_to_name[tc_id] = fn_name
 
-    out: list = []
+    # === Pass 1: pro-Message normalisieren (in-place auf Kopien) ===
+    normalized: list = []
     for m in msgs:
         role = m.get("role")
         if role == "tool":
-            # Fix #1: name-Feld nachrüsten oder droppen
-            if not m.get("name"):
-                tc_id = m.get("tool_call_id")
-                fn_name = id_to_name.get(tc_id) if tc_id else None
-                if fn_name:
-                    m = dict(m)
-                    m["name"] = fn_name
-                else:
-                    continue  # Nicht reparierbar
-            # Content muss String sein
+            m = dict(m)
             if not isinstance(m.get("content"), str):
-                m = dict(m)
                 m["content"] = str(m.get("content", ""))
         elif role == "assistant":
             tcs = m.get("tool_calls")
             if tcs:
                 m = dict(m)
-                # Fix #4: content="" wenn fehlt aber tool_calls da
                 if m.get("content") is None or "content" not in m:
                     m["content"] = ""
-                # Fix #5: tool_calls whitelisten
                 clean_tcs = []
                 for tc in tcs:
                     if not isinstance(tc, dict):
@@ -3240,10 +3225,8 @@ def _sanitize_loaded_history(msgs: list) -> list:
                     fn = tc.get("function") or {}
                     fn_name = fn.get("name") if isinstance(fn, dict) else None
                     fn_args = fn.get("arguments") if isinstance(fn, dict) else None
-                    # Defensive: id + name müssen vorhanden sein
                     if not tc_id or not fn_name:
                         continue
-                    # arguments zu String (kann dict sein bei manchen Modellen)
                     if isinstance(fn_args, (dict, list)):
                         try:
                             fn_args = json.dumps(fn_args, ensure_ascii=False)
@@ -3261,11 +3244,84 @@ def _sanitize_loaded_history(msgs: list) -> list:
                 if clean_tcs:
                     m["tool_calls"] = clean_tcs
                 else:
-                    # Alle tool_calls invalid → drop tool_calls, behalt content
                     m.pop("tool_calls", None)
                     if not m.get("content"):
-                        continue  # Komplett leer → skippen
-        out.append(m)
+                        continue
+        normalized.append(m)
+
+    # === Pass 2: Adjazenz erzwingen ===
+    # Strategie: Walk forward. Wenn assistant mit tool_calls kommt,
+    # sammle die erwarteten ids. Folgende tool-msgs MÜSSEN diese ids
+    # treffen — fremde tool-msgs werden gedroppt. Wenn assistant
+    # tool_calls hat, aber NICHT alle Replies kommen, → tool_calls
+    # vom assistant droppen (oder die ganze Message wenn dann leer).
+    # tool-msgs ohne vorhergehenden tool-call-Kontext → DROP.
+
+    out: list = []
+    expected_ids: set[str] = set()       # noch ausstehende tool_call_ids vom letzten assistant
+    pending_assistant_idx: int = -1      # Index in `out` der wartet auf Replies
+    pending_assistant_ids: list[str] = []  # alle ids vom pending assistant (für Cleanup)
+
+    def _close_pending_assistant():
+        """Falls pending assistant nicht alle Replies bekam: tool_calls droppen
+        die keine Reply haben (sonst Anthropic-400 beim NÄCHSTEN Call).
+        """
+        nonlocal expected_ids, pending_assistant_idx, pending_assistant_ids
+        if pending_assistant_idx >= 0 and expected_ids:
+            am = out[pending_assistant_idx]
+            am = dict(am)
+            am["tool_calls"] = [
+                tc for tc in am.get("tool_calls", [])
+                if tc.get("id") not in expected_ids
+            ]
+            if not am["tool_calls"]:
+                am.pop("tool_calls", None)
+            if not am.get("tool_calls") and not am.get("content"):
+                # Komplett leer → assistant-msg ganz raus
+                out.pop(pending_assistant_idx)
+            else:
+                out[pending_assistant_idx] = am
+        expected_ids = set()
+        pending_assistant_idx = -1
+        pending_assistant_ids = []
+
+    for m in normalized:
+        role = m.get("role")
+        if role == "tool":
+            tc_id = m.get("tool_call_id")
+            if not tc_id or tc_id not in expected_ids:
+                # Orphan tool-msg → DROP (Anthropic-400-Vermeidung)
+                continue
+            # Name-Feld nachrüsten falls fehlt (für Gemini)
+            if not m.get("name"):
+                # Lookup im pending assistant
+                if pending_assistant_idx >= 0:
+                    for tc in out[pending_assistant_idx].get("tool_calls", []):
+                        if tc.get("id") == tc_id:
+                            m = dict(m)
+                            m["name"] = tc.get("function", {}).get("name", "unknown")
+                            break
+            expected_ids.discard(tc_id)
+            out.append(m)
+            # Wenn alle expected geliefert, pending closen (alle Replies da)
+            if not expected_ids:
+                pending_assistant_idx = -1
+                pending_assistant_ids = []
+        else:
+            # Wenn neue Message (user oder assistant) während noch Replies fehlen,
+            # → pending closen (= incomplete tool_calls droppen)
+            if expected_ids:
+                _close_pending_assistant()
+            out.append(m)
+            if role == "assistant" and m.get("tool_calls"):
+                pending_assistant_idx = len(out) - 1
+                pending_assistant_ids = [tc.get("id") for tc in m["tool_calls"] if tc.get("id")]
+                expected_ids = set(pending_assistant_ids)
+
+    # End-of-list cleanup: pending assistant ohne Replies
+    if expected_ids:
+        _close_pending_assistant()
+
     return out
 
 
