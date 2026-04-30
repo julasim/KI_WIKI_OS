@@ -514,6 +514,22 @@ def _is_system_file(path: Path) -> bool:
             return True
     return False
 
+
+def _is_legacy_file(path: Path) -> bool:
+    """True wenn Datei nicht dem Bot-Schema folgt (Pre-Bot oder manuell).
+
+    Heuristik: Filename hat Spaces, Großbuchstaben, Umlaute oder Sonderzeichen
+    (z.B. "Panama – Budget.md", "K6 Gerätepreis.md") — solche Files werden vom
+    Bot nie automatisch angefasst und sind dauerhaftes Health-Check-Rauschen
+    wenn sie im Lint landen. Bot-erzeugte Files folgen kebab-case + ASCII
+    (z.B. `2026-04-29_oenorm-b-2061.md`).
+    """
+    if _is_system_file(path):
+        return False
+    name = path.stem  # ohne .md
+    return bool(re.search(r"[A-ZÄÖÜäöüß \–\—()&,]", name))
+
+
 # Häufige Wörter die Bot oft schreibt — würden sonst nervig auto-linked
 # wenn jemand zufällig ein Note/Task mit so einem Title hat
 _LINK_STOPWORDS = {
@@ -2017,6 +2033,11 @@ REMINDERS_FILE = VAULT / "06_Meta" / "reminders.json"
 ACTIVE_REMINDER_JOBS: dict = {}  # id → telegram.ext.Job
 BOT_APP = None  # wird in main() gesetzt — brauchen Zugriff auf job_queue von Tools aus
 
+# Lock gegen Race zwischen reminder_callback (entfernt einmaligen Reminder)
+# und cancel_reminder/create_reminder (mutieren ebenfalls reminders.json).
+# Last-write-wins ohne Lock kann Mutationen verschlucken.
+_REMINDERS_LOCK = threading.Lock()
+
 
 def _load_reminders() -> list:
     if not REMINDERS_FILE.exists():
@@ -2030,10 +2051,13 @@ def _load_reminders() -> list:
 
 def _save_reminders(reminders: list) -> None:
     REMINDERS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    REMINDERS_FILE.write_text(
+    # Atomic write: tmp + rename, verhindert halbgeschriebene JSON bei Crash
+    tmp = REMINDERS_FILE.with_suffix(".json.tmp")
+    tmp.write_text(
         json.dumps(reminders, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
+    os.replace(tmp, REMINDERS_FILE)
 
 
 # Reminder-Recurrence (kein monthly — Reminders sind zeitpunkt-basiert,
@@ -2074,9 +2098,10 @@ def create_reminder(when_iso: str, message: str, recurrence: Optional[str] = Non
         "recurrence": rec,
         "created": datetime.now(TIMEZONE).isoformat(timespec="seconds"),
     }
-    reminders = _load_reminders()
-    reminders.append(reminder)
-    _save_reminders(reminders)
+    with _REMINDERS_LOCK:
+        reminders = _load_reminders()
+        reminders.append(reminder)
+        _save_reminders(reminders)
 
     if BOT_APP is not None:
         _schedule_reminder(BOT_APP, reminder)
@@ -2142,9 +2167,10 @@ def _schedule_reminder(app, reminder: dict) -> None:
 
 
 def _remove_reminder_from_json(rid: str) -> None:
-    reminders = _load_reminders()
-    reminders = [r for r in reminders if r["id"] != rid]
-    _save_reminders(reminders)
+    with _REMINDERS_LOCK:
+        reminders = _load_reminders()
+        reminders = [r for r in reminders if r["id"] != rid]
+        _save_reminders(reminders)
 
 
 async def reminder_callback(ctx: ContextTypes.DEFAULT_TYPE):
@@ -2162,12 +2188,15 @@ async def reminder_callback(ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.exception(f"Reminder-Send fehlgeschlagen für {rid}")
 
-    # Einmalige Reminder aus JSON + ACTIVE_JOBS entfernen
-    reminders = _load_reminders()
-    reminder = next((r for r in reminders if r["id"] == rid), None)
-    if reminder and not reminder.get("recurrence"):
-        _remove_reminder_from_json(rid)
-        ACTIVE_REMINDER_JOBS.pop(rid, None)
+    # Einmalige Reminder aus JSON + ACTIVE_JOBS entfernen.
+    # Lock schützt Lookup+Remove-Sequenz vor Race mit cancel_reminder.
+    with _REMINDERS_LOCK:
+        reminders = _load_reminders()
+        reminder = next((r for r in reminders if r["id"] == rid), None)
+        if reminder and not reminder.get("recurrence"):
+            reminders = [r for r in reminders if r["id"] != rid]
+            _save_reminders(reminders)
+            ACTIVE_REMINDER_JOBS.pop(rid, None)
 
 
 def list_reminders() -> str:
@@ -4289,8 +4318,10 @@ def _truncate_history_for_budget(messages: list, budget: int = HISTORY_TOKEN_BUD
     Invarianten:
       - messages[0] (system) immer behalten
       - messages[-1] (neue user-message) immer behalten
-      - middle wird in 2er-Schritten getrimmt (pair-aware: assistant + tool)
-      - keine orphaned tool-Messages am middle-start (würde LLM verwirren)
+      - PAIR-AWARE drop: assistant mit tool_calls + alle zugehörigen tool-Replies
+        werden ATOMAR gedropt (nie nur halb), egal wo im middle die liegen.
+      - Sonst: einzelne Message droppen.
+      - Orphaned tool-Messages am middle-start werden mit-gedropt.
     """
     if not messages or len(messages) <= 2:
         return messages
@@ -4302,14 +4333,52 @@ def _truncate_history_for_budget(messages: list, budget: int = HISTORY_TOKEN_BUD
     middle = list(messages[1:-1])
     dropped = 0
 
-    while middle and _estimate_tokens([system] + middle + [last]) > budget:
-        # 2 raus, plus orphaned tool-message am Anfang weg
-        middle = middle[2:]
-        dropped += 2
-        # Wenn middle[0] orphaned tool-message → auch raus
-        while middle and middle[0].get("role") == "tool":
+    def _drop_one_unit():
+        """Droppt eine atomare Einheit vom Anfang von middle.
+
+        Wenn middle[0] assistant mit tool_calls ist: drop assistant + alle
+        nachfolgenden tool-msgs die zu seinen tool_call.ids gehören.
+        Sonst: drop middle[0].
+        Plus: orphaned tools am neuen Anfang mit-droppen.
+        """
+        nonlocal middle, dropped
+        if not middle:
+            return
+        first = middle[0]
+        if first.get("role") == "assistant" and first.get("tool_calls"):
+            # Atomar: assistant + alle zugehörigen tool-Replies
+            expected_ids = set()
+            for tc in first.get("tool_calls") or []:
+                tc_id = tc.get("id") if isinstance(tc, dict) else None
+                if tc_id:
+                    expected_ids.add(tc_id)
             middle = middle[1:]
             dropped += 1
+            # Alle direkt-folgenden tool-msgs die zu unseren ids gehören weg
+            while middle and middle[0].get("role") == "tool":
+                tc_id = middle[0].get("tool_call_id")
+                if tc_id in expected_ids:
+                    middle = middle[1:]
+                    dropped += 1
+                    expected_ids.discard(tc_id)
+                else:
+                    # Fremder tool-reply (orphan oder anderes Pair) → auch weg
+                    middle = middle[1:]
+                    dropped += 1
+        else:
+            middle = middle[1:]
+            dropped += 1
+            # Orphaned tools am neuen Anfang mit-droppen
+            while middle and middle[0].get("role") == "tool":
+                middle = middle[1:]
+                dropped += 1
+
+    while middle and _estimate_tokens([system] + middle + [last]) > budget:
+        before_len = len(middle)
+        _drop_one_unit()
+        if len(middle) == before_len:
+            # Defensive: kein Fortschritt → Notfall-break um Endlos-Loop zu verhindern
+            break
 
     if dropped:
         log.warning(f"history-truncate: {dropped} alte Messages gecuttet (Budget {budget} tokens)")
@@ -4796,46 +4865,133 @@ def _strip_paren_wikilinks(text: str) -> str:
     return re.sub(r"[ \t]*\(\[\[[^\[\]\n]+\]\]\)", "", text)
 
 
-async def safe_reply(update: Update, text: str) -> None:
-    """Split + send. HTML-Format mit Plain-Fallback bei Parse-Fehler."""
+def _safe_split_html(html: str, max_len: int = None) -> list[str]:
+    """Splittet HTML in Telegram-konforme Chunks ohne offene Tags zu hinterlassen.
+
+    Strategie:
+    - Cut-Position wird so gewählt dass keine `<pre>`/`<code>`-Range straddled wird
+      (sonst Telegram-400 oder optisch kaputter Code-Block)
+    - Bevorzugt Splits an Doppel-Newline > Newline > Space
+    """
+    if max_len is None:
+        max_len = TG_MAX_MESSAGE
+
+    if len(html) <= max_len:
+        return [html] if html else []
+
+    # Pre-compute alle <pre>...</pre>-Ranges (start, end)
+    # Cut darf NICHT zwischen pre_start und pre_end liegen
+    def _find_protected_ranges(text: str) -> list[tuple[int, int]]:
+        ranges = []
+        for m in re.finditer(r"<pre\b[^>]*>.*?</pre>", text, flags=re.DOTALL):
+            ranges.append((m.start(), m.end()))
+        # auch <code>...</code> (single-line) protect, weil Cut mitten
+        # im code-block die Escaping-Symmetrie kaputt macht
+        for m in re.finditer(r"<code\b[^>]*>.*?</code>", text, flags=re.DOTALL):
+            ranges.append((m.start(), m.end()))
+        return ranges
+
+    def _is_in_range(pos: int, ranges: list[tuple[int, int]]) -> Optional[int]:
+        """Return range_start wenn pos innerhalb einer protected range, sonst None."""
+        for r_start, r_end in ranges:
+            if r_start < pos < r_end:
+                return r_start
+        return None
+
+    # Mindest-Cut-Position: 25% von max_len (verhindert winzige Chunks),
+    # aber mindestens 50 Zeichen (für Tests mit kleinem max_len)
+    min_cut = max(50, max_len // 4)
+
+    chunks = []
+    remaining = html
+    while remaining:
+        if len(remaining) <= max_len:
+            chunks.append(remaining)
+            break
+
+        ranges = _find_protected_ranges(remaining)
+
+        # Strategie:
+        # 1) Bevorzuge Cut an \n\n / \n / Space (in dieser Prio-Reihenfolge)
+        # 2) Cut-Position muss >= min_cut sein (kein winziger Chunk)
+        # 3) Cut-Position darf NICHT innerhalb einer <pre>/<code>-Range liegen
+        # 4) Wenn Range straddled wird: vor den Range-Start zurückziehen
+        cut = -1
+        for sep in ("\n\n", "\n", " "):
+            candidate = remaining.rfind(sep, 0, max_len)
+            if candidate < min_cut:
+                continue
+            range_start = _is_in_range(candidate, ranges)
+            if range_start is not None:
+                # In protected range → vor den Range-Start (wenn der weit genug ist)
+                if range_start >= min_cut:
+                    cut = range_start
+                    break
+                continue  # zu früh, nächster Separator
+            cut = candidate
+            break
+
+        # Last resort: vor irgendeine Range, die im Cut-Bereich endet
+        if cut < min_cut:
+            for r_start, r_end in ranges:
+                if r_start >= min_cut and r_start < max_len:
+                    cut = r_start
+                    break
+
+        if cut < 1:
+            # Härte-Notfall: harter Cut. Plain-Fallback im Send catched
+            # mögliche Tag-Imbalance.
+            cut = max_len
+
+        chunks.append(remaining[:cut].rstrip())
+        remaining = remaining[cut:].lstrip()
+
+    return chunks
+
+
+async def _send_split_html(send_fn, text: str) -> None:
+    """Schickt text in mehreren Chunks via send_fn (z.B. update.message.reply_text
+    oder ctx.bot.send_message). HTML-Format mit Plain-Text-Fallback bei Parse-Fehler.
+
+    send_fn muss eine async-callable sein, die (text=str, parse_mode, disable_web_page_preview)
+    akzeptiert. Bei Fehler ohne parse_mode (Plain) erneut versuchen.
+    """
     if not text:
-        await update.message.reply_text("(leer)")
+        await send_fn(text="(leer)")
         return
 
     # Noise-Wikilinks rausstrippen, BEVOR Markdown→HTML konvertiert
     text = _strip_paren_wikilinks(text)
 
-    # Erst Markdown→HTML, dann splitten
     html = md_to_telegram_html(text)
-
-    # Splitten an Newlines wo möglich (Smart-Breaks)
-    chunks = []
-    remaining = html
-    while remaining:
-        if len(remaining) <= TG_MAX_MESSAGE:
-            chunks.append(remaining)
-            break
-        cut = remaining.rfind("\n\n", 0, TG_MAX_MESSAGE)
-        if cut < 1000:
-            cut = remaining.rfind("\n", 0, TG_MAX_MESSAGE)
-        if cut < 1000:
-            cut = remaining.rfind(" ", 0, TG_MAX_MESSAGE)
-        if cut < 1:
-            cut = TG_MAX_MESSAGE
-        chunks.append(remaining[:cut])
-        remaining = remaining[cut:].lstrip()
+    chunks = _safe_split_html(html)
 
     for i, chunk in enumerate(chunks, 1):
         prefix = f"({i}/{len(chunks)})\n" if len(chunks) > 1 else ""
         try:
-            await update.message.reply_text(
-                prefix + chunk,
+            await send_fn(
+                text=prefix + chunk,
                 parse_mode=constants.ParseMode.HTML,
                 disable_web_page_preview=True,
             )
         except Exception as e:
             log.warning(f"HTML-Send fehlgeschlagen, Fallback Plain: {e}")
-            await update.message.reply_text(prefix + _strip_html(chunk))
+            await send_fn(text=prefix + _strip_html(chunk))
+
+
+async def safe_reply(update: Update, text: str) -> None:
+    """Split + send via update.message.reply_text. Wrapper um _send_split_html."""
+    await _send_split_html(update.message.reply_text, text)
+
+
+async def safe_send(bot, chat_id: int, text: str) -> None:
+    """Split + send via bot.send_message. Wrapper um _send_split_html.
+
+    Für Job-Callbacks ohne Update-Objekt (z.B. daily_briefing_job).
+    """
+    async def _send(text: str, **kwargs):
+        await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+    await _send_split_html(_send, text)
 
 
 def _detect_pending_reply_intent(text: str) -> Optional[str]:
@@ -5421,6 +5577,7 @@ def collect_health_data() -> dict:
     done_old_tasks = []        # task-Dicts (status=done, >30d, nicht-recurring)
     recurring_stuck = []       # task-Dicts (recurring, last_completed > 2× Periode her)
     tag_clusters = []          # (canonical, [variants_with_counts])
+    legacy_files = []          # rel_path (Pre-Bot-Files, aus Lint-Bucket gefiltert)
 
     # Walk: alle non-noise .md mit Frontmatter
     all_notes = []  # [(path, post)]
@@ -5432,14 +5589,21 @@ def collect_health_data() -> dict:
         all_notes.append((path, post))
         meta = post.metadata
         rel = path.relative_to(VAULT).as_posix()
+        is_legacy = _is_legacy_file(path)
 
         # ── Check 1: Schema-Lint (Pflichtfelder, Type-Folder-Konformität) ──
         if not meta:
-            lint_issues.append((rel, "kein Frontmatter"))
+            if is_legacy:
+                legacy_files.append(rel)
+            else:
+                lint_issues.append((rel, "kein Frontmatter"))
             continue
         t = meta.get("type")
         if not t:
-            lint_issues.append((rel, "type fehlt"))
+            if is_legacy:
+                legacy_files.append(rel)
+            else:
+                lint_issues.append((rel, "type fehlt"))
             continue
 
         # ── Check 7: Doppel-IDs sammeln ──
@@ -5622,6 +5786,7 @@ def collect_health_data() -> dict:
         "today_str": today_str,
         "first_run": _is_health_first_run(),
         "lint_issues": lint_issues,
+        "legacy_files": legacy_files,
         "broken_links": broken_links,
         "orphans": orphans,
         "duplicate_ids": duplicate_ids,
@@ -6058,6 +6223,21 @@ def write_health_report(data: dict, autofixes: list, proposals: list) -> Path:
             lines.append(block)
             lines.append("")
 
+    # ── Migrations-Backlog (Pre-Bot-Files, separater Bucket) ──
+    if data.get("legacy_files"):
+        legacy = data["legacy_files"]
+        lines.append(f"## 📦 Migrations-Backlog ({len(legacy)})")
+        lines.append("")
+        lines.append("Files mit Legacy-Naming (Spaces/Umlaute/Großbuchstaben), "
+                     "die vor dem Bot existierten. Bot fasst sie nicht automatisch an. "
+                     "Manuell ans Schema anpassen wenn gewünscht.")
+        lines.append("")
+        for p in legacy[:10]:
+            lines.append(f"- `{p}`")
+        if len(legacy) > 10:
+            lines.append(f"- _… {len(legacy)-10} weitere_")
+        lines.append("")
+
     # ── Pending Approvals ──
     if proposals:
         lines.append(f"## 🔧 Pending Approvals ({len(proposals)})")
@@ -6132,6 +6312,7 @@ def run_nightly_health() -> dict:
         "proposal_count": len(proposals),
         "issue_summary": {
             "lint": len(data["lint_issues"]),
+            "legacy": len(data.get("legacy_files", [])),
             "broken_links": len(data["broken_links"]),
             "orphans": len(data["orphans"]),
             "duplicate_ids": len(data["duplicate_ids"]),
@@ -6564,11 +6745,8 @@ async def daily_briefing_job(ctx: ContextTypes.DEFAULT_TYPE):
         # die wiederkehrenden Tasks in der heutigen Daily.
         await asyncio.to_thread(reset_recurring_tasks)
         text = await asyncio.to_thread(compute_briefing)
-        await ctx.bot.send_message(
-            chat_id=ALLOWED_USER_ID,
-            text=text,
-            parse_mode=constants.ParseMode.HTML,
-        )
+        # safe_send splittet bei >4096 Chars, sonst Telegram-400.
+        await safe_send(ctx.bot, ALLOWED_USER_ID, text)
         log.info(f"Daily briefing sent to {ALLOWED_USER_ID}")
     except Exception as e:
         log.exception(f"daily_briefing_job failed: {e}")
@@ -6587,7 +6765,7 @@ async def daily_briefing_job(ctx: ContextTypes.DEFAULT_TYPE):
 async def handle_briefing(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/briefing — manueller Trigger für das Morgens-Briefing."""
     text = await asyncio.to_thread(compute_briefing)
-    await update.message.reply_text(text, parse_mode=constants.ParseMode.HTML)
+    await safe_reply(update, text)
 
 
 @require_auth
