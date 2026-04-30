@@ -2050,14 +2050,11 @@ def _load_reminders() -> list:
 
 
 def _save_reminders(reminders: list) -> None:
-    REMINDERS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    # Atomic write: tmp + rename, verhindert halbgeschriebene JSON bei Crash
-    tmp = REMINDERS_FILE.with_suffix(".json.tmp")
-    tmp.write_text(
+    # atomic_write macht intern tmp+rename — verhindert halbgeschriebene JSON
+    atomic_write(
+        REMINDERS_FILE,
         json.dumps(reminders, indent=2, ensure_ascii=False),
-        encoding="utf-8",
     )
-    os.replace(tmp, REMINDERS_FILE)
 
 
 # Reminder-Recurrence (kein monthly — Reminders sind zeitpunkt-basiert,
@@ -2457,12 +2454,12 @@ SORT date DESC
 
     # CONTEXT.md leer initialisieren — kann später via update_project_context befüllt werden
     context_path = proj_dir / "CONTEXT.md"
-    context_path.write_text(
+    atomic_write(
+        context_path,
         f"# Kontext: {slug}\n\n"
         "_Projekt-spezifische Regeln/Infos (Auftraggeber, Tech-Stack, Frist, Budget). "
         f"Wird automatisch in den Bot-Prompt geladen wenn `activate_project({slug})` aktiv._\n\n"
         "_(noch leer — fülle via Bot-Tool `update_project_context` oder direkt in Obsidian)_\n",
-        encoding="utf-8",
     )
 
     invalidate_link_index()
@@ -2588,11 +2585,11 @@ def remember(fact: str) -> str:
 
     # Initialize file with header if needed
     if not FACTS_FILE.exists():
-        FACTS_FILE.write_text(
+        atomic_write(
+            FACTS_FILE,
             "# Bot-Memory: persistente Fakten\n\n"
             "_Hier sammelt der Bot Fakten die er sich dauerhaft merken soll. "
             "Du kannst manuell editieren — Änderungen sind beim nächsten LLM-Call wirksam._\n\n",
-            encoding="utf-8",
         )
 
     today = today_iso()
@@ -2664,10 +2661,10 @@ def set_preference(text: str) -> str:
     text = text.strip()
     _ensure_memory_dir()
     if not PREFERENCES_FILE.exists():
-        PREFERENCES_FILE.write_text(
+        atomic_write(
+            PREFERENCES_FILE,
             "# Präferenzen — wie der Bot mir antworten soll\n\n"
             "_Stil, Tonalität, Format. Werden bei jedem LLM-Call automatisch in den System-Prompt eingespeist._\n\n",
-            encoding="utf-8",
         )
     today = today_iso()
     line = f"- ({today}) {text}\n"
@@ -2749,7 +2746,7 @@ def activate_project(slug: str) -> str:
     if proj_dir is None:
         return f"Projekt nicht gefunden: {slug}"
     _ensure_memory_dir()
-    ACTIVE_PROJECT_FILE.write_text(slug, encoding="utf-8")
+    atomic_write(ACTIVE_PROJECT_FILE, slug)
     ctx = get_project_context(slug)
     ctx_info = f" (CONTEXT.md: {len(ctx)} Zeichen)" if ctx else " (noch keine CONTEXT.md)"
     return f"✓ Projekt aktiviert: [[project-{slug}]]{ctx_info}"
@@ -2787,7 +2784,7 @@ def update_project_context(slug: str, text: str, mode: str = "append") -> str:
     )
 
     if mode == "replace" or not context_file.exists():
-        context_file.write_text(header + linked_text + "\n", encoding="utf-8")
+        atomic_write(context_file, header + linked_text + "\n")
         return f"✓ CONTEXT.md für {slug} {'ersetzt' if mode == 'replace' else 'angelegt'}"
     else:
         with context_file.open("a", encoding="utf-8") as f:
@@ -2835,9 +2832,9 @@ def _load_pending_suggestions() -> list:
 
 def _save_pending_suggestions(suggestions: list) -> None:
     _ensure_memory_dir()
-    PENDING_SUGGESTIONS_FILE.write_text(
+    atomic_write(
+        PENDING_SUGGESTIONS_FILE,
         json.dumps(suggestions, ensure_ascii=False, indent=2),
-        encoding="utf-8",
     )
 
 
@@ -3389,7 +3386,7 @@ def _maybe_compact_history() -> None:
         if len(lines) <= HISTORY_PERSIST_LIMIT:
             return
         keep = lines[-HISTORY_COMPACT_KEEP:]
-        HISTORY_FILE.write_text("\n".join(keep) + "\n", encoding="utf-8")
+        atomic_write(HISTORY_FILE, "\n".join(keep) + "\n")
         log.info(f"History compacted: {len(lines)} → {len(keep)}")
     except Exception as e:
         log.warning(f"history compact failed: {e}")
@@ -6122,11 +6119,10 @@ def _save_pending_health_actions(proposals: list) -> None:
             except Exception:
                 pass
         return
-    PENDING_HEALTH_ACTIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    PENDING_HEALTH_ACTIONS_FILE.write_text(
+    atomic_write(
+        PENDING_HEALTH_ACTIONS_FILE,
         json.dumps({"created": datetime.now(TIMEZONE).isoformat(), "proposals": proposals},
                    indent=2, ensure_ascii=False),
-        encoding="utf-8",
     )
 
 
@@ -6258,7 +6254,7 @@ def write_health_report(data: dict, autofixes: list, proposals: list) -> Path:
         lines.append(", ".join(f"`{t}` ({c})" for t, c in top_tags))
         lines.append("")
 
-    report_path.write_text("\n".join(lines), encoding="utf-8")
+    atomic_write(report_path, "\n".join(lines))
     return report_path
 
 
