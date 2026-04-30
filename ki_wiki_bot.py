@@ -1424,10 +1424,13 @@ def create_note(title: str, body: str, tags: Optional[list] = None,
     target_dir.mkdir(parents=True, exist_ok=True)
 
     path = target_dir / f"{today}_{slug}.md"
+    final_slug = slug  # ID muss mit Filename mitwachsen, sonst ID-Duplikat
     n = 2
     while path.exists():
-        path = target_dir / f"{today}_{slug}-{n}.md"
+        final_slug = f"{slug}-{n}"
+        path = target_dir / f"{today}_{final_slug}.md"
         n += 1
+    slug = final_slug
 
     # Tags filtern (nur strings, nicht-leer, deduplizieren, lowercase)
     clean_tags = []
@@ -5503,14 +5506,10 @@ def collect_health_data() -> dict:
         if len(paths) > 1:
             duplicate_ids.append((fid, paths))
 
-    # ── Check 4: Daily-Gaps (Werktage der letzten 7 Tage ohne Daily) ──
-    for delta in range(1, 8):  # gestern bis vor 7 Tagen
-        d = today - timedelta(days=delta)
-        if d.weekday() >= 5:  # Samstag/Sonntag → kein Werktag, kein Gap
-            continue
-        daily_path = DAILY_DIR / f"{d.isoformat()}.md"
-        if not daily_path.exists():
-            daily_gaps.append(d.isoformat())
+    # ── Check 4: Daily-Gaps wurde DEAKTIVIERT ──
+    # War nicht aktionable — wenn User an einem Werktag nichts dokumentiert,
+    # ist das seine Entscheidung, nicht ein Health-Issue. Liste bleibt leer
+    # damit das Schema-Format des Reports konstant bleibt.
 
     # ── Check 5: Stale Inbox ──
     inbox_dir = VAULT / "00_Inbox"
@@ -6044,10 +6043,8 @@ def write_health_report(data: dict, autofixes: list, proposals: list) -> Path:
         for fid, paths in data["duplicate_ids"]:
             b.append(f"- `{fid}` → {', '.join(f'`{p}`' for p in paths)}")
         issues_blocks.append("\n".join(b))
-    if data["daily_gaps"]:
-        b = [f"### Daily-Lücken (Werktage ohne Daily-Note, letzte 7 Tage)"]
-        b.append(", ".join(data["daily_gaps"]))
-        issues_blocks.append("\n".join(b))
+    # Daily-Gaps werden bewusst NICHT mehr im Issues-Block gemeldet —
+    # nicht aktionable, nur Rauschen.
     if data["stale_uploads"]:
         b = [f"### Stale Uploads — PDFs ohne .md-Wrapper ({len(data['stale_uploads'])})"]
         for p in data["stale_uploads"][:10]:
