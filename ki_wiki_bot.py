@@ -3999,7 +3999,7 @@ TOOLS = [
             "required": [],
         },
     }},
-    {"type": "function", "function": {
+    {"type": "function", "strict": True, "function": {
         "name": "create_meeting",
         "description": "Legt ein Meeting-Protokoll an. ROUTING analog zu create_note: Wenn aktives Projekt im Kontext ODER explizit `project=<slug>` → landet in `05_Projects/<slug>/meetings/`. Sonst in `10_Life/meetings/` (nur für privates ohne Projekt-Bezug). tags: thematische Schlagworte (z.B. ['kickoff', 'kunde']).",
         "parameters": {
@@ -4007,14 +4007,15 @@ TOOLS = [
             "properties": {
                 "title": {"type": "string"},
                 "attendees": {"type": "array", "items": {"type": "string"}},
-                "meeting_date": {"type": "string", "description": "ISO-Datum YYYY-MM-DD, default heute"},
+                "meeting_date": {"type": "string", "description": "ISO-Datum YYYY-MM-DD, default heute. Strict: NUR ISO-Format akzeptiert."},
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "2-5 thematische Tags, kebab-case Deutsch"},
                 "project": {"type": "string", "description": "Optional: Projekt-Slug für Projekt-Meeting. Landet dann in 05_Projects/<slug>/meetings/. Wenn nicht gesetzt aber aktives Projekt existiert, wird das automatisch verwendet."},
             },
             "required": ["title"],
+            "additionalProperties": False,
         },
     }},
-    {"type": "function", "function": {
+    {"type": "function", "strict": True, "function": {
         "name": "create_note",
         "description": "Legt eine freie Notiz an. Für längere strukturierte Inhalte (>3 Sätze, eigenes Thema), die weder Task noch Tagesreflexion sind. ROUTING: Wenn ein Projekt im Kontext aktiv ist ODER explizit `project=<slug>` gesetzt → landet in `05_Projects/<slug>/notes/`. Sonst in `10_Life/notes/`.",
         "parameters": {
@@ -4026,7 +4027,12 @@ TOOLS = [
                 "project": {"type": "string", "description": "Optional: Projekt-Slug für Projekt-bezogene Notizen. Note landet dann in 05_Projects/<slug>/notes/. Wenn nicht gesetzt aber aktives Projekt existiert, wird das automatisch verwendet."},
             },
             "required": ["title", "body"],
+            "additionalProperties": False,
         },
+        "input_examples": [
+            {"title": "Schlafqualität-Tracking", "body": "Ab heute notiere ich abends Bewertung 1-10 und Stunden.", "tags": ["gesundheit", "schlaf"]},
+            {"title": "Kiosk-Sanierung Updates", "body": "Auftraggeber: Schiemer. Letzte Trocknungsmessung: 12%. Nächster Schritt: Antischimmel-Beschichtung.", "project": "kiosk-sanierung", "tags": ["sanierung", "trocknung"]},
+        ],
     }},
     {"type": "function", "function": {
         "name": "search_vault",
@@ -4071,7 +4077,7 @@ TOOLS = [
             "required": ["rel_path", "find", "replace"],
         },
     }},
-    {"type": "function", "function": {
+    {"type": "function", "strict": True, "function": {
         "name": "move",
         "description": (
             "Vereinheitlichtes Move-Tool für 3 Use-Cases — nutze GENAU EINEN Modus:\n"
@@ -4095,7 +4101,13 @@ TOOLS = [
                 "overwrite": {"type": "boolean", "default": False},
             },
             "required": [],
+            "additionalProperties": False,
         },
+        "input_examples": [
+            {"src": "10_Life/notes/2026-04-28_kiosk-update.md", "dst": "05_Projects/kiosk-sanierung/notes/"},
+            {"srcs": ["09_Attachments/photo_a.jpg", "09_Attachments/photo_b.jpg", "09_Attachments/photo_c.jpg"], "dst": "05_Projects/dachboden-ausbau/"},
+            {"project_slug": "bbm-skript", "parent": "matura"},
+        ],
     }},
     {"type": "function", "function": {
         "name": "clip_url",
@@ -4106,11 +4118,12 @@ TOOLS = [
             "required": ["url"],
         },
     }},
-    {"type": "function", "function": {
+    {"type": "function", "strict": True, "function": {
         "name": "request_delete",
         "description": (
             "Schritt 1 von 2 für Löschen: meldet Löschanfrage an User. "
-            "Akzeptiert einen ODER mehrere Pfade. Bei 'lösche alle X' erst list_files. "
+            "Akzeptiert einen ODER mehrere Pfade (entweder rel_path ODER rel_paths setzen). "
+            "Bei 'lösche alle X' erst list_files. "
             "permanent=False (Default): nach 99_Archive/ verschieben (reversibel). "
             "permanent=True NUR wenn User explizite Worte nutzt wie "
             "'endgültig', 'wirklich weg', 'permanent', 'unwiderruflich', 'hart löschen', "
@@ -4135,10 +4148,16 @@ TOOLS = [
                     "default": False,
                 },
             },
+            "additionalProperties": False,
             # Kein required — Handler akzeptiert rel_path ODER rel_paths.
             # oneOf wäre semantisch sauberer aber Gemini/Ollama strikt lehnen
             # oneOf/anyOf in Tool-Schemas ab → 400.
         },
+        "input_examples": [
+            {"rel_path": "10_Life/tasks/alte-task.md"},
+            {"rel_paths": ["10_Life/notes/woche-1.md", "10_Life/notes/woche-2.md", "10_Life/notes/woche-3.md"]},
+            {"rel_path": "10_Life/tasks/test.md", "permanent": True},
+        ],
     }},
     {"type": "function", "function": {
         "name": "confirm_delete",
@@ -4160,19 +4179,24 @@ TOOLS = [
             "required": [],
         },
     }},
-    {"type": "function", "function": {
+    {"type": "function", "strict": True, "function": {
         "name": "list_files",
         "description": (
-            "Listet User-Content-Files (.md) im Vault. System-Krempel (Templates, Meta, "
-            "Tools, Trash, Archive, CLAUDE.md etc.) wird automatisch rausgefiltert. "
-            "Bei >12 Files wird nach Top-Level-Ordner gruppiert."
+            "Listet User-Content-Files (.md) im Vault — rekursiv ab rel_dir oder ab Vault-Root. "
+            "Standardmäßig wird System-Krempel (Templates, 06_Meta, 07_Tools, .obsidian, .trash, "
+            "99_Archive, CLAUDE.md/README.md/SCHEMA.md/PIPELINES.md etc.) automatisch ausgefiltert — "
+            "User soll nur seine eigenen Notes/Tasks/Projekte sehen. Bei >12 Treffern wird nach "
+            "Top-Level-Ordner gruppiert für bessere Übersicht. "
+            "USE-CASES: 'was hab ich im Projekt X', 'zeig alle Files in 10_Life', 'welche notes hab ich', "
+            "vor Bulk-Operationen wie 'lösche alle X' oder 'verschiebe alle Y'. "
+            "include_system=True nur für Debug — zeigt dann auch System-Files."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "rel_dir": {
                     "type": "string",
-                    "description": "Verzeichnis relativ zu Vault-Root, z.B. '10_Life/tasks'. Leer = ganzer Vault.",
+                    "description": "Verzeichnis relativ zu Vault-Root, z.B. '10_Life/tasks' oder '05_Projects/kiosk-sanierung'. Leer = ganzer Vault.",
                 },
                 "include_system": {
                     "type": "boolean",
@@ -4181,6 +4205,7 @@ TOOLS = [
                 },
             },
             "required": [],
+            "additionalProperties": False,
         },
     }},
     # apply_memory_suggestion + apply_health_action sind KEINE LLM-Tools mehr —
@@ -4221,7 +4246,7 @@ TOOLS = [
             "required": ["text"],
         },
     }},
-    {"type": "function", "function": {
+    {"type": "function", "strict": True, "function": {
         "name": "project_context",
         "description": (
             "Steuert Projekt-Kontext-Loading + CONTEXT.md-Editing in einem Tool. "
@@ -4240,7 +4265,14 @@ TOOLS = [
                 "mode": {"type": "string", "enum": ["append", "replace"], "default": "append"},
             },
             "required": ["action"],
+            "additionalProperties": False,
         },
+        "input_examples": [
+            {"action": "activate", "slug": "kiosk-sanierung"},
+            {"action": "deactivate"},
+            {"action": "update", "slug": "kiosk-sanierung", "text": "Auftraggeber: Schiemer\nÖNORM: B 2061", "mode": "append"},
+            {"action": "update", "slug": "matura", "text": "Prüfungstermine: 15.06. schriftlich, 22.06. mündlich", "mode": "replace"},
+        ],
     }},
     {"type": "function", "function": {
         "name": "remember",
@@ -4259,20 +4291,25 @@ TOOLS = [
             "required": ["fact"],
         },
     }},
-    {"type": "function", "function": {
+    {"type": "function", "strict": True, "function": {
         "name": "forget",
         "description": (
-            "Entfernt Memory-Einträge die ein Pattern enthalten (case-insensitive). "
-            "kind='fact' für Fakten in facts.md, kind='preference' für Stil-Regeln in preferences.md. "
-            "Trigger: 'vergiss X' / 'lösch die Regel Y' / 'das stimmt nicht mehr'."
+            "Entfernt persistente Memory-Einträge aus facts.md (kind='fact') oder "
+            "preferences.md (kind='preference'). Match ist case-insensitive Substring — "
+            "alle Einträge die das Pattern enthalten werden entfernt. Bei mehreren Matches "
+            "alle weg (also pattern präzise wählen). Trigger: 'vergiss X' / 'lösch die Regel Y' / "
+            "'das stimmt nicht mehr' / 'das gilt nicht mehr'. "
+            "Wenn unsicher welcher kind: erst remember/set_preference Files via read_file lesen, "
+            "dann gezielt forget. Returns: Anzahl gelöschter Einträge + welche."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "kind": {"type": "string", "enum": ["fact", "preference"]},
-                "pattern": {"type": "string", "description": "Text-Snippet zum matchen"},
+                "kind": {"type": "string", "enum": ["fact", "preference"], "description": "fact = Bio/Setup-Wahrheit, preference = Stil/Antwort-Regel."},
+                "pattern": {"type": "string", "description": "Text-Snippet zum matchen, möglichst spezifisch (alle Treffer werden gelöscht)"},
             },
             "required": ["kind", "pattern"],
+            "additionalProperties": False,
         },
     }},
     {"type": "function", "function": {
@@ -4290,7 +4327,7 @@ TOOLS = [
             "required": [],
         },
     }},
-    {"type": "function", "function": {
+    {"type": "function", "strict": True, "function": {
         "name": "create_project",
         "description": (
             "Legt einen neuen Projekt-Ordner unter 05_Projects/<slug>/ an. "
@@ -4299,7 +4336,7 @@ TOOLS = [
             "Nutze wenn User 'lege ein Projekt an', 'neues Projekt: ...' o.ä. sagt. "
             "Bei Subprojekt: parent=<slug-des-eltern-projekts> setzen — wird unter "
             "05_Projects/<parent>/<slug>/ angelegt. Bestehende Projekte verschiebt "
-            "man stattdessen mit move_project. "
+            "man stattdessen mit move (project_slug + parent). "
             "WICHTIG: dieses Tool legt den Ordner UND die README-Datei direkt an — "
             "nicht erst fragen, dann ankündigen, dann nochmal fragen. Direkt machen."
         ),
@@ -4312,9 +4349,10 @@ TOOLS = [
                 "parent": {"type": "string", "description": "Optional: Parent-Projekt-Slug für Subprojekt-Anlage"},
             },
             "required": ["name"],
+            "additionalProperties": False,
         },
     }},
-    {"type": "function", "function": {
+    {"type": "function", "strict": True, "function": {
         "name": "create_reminder",
         "description": (
             "Setzt eine Erinnerung — Bot schickt zur angegebenen Zeit eine Telegram-Nachricht "
@@ -4322,7 +4360,9 @@ TOOLS = [
             "(Europe/Vienna). 'morgen 15:00' → 2026-04-27T15:00:00. 'in 30 Min' → "
             "aktuelle Zeit + 30 Min. Heutiges Datum kennst du aus dem System-Prompt. "
             "Wiederholungen via recurrence: daily, weekdays (Mo-Fr), weekly (jede Woche "
-            "selber Wochentag). Leer/null = einmalig."
+            "selber Wochentag). Leer/null = einmalig. WICHTIG: bei Korrektur der Uhrzeit "
+            "vom letzten Reminder → erst cancel_reminder, dann neuen create. NIEMALS zweiten "
+            "anlegen ohne ersten zu canceln."
         ),
         "parameters": {
             "type": "object",
@@ -4332,20 +4372,27 @@ TOOLS = [
                 "recurrence": {"type": "string", "enum": ["daily", "weekdays", "weekly"]},
             },
             "required": ["when_iso", "message"],
+            "additionalProperties": False,
         },
+        "input_examples": [
+            {"when_iso": "2026-05-02T16:00:00", "message": "Email an Müller schicken"},
+            {"when_iso": "2026-05-02T08:00:00", "message": "Tagebuch schreiben", "recurrence": "daily"},
+            {"when_iso": "2026-05-04T08:00:00", "message": "Müll rausstellen", "recurrence": "weekly"},
+        ],
     }},
-    {"type": "function", "function": {
+    {"type": "function", "strict": True, "function": {
         "name": "list_reminders",
         "description": "Listet alle aktiven Erinnerungen (für 'was steht an?', 'welche Reminder hab ich').",
-        "parameters": {"type": "object", "properties": {}, "required": []},
+        "parameters": {"type": "object", "properties": {}, "required": [], "additionalProperties": False},
     }},
-    {"type": "function", "function": {
+    {"type": "function", "strict": True, "function": {
         "name": "cancel_reminder",
         "description": "Bricht eine Erinnerung ab. Erst list_reminders aufrufen wenn der User keine ID nennt.",
         "parameters": {
             "type": "object",
             "properties": {"reminder_id": {"type": "string", "description": "Reminder-ID, z.B. 'rem-20260426-153000-123'"}},
             "required": ["reminder_id"],
+            "additionalProperties": False,
         },
     }},
     {"type": "function", "function": {
