@@ -2446,11 +2446,18 @@ async def reminder_callback(ctx: ContextTypes.DEFAULT_TYPE):
         )
         log.info(f"Reminder fired: {rid}")
 
-        # Tagebuch-Spezialfall: User-Reply wird direkt in Daily-Note einsortiert
-        # statt LLM zu rufen (sonst behandelt LLM die Reflexion als isolierte
-        # Anfrage und antwortet "wie kann ich helfen" statt einzutragen).
-        msg_lower = (message or "").lower()
-        if "tagebuch" in msg_lower or "diary" in msg_lower or "📔" in (message or ""):
+        # Tagebuch-Spezialfall: NUR der spezifische System-Default-Reminder
+        # triggert den Bypass. User-Reminders die zufällig "tagebuch" enthalten
+        # ("Tagebuch schreiben für Klassenkamerad") sollen NICHT auto-einsortiert
+        # werden. Match: "📔 Tagebuch:" oder "Tagebuch: Highlight" am Anfang.
+        msg = (message or "").strip()
+        msg_lower = msg.lower()
+        is_default_diary = (
+            msg.startswith("📔 Tagebuch:")
+            or msg_lower.startswith("tagebuch: highlight")
+            or msg_lower.startswith("📔 tagebuch")
+        )
+        if is_default_diary:
             _save_pending_diary()
 
         # Generischer Bot-Push-Log in History — LLM weiß bei späterer
