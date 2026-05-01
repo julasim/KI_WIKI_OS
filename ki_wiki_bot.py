@@ -4504,13 +4504,9 @@ TOOLS = [
             "additionalProperties": False,
         },
         "input_examples": [
-            {"action": "create", "title": "Wäsche aufhängen", "priority": "medium"},
-            {"action": "create", "title": "Müll rausstellen", "recurrence": "weekly"},
-            {"action": "create", "title": "Statik anschauen", "due": "2026-05-05", "project": "kiosk-sanierung", "tags": ["statik", "kiosk"]},
+            {"action": "create", "title": "Statik anschauen", "due": "2026-05-05", "project": "kiosk-sanierung", "tags": ["statik"]},
             {"action": "update", "task_id": "t-glastisch-abwischen", "due": "null"},
-            {"action": "update", "task_id": "raum-ausmessen", "priority": "urgent", "project": "kiosk-sanierung"},
             {"action": "done", "task_id": "t-waesche-aufhaengen"},
-            {"action": "reopen", "task_id": "t-glastisch-abwischen"},
         ],
     }},
     {"type": "function", "function": {
@@ -4985,13 +4981,9 @@ TOOLS = [
             "additionalProperties": False,
         },
         "input_examples": [
-            {"action": "sport", "payload": {"kind": "cardio", "duration_min": 32, "note": "Stadtpark, leichter Lauf"}},
-            {"action": "sport", "payload": {"kind": "kraft", "duration_min": 50, "note": "Bodyweight @ home"}},
+            {"action": "sport", "payload": {"kind": "cardio", "duration_min": 32, "note": "Stadtpark"}},
             {"action": "win", "payload": {"text": "Maturathema durchgegangen ohne Hänger"}},
-            {"action": "habit", "payload": {"name": "vision", "value": True}},
-            {"action": "habit", "payload": {"name": "schlaf", "value": False}, "date": "2026-05-02"},
-            {"action": "book", "payload": {"action": "start", "title": "Atomic Habits", "author": "James Clear", "focus": "Mindset"}},
-            {"action": "book", "payload": {"action": "finish", "title": "Atomic Habits", "lesson": "1% besser pro Tag macht den Unterschied", "score": 5}},
+            {"action": "book", "payload": {"action": "finish", "title": "Atomic Habits", "lesson": "1% besser pro Tag", "score": 5}},
         ],
     }},
     {"type": "function", "strict": True, "function": {
@@ -5027,10 +5019,8 @@ TOOLS = [
         },
         "input_examples": [
             {"action": "weekly"},
-            {"action": "weekly", "period": "2026-W18"},
-            {"action": "weekly", "period": "2026-W18", "answers": {"Habits-Score": "16/18", "Sport-Sessions": "1/1", "Status Karriere": "Matura-Vorbereitung läuft", "3 Prios nächste Woche": "1) Matura, 2) Sport reduziert halten, 3) Atomic Habits Kap. 4"}},
-            {"action": "monthly", "period": "2026-05"},
-            {"action": "quarterly", "period": "q2-2026"},
+            {"action": "weekly", "period": "2026-W18", "answers": {"Habits-Score": "16/18", "Sport-Sessions": "1/1", "3 Prios nächste Woche": "Matura, Sport reduziert, Atomic Habits Kap. 4"}},
+            {"action": "quarterly"},
         ],
     }},
     {"type": "function", "strict": True, "function": {
@@ -5115,7 +5105,7 @@ TOOL_HANDLERS = {
 # System prompt (cached)
 # ============================================================================
 
-SYSTEM_PROMPT = """Du bist Julius' Vault-Assistent über Telegram. Deutsch. Heute ist {today}, jetzt {now} ({tz}).
+SYSTEM_PROMPT = """Du bist Julius' Vault-Assistent über Telegram. Deutsch.
 
 VAULT
 - 10_Life/{daily,tasks,notes,meetings,areas}/   Persönliches
@@ -5125,41 +5115,24 @@ VAULT
 
 # VERHALTEN — Default: nur antworten, nichts speichern. Tool nur bei explizitem Speicher-Intent.
 
-| Trigger | Tool |
-|---|---|
-| "speicher / merk dir / notiere / ins tagebuch" | `append_to_daily` oder `create_note` |
-| "task: …" / "todo: …" / Imperativ+Frist | `task(action='create', title=...)` |
-| "jeden Tag / täglich / jede Woche / jeden <Wochentag> / monatlich" | `task(action='create', ..., recurrence='daily/weekdays/weekly/monthly')` |
-| "was steht heute an / agenda / tagesplan / was muss ich noch tun" | `get_today_agenda` |
-| "alle offenen tasks / todo-liste" | `list_open_tasks()` (gruppiert) |
-| "was ist überfällig / morgen / diese woche / ohne datum" | `list_open_tasks(when=overdue/tomorrow/week/nodate)` |
-| "tasks für <projekt>" | `list_open_tasks(project='<slug>')` |
-| "meeting: … / war im Termin mit" | `create_meeting` |
-| "X erledigt / fertig / done" | `task(action='done', task_id=...)` |
-| "Deadline von X entfernen / kein Datum mehr / verschiebe X auf Y" | `task(action='update', task_id=..., due='null'/'YYYY-MM-DD')` |
-| "X wieder öffnen / war versehentlich erledigt" | `task(action='reopen', task_id=...)` |
-| "ändere Priorität von X / verschiebe X ins Projekt Y" | `task(action='update', task_id=..., priority/project=...)` |
-| URL allein | erst fragen, dann `clip_url` |
-| "lösche X" | `request_delete` (Default: ins Archiv = reversibel) |
-| "lösche endgültig / komplett / vollständig / ganz weg / wirklich weg / unwiderruflich / für immer / hart" | `request_delete(permanent=true)` |
-| "lösche alle X / leere Y" | erst `list_files`, dann `request_delete` mit Liste |
-| "ja/bestätigt" nach request_delete | `confirm_delete()`. "nein/abbrechen" → `confirm_delete(action='cancel')`. |
-| "lege Projekt X an / neues Projekt" | `create_project` (Ordner+README direkt, nicht erst nachfragen) |
-| "X als Subprojekt von Y / schiebe X unter Y" | `move(project_slug='X', parent='Y')` |
-| "verschieb A nach B / ordne in Y ein" | `move(src='A', dst='B')` (Einzel) oder `move(src=['a','b','c'], dst='ordner/')` (Bulk bei ≥2 Files) |
-| "erinner mich an X um Y / wecker für 14 / in 30 Min" | `create_reminder` (when_iso = absolute Lokalzeit!) |
-| "jeden Montag 8 Uhr / täglich um 7" | `create_reminder` mit recurrence (daily/weekdays/weekly) |
-| "welche Reminder / cancel reminder" | `list_reminders` / `cancel_reminder` |
-| "mach backup / sicher das vault" | `backup_vault` |
-| "heute X min gelaufen / X min Sport / Kraft heute" | `goal_log(action='sport', payload={kind, duration_min, note?})` |
-| "Win heute: X" / "Wins: a, b, c" | `goal_log(action='win', payload={text})` für jeden Win |
-| "Habit X heute ✓/✗" / "Lesen heute ja" | `goal_log(action='habit', payload={name, value})` |
-| "Buch angefangen: X von Y" | `goal_log(action='book', payload={action='start', title, author?, focus?})` |
-| "Buch fertig: X · Lesson: Y" | `goal_log(action='book', payload={action='finish', title, lesson, score?})` |
-| "Wochen-Anker / Sonntag-Review starten" | `goal_anchor(action='weekly')` (2-step: Fragen stellen, dann mit answers writeback) |
-| "Monats-Bilanz / Monats-Anker" | `goal_anchor(action='monthly')` |
-| "Quartals-Anker / Quartals-Review" | `goal_anchor(action='quarterly')` |
-| "wo stehe ich (Goal) / wie läuft mein 5y-plan / habits-quote" | `goal_status(scope=...)` |
+**Trigger → Tool** (Tool-Beschreibungen geben Details, hier nur Mapping):
+- "speicher/merk dir/notiere/tagebuch" → `append_to_daily` oder `create_note`
+- "task:/todo:/Imperativ+Frist" → `task(action='create')` (mit `recurrence` bei "täglich/wöchentlich/monatlich")
+- "was steht heute an/agenda" → `get_today_agenda`
+- "alle offenen tasks" → `list_open_tasks()` (mit `when=overdue/tomorrow/week/nodate` bei Filter, `project=` bei Projekt)
+- "X erledigt/fertig" → `task(action='done')` · "Deadline weg / verschiebe auf Y" → `task(action='update', due='null'/'YYYY-MM-DD')` · "wieder öffnen" → `task(action='reopen')` · "Prio/Projekt ändern" → `task(action='update')`
+- "meeting:/war im Termin" → `create_meeting`
+- URL allein → erst fragen, dann `clip_url`
+- "lösche X" → `request_delete` (Default Archiv); "endgültig/unwiderruflich/hart" → `permanent=true`; "alle X/leere Y" → erst `list_files`, dann bulk
+- "ja/bestätigt" nach request_delete → `confirm_delete()`; "nein/abbrechen" → `confirm_delete(action='cancel')`
+- "neues Projekt X" → `create_project` (direkt anlegen, nicht nachfragen); "Subprojekt von Y" → `move(project_slug='X', parent='Y')`
+- "verschieb A nach B" → `move(src='A', dst='B')`; ≥2 Files → `move(srcs=[...], dst='ordner/')`
+- "erinner mich um Y / in N Min / täglich um Z / jeden Montag" → `create_reminder` (when_iso = absolute Lokalzeit!), recurrence daily/weekdays/weekly
+- "welche Reminder/cancel" → `list_reminders` / `cancel_reminder`
+- "mach backup" → `backup_vault`
+- 5y-Goal-System: "X min gelaufen/Sport/Kraft" → `goal_log(action='sport')`; "Win/Wins:..." → `goal_log(action='win')` (1 Call pro Win); "Habit X ✓/✗" → `goal_log(action='habit')`; "Buch angefangen/fertig" → `goal_log(action='book', payload={action: start/finish})`
+- 5y-Anker: "Wochen/Monats/Quartals-Review starten" → `goal_anchor(action='weekly'/'monthly'/'quarterly')` (2-step: erst Fragen, dann mit answers)
+- "wo stehe ich / 5y-Status" → `goal_status(scope=all/saeule/habits/sport/drift)`
 
 **Nachfragen vs. Direkt-Machen**:
 - Mini-Input ohne Kontext ("ja", "?") → nachfragen.
@@ -5452,33 +5425,44 @@ async def llm_loop(user_text: str, user_id: int) -> str:
 
     Mit Conversation-Memory: letzte ~12 Turns werden als Context übergeben.
     """
+    # SYSTEM_PROMPT bleibt UNVERÄNDERT als statischer Block — kein .replace() mehr.
+    # Anthropic Prompt-Caching (cache_control) braucht einen identischen Prefix
+    # damit der Cache greift. {today}/{now} im Prefix würde den Cache jede
+    # Minute invalidieren → de facto 0% Hit-Rate. Lösung: dynamische Sachen
+    # (Datum/Uhrzeit + Memory + aktives Projekt) ans ENDE als separater Block,
+    # NACH dem cache_control-Marker. So bleibt der Prefix stabil, Cache greift.
+    sys_text = SYSTEM_PROMPT  # statischer Cache-Prefix
     now_local = datetime.now(TIMEZONE)
-    sys_text = (SYSTEM_PROMPT
-                .replace("{today}", today_iso())
-                .replace("{now}", now_local.strftime("%H:%M"))
-                .replace("{tz}", TIMEZONE.key if hasattr(TIMEZONE, "key") else str(TIMEZONE)))
+    tz_str = TIMEZONE.key if hasattr(TIMEZONE, "key") else str(TIMEZONE)
 
-    # ─── Memory-Tiers in System-Prompt einspeisen ───
+    # Dynamischer Block — ändert sich pro Call, nicht gecacht
+    dynamic_block = f"\n\n# AKTUELLER ZUSTAND\n\nHeute ist {today_iso()}, jetzt {now_local.strftime('%H:%M')} ({tz_str}).\n"
+
+    # ─── Memory-Tiers in dynamischen Block einspeisen ───
     prefs = get_preferences()
     if prefs:
-        sys_text += f"\n\n# PRÄFERENZEN (Stil/Tonalität — befolge diese)\n\n{prefs}\n"
+        dynamic_block += f"\n# PRÄFERENZEN (Stil/Tonalität — befolge diese)\n\n{prefs}\n"
     facts = get_facts()
     if facts:
-        sys_text += f"\n\n# PERSISTENTE FAKTEN (Hintergrund über Julius)\n\n{facts}\n"
+        dynamic_block += f"\n# PERSISTENTE FAKTEN (Hintergrund über Julius)\n\n{facts}\n"
     active_proj = get_active_project()
     if active_proj:
         proj_ctx = get_project_context(active_proj)
         if proj_ctx:
-            sys_text += f"\n\n# AKTIVES PROJEKT: {active_proj}\n\n{proj_ctx}\n"
+            dynamic_block += f"\n# AKTIVES PROJEKT: {active_proj}\n\n{proj_ctx}\n"
         else:
-            sys_text += f"\n\n# AKTIVES PROJEKT: {active_proj} (keine CONTEXT.md gesetzt)\n"
+            dynamic_block += f"\n# AKTIVES PROJEKT: {active_proj} (keine CONTEXT.md gesetzt)\n"
 
     # System-Prompt + History + neue User-Message
     history = await get_history(user_id)
     new_user_msg = {"role": "user", "content": user_text}
     # Provider-aware System-Message-Format:
     # Anthropic akzeptiert content-as-list mit cache_control (Prompt-Caching).
-    # Gemini/OpenAI/Ollama erwarten content als plain String — sonst 400.
+    # WICHTIG: Cache greift nur wenn der Prefix-Block IDENTISCH bleibt.
+    # → Statisches sys_text als Block 1 mit cache_control (gecacht).
+    # → Dynamischer Block (Datum/Uhrzeit/Memory) als Block 2 ohne cache_control
+    #   (jeden Call frisch, kostet vollen Preis aber ist klein).
+    # Gemini/OpenAI/Ollama erwarten content als plain String → konkateniert.
     if USE_ANTHROPIC_CACHE:
         system_msg = {
             "role": "system",
@@ -5487,11 +5471,15 @@ async def llm_loop(user_text: str, user_id: int) -> str:
                     "type": "text",
                     "text": sys_text,
                     "cache_control": {"type": "ephemeral"},
-                }
+                },
+                {
+                    "type": "text",
+                    "text": dynamic_block,
+                },
             ],
         }
     else:
-        system_msg = {"role": "system", "content": sys_text}
+        system_msg = {"role": "system", "content": sys_text + dynamic_block}
     messages = [system_msg] + history + [new_user_msg]
 
     # Token-Budget-Truncation: bei langen Sessions würde messages das
