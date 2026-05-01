@@ -2203,10 +2203,10 @@ async def reminder_callback(ctx: ContextTypes.DEFAULT_TYPE):
     rid = data["id"]
     message = data["message"]
     try:
-        await ctx.bot.send_message(
-            chat_id=ALLOWED_USER_ID,
-            text=f"⏰ <b>Erinnerung</b>\n\n{_esc_html(message)}",
-            parse_mode=constants.ParseMode.HTML,
+        await safe_send(
+            ctx.bot, ALLOWED_USER_ID,
+            f"⏰ <b>Erinnerung</b>\n\n{_esc_html(message)}",
+            is_html=True,
         )
         log.info(f"Reminder fired: {rid}")
     except Exception as e:
@@ -3088,11 +3088,8 @@ async def nightly_suggestion_job(ctx: ContextTypes.DEFAULT_TYPE):
             return
         _save_pending_suggestions(suggestions)
         msg = _format_suggestion_briefing(suggestions)
-        await ctx.bot.send_message(
-            chat_id=ALLOWED_USER_ID,
-            text=msg,
-            parse_mode=constants.ParseMode.HTML,
-        )
+        # _format_suggestion_briefing returnt HTML — is_html=True nötig
+        await safe_send(ctx.bot, ALLOWED_USER_ID, msg, is_html=True)
         log.info(f"Nightly briefing sent: {len(suggestions)} suggestions pending")
     except Exception as e:
         log.exception(f"nightly_suggestion_job failed: {e}")
@@ -5004,21 +5001,31 @@ def _safe_split_html(html: str, max_len: int = None) -> list[str]:
     return chunks
 
 
-async def _send_split_html(send_fn, text: str) -> None:
-    """Schickt text in mehreren Chunks via send_fn (z.B. update.message.reply_text
-    oder ctx.bot.send_message). HTML-Format mit Plain-Text-Fallback bei Parse-Fehler.
+async def _send_split_html(send_fn, text: str, is_html: bool = False) -> None:
+    """Schickt text in mehreren Chunks via send_fn.
 
-    send_fn muss eine async-callable sein, die (text=str, parse_mode, disable_web_page_preview)
-    akzeptiert. Bei Fehler ohne parse_mode (Plain) erneut versuchen.
+    is_html=False (Default): text wird als Markdown interpretiert und konvertiert.
+    is_html=True: text ist BEREITS Telegram-konformes HTML, nur splitten + senden.
+
+    Hintergrund: compute_briefing baut sein HTML manuell (um spezielle Layouts
+    zu kontrollieren), Tool-Outputs sind dagegen Markdown. Eine Funktion für
+    beide Fälle, klares Flag.
+
+    send_fn muss eine async-callable sein, die (text=str, parse_mode,
+    disable_web_page_preview) akzeptiert. Bei Fehler ohne parse_mode
+    (Plain) erneut versuchen.
     """
     if not text:
         await send_fn(text="(leer)")
         return
 
-    # Noise-Wikilinks rausstrippen, BEVOR Markdown→HTML konvertiert
-    text = _strip_paren_wikilinks(text)
+    if is_html:
+        html = text
+    else:
+        # Noise-Wikilinks rausstrippen, BEVOR Markdown→HTML konvertiert
+        text = _strip_paren_wikilinks(text)
+        html = md_to_telegram_html(text)
 
-    html = md_to_telegram_html(text)
     chunks = _safe_split_html(html)
 
     for i, chunk in enumerate(chunks, 1):
@@ -5034,19 +5041,22 @@ async def _send_split_html(send_fn, text: str) -> None:
             await send_fn(text=prefix + _strip_html(chunk))
 
 
-async def safe_reply(update: Update, text: str) -> None:
-    """Split + send via update.message.reply_text. Wrapper um _send_split_html."""
-    await _send_split_html(update.message.reply_text, text)
+async def safe_reply(update: Update, text: str, is_html: bool = False) -> None:
+    """Split + send via update.message.reply_text.
+
+    is_html=True wenn text bereits HTML ist (z.B. compute_briefing-Output).
+    """
+    await _send_split_html(update.message.reply_text, text, is_html=is_html)
 
 
-async def safe_send(bot, chat_id: int, text: str) -> None:
-    """Split + send via bot.send_message. Wrapper um _send_split_html.
+async def safe_send(bot, chat_id: int, text: str, is_html: bool = False) -> None:
+    """Split + send via bot.send_message — für Job-Callbacks ohne Update.
 
-    Für Job-Callbacks ohne Update-Objekt (z.B. daily_briefing_job).
+    is_html=True wenn text bereits HTML ist (z.B. compute_briefing-Output).
     """
     async def _send(text: str, **kwargs):
         await bot.send_message(chat_id=chat_id, text=text, **kwargs)
-    await _send_split_html(_send, text)
+    await _send_split_html(_send, text, is_html=is_html)
 
 
 def _detect_pending_reply_intent(text: str) -> Optional[str]:
@@ -5239,11 +5249,11 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             log.warning(f"Daily-Link für Photo fehlgeschlagen: {e}")
 
-        # Reply
+        # Reply — reply ist bereits HTML (mit <b>/<pre>/<code>)
         reply = f"🖼 {filename}\n\n<b>Vision</b>: {_esc_html(vision_caption)}"
         if ocr_text:
             reply += f"\n\n<b>OCR</b> ({len(ocr_text)} Zeichen):\n<pre><code>{_esc_html(ocr_text[:1500])}</code></pre>"
-        await update.message.reply_text(reply, parse_mode=constants.ParseMode.HTML)
+        await safe_reply(update, reply, is_html=True)
 
         # Upload-Event in LLM-History
         try:
@@ -5509,7 +5519,7 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply += extra_html
         if body_preview and not user_caption:
             reply += f"\n\n<b>Inhalt (Vorschau):</b>\n<pre><code>{_esc_html(body_preview[:600])}</code></pre>"
-        await update.message.reply_text(reply, parse_mode=constants.ParseMode.HTML)
+        await safe_reply(update, reply, is_html=True)
 
         # 6. Upload-Event in LLM-History (für spätere "lege als Projekt an"-Anfragen)
         try:
@@ -6799,17 +6809,18 @@ async def daily_briefing_job(ctx: ContextTypes.DEFAULT_TYPE):
         # die wiederkehrenden Tasks in der heutigen Daily.
         await asyncio.to_thread(reset_recurring_tasks)
         text = await asyncio.to_thread(compute_briefing)
-        # safe_send splittet bei >4096 Chars, sonst Telegram-400.
-        await safe_send(ctx.bot, ALLOWED_USER_ID, text)
+        # compute_briefing returnt bereits HTML — safe_send muss is_html=True
+        # nutzen, sonst werden die <b>/<i>-Tags doppelt-escaped.
+        await safe_send(ctx.bot, ALLOWED_USER_ID, text, is_html=True)
         log.info(f"Daily briefing sent to {ALLOWED_USER_ID}")
     except Exception as e:
         log.exception(f"daily_briefing_job failed: {e}")
-        # Versuche zumindest eine Fehler-Notification zu schicken
+        # Versuche zumindest eine Fehler-Notification zu schicken — plain text
+        # weil safe_send selbst die Ursache sein könnte. Bewusst KEIN HTML hier.
         try:
             await ctx.bot.send_message(
                 chat_id=ALLOWED_USER_ID,
-                text=f"⚠️ Daily-Briefing-Fehler: {type(e).__name__}\n<code>{_esc_html(str(e))[:300]}</code>",
-                parse_mode=constants.ParseMode.HTML,
+                text=f"⚠️ Daily-Briefing-Fehler: {type(e).__name__}\n{str(e)[:300]}",
             )
         except Exception:
             pass
@@ -6819,7 +6830,8 @@ async def daily_briefing_job(ctx: ContextTypes.DEFAULT_TYPE):
 async def handle_briefing(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """/briefing — manueller Trigger für das Morgens-Briefing."""
     text = await asyncio.to_thread(compute_briefing)
-    await safe_reply(update, text)
+    # compute_briefing returnt HTML, nicht Markdown
+    await safe_reply(update, text, is_html=True)
 
 
 @require_auth
