@@ -2445,6 +2445,20 @@ async def reminder_callback(ctx: ContextTypes.DEFAULT_TYPE):
             is_html=True,
         )
         log.info(f"Reminder fired: {rid}")
+
+        # Tagebuch-Spezialfall: User-Reply wird direkt in Daily-Note einsortiert
+        # statt LLM zu rufen (sonst behandelt LLM die Reflexion als isolierte
+        # Anfrage und antwortet "wie kann ich helfen" statt einzutragen).
+        msg_lower = (message or "").lower()
+        if "tagebuch" in msg_lower or "diary" in msg_lower or "📔" in (message or ""):
+            _save_pending_diary()
+
+        # Generischer Bot-Push-Log in History — LLM weiß bei späterer
+        # User-Antwort dass gerade ein Reminder kam.
+        await _log_bot_push_to_history(
+            ALLOWED_USER_ID, "reminder",
+            f"Reminder ausgelöst: {message[:150]}",
+        )
     except Exception as e:
         log.exception(f"Reminder-Send fehlgeschlagen für {rid}")
 
@@ -2819,6 +2833,12 @@ PENDING_SUGGESTIONS_FILE = BOT_MEMORY_DIR / "pending-suggestions.json"
 PENDING_GOAL_ANCHOR_FILE = BOT_MEMORY_DIR / "pending-goal-anchor.json"
 # Pending-Anchor TTL: 4 Stunden (Sonntag 19:00 → bis 23:00 reagierbar)
 PENDING_GOAL_ANCHOR_TTL_SEC = 4 * 3600
+
+# Pending-Diary: Bot hat 20:00 Tagebuch-Reminder gepusht — User-Reply wird
+# direkt in Daily-Note einsortiert (kein LLM-Roundtrip, keine "wie kann ich
+# helfen"-Antworten auf einen Tagebuch-Eintrag).
+PENDING_DIARY_FILE = BOT_MEMORY_DIR / "pending-diary.json"
+PENDING_DIARY_TTL_SEC = 3 * 3600  # 3h: Reminder 20:00 → bis 23:00 reagierbar
 
 
 def _ensure_memory_dir():
@@ -3329,6 +3349,12 @@ async def nightly_suggestion_job(ctx: ContextTypes.DEFAULT_TYPE):
         msg = _format_suggestion_briefing(suggestions)
         # _format_suggestion_briefing returnt HTML — is_html=True nötig
         await safe_send(ctx.bot, ALLOWED_USER_ID, msg, is_html=True)
+        # Push-Log: User-Replies wie '1 3 alle' werden eh über _detect_pending_reply_intent
+        # geroutet, aber LLM weiß bei normalen Texten dass gerade Suggestions kamen.
+        await _log_bot_push_to_history(
+            ALLOWED_USER_ID, "memory-suggestions",
+            f"Nightly Memory-Vorschläge gesendet ({len(suggestions)} Items, User antwortet mit '1 3' / 'alle' / '0' / 'erkläre N')",
+        )
         log.info(f"Nightly briefing sent: {len(suggestions)} suggestions pending")
     except Exception as e:
         log.exception(f"nightly_suggestion_job failed: {e}")
@@ -5138,6 +5164,13 @@ VAULT
 - Mini-Input ohne Kontext ("ja", "?") → nachfragen.
 - Klarer Auftrag → direkt machen, kein "wo soll ich"-Loop.
 
+**REMINDER-CONTEXT** (kritisch — sonst behandelst du Antworten auf Bot-Pings als isolierte Anfragen):
+Wenn deine letzte assistant-Message mit `[Bot-Push HH:MM kind=...]` beginnt, ist die nächste User-Message mit hoher Wahrscheinlichkeit die ANTWORT auf den Push:
+- `kind=reminder` → User reagiert auf einen User-konfigurierten Reminder. Direkt erledigen/einsortieren was der Reminder erinnerte. KEIN "wie kann ich helfen".
+- `kind=morning-briefing` → User antwortet auf Tagesplan-Frage am Ende. Items als Reminders/Tasks eintragen.
+- `kind=memory-suggestions` → User wählt aus Liste. Wird normalerweise schon vor LLM-Pfad gehandled — wenn doch hier, frag was er meint.
+- `kind=sunday-anchor` → User startet/skipt Anker. Wird normalerweise vor LLM gehandled — falls doch hier, ruf goal_anchor.
+
 **Korrekturen**: User-Reaktionen wie "nein/stopp/falsch/besser X statt Y" auf deine LETZTE Aktion → `edit_file` der bestehenden Datei (NICHT neu anlegen) + `log_correction`. Bei Frust → kurz entschuldigen, klärend nachfragen, KEINE blinde Folge-Aktion.
 
 **Multi-File-Upload + Projekt-Anlage**: `create_project` → EIN `move(src=[liste], dst='05_Projects/<slug>/')` → optional `activate`. Niemals N× einzelnen move bei mehreren Files.
@@ -6108,6 +6141,34 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply = _sanitize_error(f"Fehler: {e}")
         await safe_reply(update, reply)
         return
+
+    # Pending Tagebuch-Reply (20:00 Tagebuch-Reminder wurde gepingt) — kein LLM nötig
+    # User-Reply geht direkt in heutige Daily-Note unter "Abends"
+    pending_diary = _load_pending_diary()
+    if pending_diary:
+        t = text.strip()
+        # Skip-Trigger
+        if t.lower() in ("skip", "nichts", "morgen", "spaeter", "später", "nicht heute", "-"):
+            _clear_pending_diary()
+            await safe_reply(update, "OK, kein Tagebuch-Eintrag heute.")
+            return
+        # Sonst: in heutige Daily unter Abends einsortieren
+        try:
+            ts = datetime.now(TIMEZONE).strftime("%H:%M")
+            entry = f"- 📔 ({ts}) {t}"
+            await asyncio.to_thread(append_to_daily, "Abends", entry)
+            _clear_pending_diary()
+            await safe_reply(
+                update,
+                "✓ Tagebuch in heutige Daily eingetragen.\n\n"
+                "Noch was zu loggen? z.B. Habits ('sport ✓ lesen ✓ schlaf ✗') "
+                "oder Wins ('3 wins: a, b, c').",
+            )
+            return
+        except Exception as e:
+            log.exception("pending-diary append failed")
+            _clear_pending_diary()
+            # Fall through to LLM falls append fehlschlägt
 
     # Pending Goal-Anker-Reply (Sonntag 19:00 wurde gerade gepingt) — kein LLM nötig
     pending_anchor = _load_pending_goal_anchor()
@@ -7889,6 +7950,11 @@ async def daily_briefing_job(ctx: ContextTypes.DEFAULT_TYPE):
         # compute_briefing returnt bereits HTML — safe_send muss is_html=True
         # nutzen, sonst werden die <b>/<i>-Tags doppelt-escaped.
         await safe_send(ctx.bot, ALLOWED_USER_ID, text, is_html=True)
+        # Push-Log in History — kompakt, nicht voller Briefing-Text
+        await _log_bot_push_to_history(
+            ALLOWED_USER_ID, "morning-briefing",
+            "Morgens-Briefing gesendet (Tagesplan + Tasks + 5y-Goal)",
+        )
         log.info(f"Daily briefing sent to {ALLOWED_USER_ID}")
     except Exception as e:
         log.exception(f"daily_briefing_job failed: {e}")
@@ -7932,6 +7998,57 @@ def _clear_pending_goal_anchor() -> None:
         PENDING_GOAL_ANCHOR_FILE.unlink(missing_ok=True)
 
 
+def _save_pending_diary() -> None:
+    """Bot hat Tagebuch-Reminder gepusht. handle_text wird User-Reply
+    direkt in Daily-Note einsortieren statt LLM zu rufen.
+    """
+    _ensure_memory_dir()
+    atomic_write(PENDING_DIARY_FILE, json.dumps({"fired_at": time.time()}))
+
+
+def _load_pending_diary() -> Optional[dict]:
+    if not PENDING_DIARY_FILE.exists():
+        return None
+    try:
+        data = json.loads(PENDING_DIARY_FILE.read_text(encoding="utf-8"))
+        if time.time() - float(data.get("fired_at", 0)) > PENDING_DIARY_TTL_SEC:
+            PENDING_DIARY_FILE.unlink(missing_ok=True)
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def _clear_pending_diary() -> None:
+    if PENDING_DIARY_FILE.exists():
+        PENDING_DIARY_FILE.unlink(missing_ok=True)
+
+
+async def _log_bot_push_to_history(user_id: int, kind: str, summary: str) -> None:
+    """Persistiert einen Bot-Push (Reminder, Briefing, Anker-Ping) als
+    assistant-Message in der Conversation-History.
+
+    WHY: Bot-Pushes sind proaktiv — gehen NICHT durch llm_loop. Wenn User
+    minutenspäter antwortet, weiß der LLM ohne diesen Eintrag nichts vom Push
+    und behandelt die User-Message als isolierte Anfrage ('Drücke mich vor
+    dem Lernen' → analysiert Prokrastination, statt als Tagebuch-Eintrag
+    zu erkennen). Mit Push-Log in History sieht der LLM den Kontext.
+
+    Format kompakt damit Token-Footprint klein bleibt — Inhalt summary,
+    nicht der ganze HTML-Block.
+    """
+    try:
+        ts = datetime.now(TIMEZONE).strftime("%H:%M")
+        summary_short = (summary or "").strip()[:200]
+        msg = {
+            "role": "assistant",
+            "content": f"[Bot-Push {ts} kind={kind}] {summary_short}",
+        }
+        await update_history(user_id, [msg])
+    except Exception as e:
+        log.warning(f"_log_bot_push_to_history failed: {e}")
+
+
 async def goal_anchor_reminder_job(ctx: ContextTypes.DEFAULT_TYPE):
     """JobQueue-Callback Sonntag 19:00 — pingt für Wochen-Anker.
 
@@ -7972,6 +8089,11 @@ async def goal_anchor_reminder_job(ctx: ContextTypes.DEFAULT_TYPE):
         # Persistiere pending-state damit User-Reply ohne LLM-Roundtrip funktioniert
         _save_pending_goal_anchor(anchor_action)
         await safe_send(ctx.bot, ALLOWED_USER_ID, msg, is_html=True)
+        # Push-Log in History — LLM hat Kontext für spätere User-Replies
+        await _log_bot_push_to_history(
+            ALLOWED_USER_ID, "sunday-anchor",
+            f"Sonntag-Anker-Reminder ({anchor_action}) gesendet — User soll mit 'ja'/'start' bestätigen oder 'skip' ablehnen",
+        )
         log.info(f"Goal-anchor reminder sent ({today.isoformat()}, action={anchor_action}, first_sunday={is_first_sunday}, quarter={is_quarter_start})")
     except Exception as e:
         log.exception(f"goal_anchor_reminder_job failed: {e}")
