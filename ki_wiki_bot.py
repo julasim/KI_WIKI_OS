@@ -1331,8 +1331,14 @@ def get_today_agenda() -> str:
 
 def create_meeting(title: str, attendees: Optional[list] = None,
                    meeting_date: Optional[str] = None,
-                   tags: Optional[list] = None) -> str:
-    """Create meeting protocol — Body dynamisch (kein Template-Cruft).
+                   tags: Optional[list] = None,
+                   project: Optional[str] = None) -> str:
+    """Create meeting protocol. Routing analog zu create_note:
+
+    - explizit `project=<slug>` ODER aktives Projekt im Bot-Kontext
+      → `05_Projects/<slug>/meetings/YYYY-MM-DD_<slug>.md`
+        (+ `project: <slug>` im Frontmatter)
+    - sonst → `10_Life/meetings/YYYY-MM-DD_<slug>.md` (Default für privat)
 
     meeting_date: NUR ISO YYYY-MM-DD akzeptiert. Bei Garbage/Path-Traversal
     Fallback auf heute (LLM darf nicht beliebige Strings in den Pfad pumpen).
@@ -1352,18 +1358,35 @@ def create_meeting(title: str, attendees: Optional[list] = None,
             log.warning(f"create_meeting: kein ISO-Datum '{meeting_date}', nutze heute")
         today = today_iso()
     slug = slugify(title)
-    # safe_path defensiv anwenden — slug ist via slugify safe, today ist validiert.
-    try:
-        path = safe_path(f"10_Life/meetings/{today}_{slug}.md")
-    except ValueError:
-        return f"Ungültiger Meeting-Pfad ({today}_{slug})"
+
+    # Project-Routing: explizit > aktives Projekt > generisch
+    project_slug: Optional[str] = None
+    target_dir = MEETINGS_DIR
+    if project:
+        proj_dir = find_project_dir(project)
+        if proj_dir is None:
+            return (f"Projekt '{project}' nicht gefunden in 05_Projects/. "
+                    f"Meeting nicht angelegt.")
+        project_slug = proj_dir.name
+        target_dir = proj_dir / "meetings"
+    else:
+        active = get_active_project()
+        if active:
+            proj_dir = find_project_dir(active)
+            if proj_dir is not None:
+                project_slug = proj_dir.name
+                target_dir = proj_dir / "meetings"
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    final_slug = slug  # ID muss mit Filename mitwachsen
+    path = target_dir / f"{today}_{slug}.md"
     n = 2
     while path.exists():
-        try:
-            path = safe_path(f"10_Life/meetings/{today}_{slug}-{n}.md")
-        except ValueError:
-            return f"Ungültiger Meeting-Pfad-Variante (n={n})"
+        final_slug = f"{slug}-{n}"
+        path = target_dir / f"{today}_{final_slug}.md"
         n += 1
+    slug = final_slug
 
     # Tags filtern
     clean_tags = []
@@ -1387,8 +1410,9 @@ def create_meeting(title: str, attendees: Optional[list] = None,
         f"## Action Items\n- [ ] \n"
     )
 
+    meeting_id = f"meeting-{today}-{slug}"
     fm_data = {
-        "id": f"meeting-{today}-{slug}",
+        "id": meeting_id,
         "title": title,
         "type": "meeting",
         "date": today,
@@ -1398,10 +1422,13 @@ def create_meeting(title: str, attendees: Optional[list] = None,
         "status": status,
         "tags": clean_tags,
     }
+    if project_slug:
+        fm_data["project"] = project_slug
     post = frontmatter.Post(body, **fm_data)
     atomic_write(path, frontmatter.dumps(post) + "\n")
     invalidate_link_index()
-    return f"Meeting angelegt: [[meeting-{today}-{slug}]]"
+    suffix = f" → Projekt {project_slug}" if project_slug else ""
+    return f"Meeting angelegt: [[{meeting_id}]]{suffix}"
 
 
 def create_note(title: str, body: str, tags: Optional[list] = None,
@@ -3724,7 +3751,7 @@ TOOLS = [
     }},
     {"type": "function", "function": {
         "name": "create_meeting",
-        "description": "Legt ein Meeting-Protokoll in 10_Life/meetings/ an. tags: thematische Schlagworte extrahieren (z.B. ['blitztext', 'kunde', 'kickoff']).",
+        "description": "Legt ein Meeting-Protokoll an. ROUTING analog zu create_note: Wenn aktives Projekt im Kontext ODER explizit `project=<slug>` → landet in `05_Projects/<slug>/meetings/`. Sonst in `10_Life/meetings/` (nur für privates ohne Projekt-Bezug). tags: thematische Schlagworte (z.B. ['kickoff', 'kunde']).",
         "parameters": {
             "type": "object",
             "properties": {
@@ -3732,6 +3759,7 @@ TOOLS = [
                 "attendees": {"type": "array", "items": {"type": "string"}},
                 "meeting_date": {"type": "string", "description": "ISO-Datum YYYY-MM-DD, default heute"},
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "2-5 thematische Tags, kebab-case Deutsch"},
+                "project": {"type": "string", "description": "Optional: Projekt-Slug für Projekt-Meeting. Landet dann in 05_Projects/<slug>/meetings/. Wenn nicht gesetzt aber aktives Projekt existiert, wird das automatisch verwendet."},
             },
             "required": ["title"],
         },
@@ -4212,8 +4240,38 @@ Bei `create_task/note/meeting`: 2-5 thematische Tags via `tags`-Parameter (kebab
 # KONVERSATIONS-KONTEXT NUTZEN
 Wenn vorhin ein Projekt erstellt/aktiviert wurde und User danach Tasks oder Notes anlegt die offensichtlich dazu gehören → `project=<slug>` AUTOMATISCH setzen, nicht nachfragen.
 
-# NOTE-ROUTING
-`create_note` routet automatisch: wenn aktives Projekt im Kontext → Note landet in `05_Projects/<slug>/notes/`. Wenn User explizit "Notiz für Kiosk" sagt aber Projekt nicht aktiv → `project=kiosk-sanierung` setzen, NICHT generische 10_Life-Note anlegen. Generische `10_Life/notes/` nur wenn kein Projekt-Bezug erkennbar ist.
+# STRIKTE TRENNUNG: PRIVAT vs PROJEKT (kritisch!)
+
+`10_Life/` ist **rein für privates Leben** ohne Projekt-Bezug:
+- `10_Life/daily/` — Tagesnotizen (immer dort, egal welches Thema)
+- `10_Life/tasks/` — alle Tasks (zentraler Pool, Projekt-Tasks haben `project:` Feld)
+- `10_Life/notes/` — Notizen NUR wenn KEIN Projekt-Bezug (z.B. "Geburtstagsidee Mama", "Recipe Risotto")
+- `10_Life/meetings/` — Meetings NUR wenn KEIN Projekt-Bezug (z.B. "Familientreffen")
+
+`05_Projects/<slug>/` ist **alles was zu einem Projekt gehört**:
+- `05_Projects/<slug>/notes/` — alle projekt-bezogenen Notes
+- `05_Projects/<slug>/meetings/` — alle projekt-bezogenen Meetings
+- `05_Projects/<slug>/README.md` — Projekt-Übersicht
+- `05_Projects/<slug>/CONTEXT.md` — Bot-Kontext-Regeln für das Projekt
+
+## Routing-Entscheidung pro Note/Meeting
+
+**Schritt 1**: Erkenne Projekt-Bezug aus dem Inhalt:
+- Erwähnt User explizit ein Projekt? ("Notiz für Kiosk-Sanierung")
+- Ist ein Projekt aktiv (im Kontext)?
+- Passt der Inhalt zu einem existierenden Projekt? (z.B. "ÖNORM B 2061" → Kiosk-Sanierung wenn das Projekt mit Bauthemen läuft)
+
+**Schritt 2**: Routing:
+- **Projekt-Bezug erkannt** → `create_note(project="<slug>", ...)` bzw. `create_meeting(project="<slug>", ...)`
+- **Kein Projekt-Bezug** → `create_note(...)` ohne project-Parameter → landet in `10_Life/`
+
+## Anti-Patterns (VERMEIDEN)
+
+- ✗ "Marketing Prüfung" als generische Note in `10_Life/notes/` ablegen, obwohl Matura-Projekt existiert → muss `project="matura"`
+- ✗ "Telefonat mit Schimmelfirma" generisch ablegen, obwohl Kiosk-Sanierung läuft → muss `project="kiosk-sanierung"`
+- ✗ "Woche 1 Lerninhalte" generisch ablegen, obwohl `lernplan-tech-konzepte-verstehen` existiert → muss dahin
+
+**Lieber 1× nachfragen "Gehört das zu Projekt X oder ist es privat?"** als falsch ablegen. Falsche Ablage = User muss manuell verschieben (nervig).
 """
 
 # ============================================================================
