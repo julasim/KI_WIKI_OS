@@ -2816,6 +2816,9 @@ ACTIVE_PROJECT_FILE = BOT_MEMORY_DIR / "active-project.txt"
 HISTORY_FILE = BOT_MEMORY_DIR / "conversation-history.jsonl"
 CORRECTIONS_FILE = BOT_MEMORY_DIR / "corrections.jsonl"
 PENDING_SUGGESTIONS_FILE = BOT_MEMORY_DIR / "pending-suggestions.json"
+PENDING_GOAL_ANCHOR_FILE = BOT_MEMORY_DIR / "pending-goal-anchor.json"
+# Pending-Anchor TTL: 4 Stunden (Sonntag 19:00 → bis 23:00 reagierbar)
+PENDING_GOAL_ANCHOR_TTL_SEC = 4 * 3600
 
 
 def _ensure_memory_dir():
@@ -4046,9 +4049,30 @@ def _book_action(sub_action: str, title: str, payload: dict,
     if sub_action == "finish":
         lesson = payload.get("lesson", "").strip() or "–"
         score = payload.get("score") or "–"
-        author = payload.get("author", "").strip() or "–"
+        author = payload.get("author", "").strip()
+
+        # Erst: in "Aktiv"-Tabelle nach passendem Title suchen → Author rüberziehen + Zeile rausnehmen
+        # Pattern: | num | TITLE | AUTHOR | focus | start | ende | lesson |
+        # Title-Match case-insensitive auf das title-Feld
+        active_pattern = re.compile(
+            r"^(\| [^|]+ \| (" + re.escape(title) + r") \| ([^|]*) \|[^\n]*\|)\s*$",
+            re.MULTILINE | re.IGNORECASE,
+        )
+        active_match = active_pattern.search(content)
+        if active_match:
+            # Author aus Aktiv-Eintrag übernehmen wenn nicht explizit gegeben
+            if not author:
+                a_from_active = active_match.group(3).strip()
+                if a_from_active and a_from_active != "?":
+                    author = a_from_active
+            # Zeile aus Aktiv-Tabelle entfernen
+            content = active_pattern.sub("", content, count=1)
+            # Eventuell entstandene Doppel-Newline aufräumen
+            content = re.sub(r"\n\n\n+", "\n\n", content)
+
+        author_str = author or "–"
         # Append in "Abgeschlossen"-Tabelle
-        new_row = f"| ? | {title} | {author} | {today_str} | {score} | {lesson} |"
+        new_row = f"| ? | {title} | {author_str} | {today_str} | {score} | {lesson} |"
         new_content, n = re.subn(
             r"(## Abgeschlossen\s*\n[\s\S]*?\|---[^\n]*\|\n)",
             r"\g<1>" + new_row + "\n",
@@ -4057,7 +4081,8 @@ def _book_action(sub_action: str, title: str, payload: dict,
         if n == 0:
             return "Konnte 'Abgeschlossen'-Tabelle nicht finden in lesen.md"
         atomic_write(lesen_path, new_content)
-        return f"✓ Buch abgeschlossen: {title} — Lesson: {lesson[:60]}"
+        moved_note = " (aus Aktiv verschoben)" if active_match else ""
+        return f"✓ Buch abgeschlossen: {title}{moved_note} — Lesson: {lesson[:60]}"
 
     return f"book.action='{sub_action}' nicht unterstützt (start | finish)"
 
@@ -4165,10 +4190,13 @@ def goal_status(scope: str = "all", saeule: Optional[str] = None,
     # Header: Tag-Countdown
     if goal == "5y-2031":
         target = date(2031, 5, 1)
-        days_total = 1826
         days_left = (target - today).days
-        days_done = days_total - days_left
-        parts.append(f"🎯 5y-2031 · Tag {days_done}/{days_total} · Stichtag 01.05.2031 ({days_left} Tage übrig)")
+        if days_left > 0:
+            parts.append(f"🎯 5y-2031 · {days_left} Tage bis Stichtag (01.05.2031)")
+        elif days_left == 0:
+            parts.append(f"🎯 5y-2031 · STICHTAG HEUTE (01.05.2031)")
+        else:
+            parts.append(f"🎯 5y-2031 · Stichtag {-days_left} Tage vergangen (01.05.2031)")
     else:
         parts.append(f"🎯 Goal {goal}")
     parts.append("")
@@ -4372,10 +4400,20 @@ def goal_anchor(action: str, period: Optional[str] = None,
     if not target.exists():
         return f"goal_anchor: target {_rel_or_name(target)} fehlt — bitte zuerst manuell anlegen oder ohne answers aufrufen für Hinweise."
     content = target.read_text(encoding="utf-8")
-    answer_block = f"\n\n## Anker-Antworten ({today_str})\n\n"
+    answer_block_body = ""
     for k, v in answers.items():
-        answer_block += f"**{k}:** {v}\n\n"
-    new_content = content.rstrip() + answer_block
+        answer_block_body += f"**{k}:** {v}\n\n"
+    new_block = f"## Anker-Antworten ({today_str})\n\n{answer_block_body}"
+
+    # Idempotent: wenn heute schon ein Anker-Antworten-Block existiert, ersetze ihn
+    # (nicht nochmal anhängen — sonst stapeln sich Duplikate bei retry).
+    existing_pattern = rf"## Anker-Antworten \({re.escape(today_str)}\)\s*\n[\s\S]*?(?=\n## |\Z)"
+    if re.search(existing_pattern, content):
+        new_content = re.sub(existing_pattern, new_block.rstrip() + "\n", content, count=1)
+        action_msg = f"✓ {period_label} für {per} aktualisiert"
+    else:
+        new_content = content.rstrip() + "\n\n" + new_block
+        action_msg = f"✓ {period_label} für {per} eingetragen"
     atomic_write(target, new_content)
 
     # readme.md updaten — Drift-Detektor-Zeile
@@ -4390,7 +4428,7 @@ def goal_anchor(action: str, period: Optional[str] = None,
         if n > 0:
             atomic_write(readme_path, new_rcontent)
 
-    return f"✓ {period_label} für {per} eingetragen + Drift-Detektor in readme.md aktualisiert ({today_str})"
+    return f"{action_msg} + Drift-Detektor in readme.md aktualisiert ({today_str})"
 
 
 # ============================================================================
@@ -6082,6 +6120,29 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply = _sanitize_error(f"Fehler: {e}")
         await safe_reply(update, reply)
         return
+
+    # Pending Goal-Anker-Reply (Sonntag 19:00 wurde gerade gepingt) — kein LLM nötig
+    pending_anchor = _load_pending_goal_anchor()
+    if pending_anchor:
+        t = text.strip().lower()
+        # Start-Trigger
+        if t in ("ja", "start", "los", "jo", "klar", "los geht's", "los gehts", "ok", "okay"):
+            anchor_action = pending_anchor.get("action", "weekly")
+            _clear_pending_goal_anchor()
+            try:
+                reply = await asyncio.to_thread(goal_anchor, anchor_action)
+            except Exception as e:
+                log.exception("goal_anchor (pending) failed")
+                reply = _sanitize_error(f"Fehler beim Anker-Start: {e}")
+            await safe_reply(update, reply)
+            return
+        # Skip-Trigger
+        if t in ("skip", "nein", "später", "spaeter", "morgen", "nicht heute"):
+            _clear_pending_goal_anchor()
+            await safe_reply(update, "OK, kein Anker heute. Drift-Detektor merkt sich's.")
+            return
+        # Sonst: pending bleibt aktiv, normale LLM-Behandlung — pending wird beim
+        # nächsten Zyklus oder TTL-Ablauf bereinigt.
 
     # Normaler Pfad: ans LLM mit Tool-Loop
     try:
@@ -7854,11 +7915,42 @@ async def daily_briefing_job(ctx: ContextTypes.DEFAULT_TYPE):
             pass
 
 
+def _save_pending_goal_anchor(action: str) -> None:
+    """Persistiert ein pending Goal-Anker — wird von handle_text gecheckt
+    wenn User mit 'ja'/'start'/etc. antwortet, damit er nicht über LLM-
+    Roundtrip gehen muss."""
+    _ensure_memory_dir()
+    payload = {"action": action, "fired_at": time.time()}
+    atomic_write(PENDING_GOAL_ANCHOR_FILE, json.dumps(payload, ensure_ascii=False))
+
+
+def _load_pending_goal_anchor() -> Optional[dict]:
+    """Returns {action, fired_at} wenn pending UND nicht abgelaufen, sonst None."""
+    if not PENDING_GOAL_ANCHOR_FILE.exists():
+        return None
+    try:
+        data = json.loads(PENDING_GOAL_ANCHOR_FILE.read_text(encoding="utf-8"))
+        if time.time() - float(data.get("fired_at", 0)) > PENDING_GOAL_ANCHOR_TTL_SEC:
+            # Abgelaufen — wegräumen
+            PENDING_GOAL_ANCHOR_FILE.unlink(missing_ok=True)
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def _clear_pending_goal_anchor() -> None:
+    if PENDING_GOAL_ANCHOR_FILE.exists():
+        PENDING_GOAL_ANCHOR_FILE.unlink(missing_ok=True)
+
+
 async def goal_anchor_reminder_job(ctx: ContextTypes.DEFAULT_TYPE):
     """JobQueue-Callback Sonntag 19:00 — pingt für Wochen-Anker.
 
     Eskaliert bei 1. Sonntag im Monat zu Monats-Anker und erwähnt zusätzlich
     am 1. Apr/Jul/Okt/Jan den Quartals-Anker.
+    Setzt pending-state, sodass User-Reply 'ja'/'start'/'los' direkt erkannt
+    und der Anker startet (kein LLM-Roundtrip).
     """
     try:
         today = datetime.now(TIMEZONE).date()
@@ -7868,25 +7960,31 @@ async def goal_anchor_reminder_job(ctx: ContextTypes.DEFAULT_TYPE):
         is_quarter_start = is_first_sunday and today.month in (1, 4, 7, 10)
 
         if is_quarter_start:
+            anchor_action = "quarterly"
             msg = (
                 "🌅 <b>Sonntag-Anker</b> — heute auch <b>Quartals-Anker</b> (90 Min)\n\n"
                 "📊 Excel öffnen + Säulen-Review:\n"
                 "<code>OneDrive\\…\\1_Privat\\08_Sonstiges\\Goals\\5-Jahres-Ziel_Tracker.xlsx</code>\n\n"
-                "Antworte mit <b>start</b> wenn bereit, dann ruf ich <code>goal_anchor(action='quarterly')</code>."
+                "Antworte mit <b>start</b> oder <b>ja</b> um zu beginnen, <b>skip</b> falls heute nicht."
             )
         elif is_first_sunday:
+            anchor_action = "monthly"
             msg = (
                 "🌅 <b>Sonntag-Anker</b> — heute auch <b>Monats-Anker</b> (60 Min, ersetzt Wochen-Anker)\n\n"
                 "Bilanz aller 6 Säulen + Monats-Ziele für nächsten Monat.\n\n"
-                "Antworte mit <b>start</b> wenn bereit, dann ruf ich <code>goal_anchor(action='monthly')</code>."
+                "Antworte mit <b>start</b> oder <b>ja</b> um zu beginnen, <b>skip</b> falls heute nicht."
             )
         else:
+            anchor_action = "weekly"
             msg = (
                 "🌅 <b>Sonntag-Anker</b> (30-45 Min) — bereit für die Wochen-Reflexion?\n\n"
                 "Antworte mit <b>start</b> oder <b>ja</b> um zu beginnen, oder <b>skip</b> falls heute nicht."
             )
+
+        # Persistiere pending-state damit User-Reply ohne LLM-Roundtrip funktioniert
+        _save_pending_goal_anchor(anchor_action)
         await safe_send(ctx.bot, ALLOWED_USER_ID, msg, is_html=True)
-        log.info(f"Goal-anchor reminder sent ({today.isoformat()}, first_sunday={is_first_sunday}, quarter={is_quarter_start})")
+        log.info(f"Goal-anchor reminder sent ({today.isoformat()}, action={anchor_action}, first_sunday={is_first_sunday}, quarter={is_quarter_start})")
     except Exception as e:
         log.exception(f"goal_anchor_reminder_job failed: {e}")
 
