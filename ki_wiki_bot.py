@@ -3881,6 +3881,515 @@ def get_usage_summary(days: int = 7) -> str:
 
 
 # ============================================================================
+# Goal-System (5-Jahres-Plan unter 10_Life/goals/<goal-slug>/)
+# ============================================================================
+# Drei Tools — bewusst dem konsolidierten task-Pattern folgend:
+#   goal_log      Daily-Einträge (sport, win, habit, book, lesson)
+#   goal_anchor   Wochen/Monats/Quartals-Review (2-step: erst File anlegen +
+#                 Fragen returnieren, dann mit answers aufrufen zum Schreiben)
+#   goal_status   Read-only Aggregation (Säulen, Habits, Sport, Drift)
+#
+# Default goal-slug ist "5y-2031" — später kann via env oder Tool-Param
+# auf andere Goals umgestellt werden.
+
+DEFAULT_GOAL_SLUG = "5y-2031"
+GOALS_BASE = VAULT / "10_Life" / "goals"
+
+VALID_HABITS = ["sport", "lesen", "schlaf", "bildschirm", "vision", "wasser"]
+
+
+def _goal_dir(slug: str = DEFAULT_GOAL_SLUG) -> Path:
+    """Resolved Goal-Dir, mit Path-Traversal-Schutz."""
+    if not re.match(r"^[a-z0-9_-]+$", slug):
+        raise ValueError(f"Ungültiger goal slug: {slug!r}")
+    p = (GOALS_BASE / slug).resolve()
+    base_resolved = GOALS_BASE.resolve()
+    if not str(p).startswith(str(base_resolved)):
+        raise ValueError(f"Goal-Pfad außerhalb {GOALS_BASE}: {slug}")
+    return p
+
+
+def _current_week_iso() -> str:
+    """ISO-Wochen-String YYYY-WXX (z.B. '2026-W18')."""
+    today = datetime.now(TIMEZONE).date()
+    iso = today.isocalendar()
+    return f"{iso.year}-W{iso.week:02d}"
+
+
+def _current_month_iso() -> str:
+    today = datetime.now(TIMEZONE).date()
+    return f"{today.year}-{today.month:02d}"
+
+
+def _current_quarter_iso() -> str:
+    today = datetime.now(TIMEZONE).date()
+    q = (today.month - 1) // 3 + 1
+    return f"q{q}-{today.year}"
+
+
+def _set_habit(date_iso: str, habit: str, symbol: str,
+               slug: str = DEFAULT_GOAL_SLUG) -> bool:
+    """Setzt Habit-Spalte in tracker/habits.md für ein Datum.
+    Falls Zeile für Datum nicht existiert, lege sie nach Header an.
+    Returns True bei Erfolg.
+    """
+    if habit not in VALID_HABITS:
+        return False
+    col_idx = VALID_HABITS.index(habit)
+    habits_path = _goal_dir(slug) / "tracker" / "habits.md"
+    if not habits_path.exists():
+        return False
+    content = habits_path.read_text(encoding="utf-8")
+
+    # Suche existierende Zeile
+    line_pattern = rf"^\| {re.escape(date_iso)} \|([^\n]+)$"
+    m = re.search(line_pattern, content, re.MULTILINE)
+    if m:
+        # Existiert: zelle updaten
+        cells = m.group(1).split("|")  # 6 Habit-Zellen + 1 trailing empty
+        if len(cells) < 7:
+            return False
+        cells[col_idx] = f" {symbol} "
+        new_line = f"| {date_iso} |" + "|".join(cells)
+        new_content = content[:m.start()] + new_line + content[m.end():]
+    else:
+        # Nicht da: neue Zeile nach Tabellen-Header
+        new_cells = ["–"] * 6
+        new_cells[col_idx] = symbol
+        new_line = f"| {date_iso} | " + " | ".join(new_cells) + " |"
+        new_content, n = re.subn(
+            r"(\| Datum \| Sport \| Lesen \| Schlaf \| Bildschirm \| Vision \| Wasser \|\n\|[-\s|]+\|\n)",
+            r"\g<1>" + new_line + "\n",
+            content, count=1,
+        )
+        if n == 0:
+            return False
+    atomic_write(habits_path, new_content)
+    return True
+
+
+def _append_sport_row(date_iso: str, kind: str, duration: int, note: str,
+                     slug: str = DEFAULT_GOAL_SLUG) -> bool:
+    log_path = _goal_dir(slug) / "tracker" / "sport-log.md"
+    if not log_path.exists():
+        return False
+    content = log_path.read_text(encoding="utf-8")
+    new_row = f"| {date_iso} | {kind} | {duration} | {note} |"
+    new_content, n = re.subn(
+        r"(\| Datum \| Art \| Dauer \(min\) \| Notiz \|\n\|[-\s|]+\|\n)",
+        r"\g<1>" + new_row + "\n",
+        content, count=1,
+    )
+    if n == 0:
+        return False
+    atomic_write(log_path, new_content)
+    return True
+
+
+def _append_win(date_iso: str, text: str, slug: str = DEFAULT_GOAL_SLUG) -> bool:
+    """Append eine Win-Zeile in tracker/wins.md unter passendem Datum-Header.
+    Header anlegen falls nicht da (oben).
+    """
+    wins_path = _goal_dir(slug) / "tracker" / "wins.md"
+    if not wins_path.exists():
+        return False
+    content = wins_path.read_text(encoding="utf-8")
+    date_header = f"## {date_iso}"
+    if date_header in content:
+        # Append unter Header — vor dem nächsten ## oder vor `---` oder am Ende
+        pattern = rf"(##\s+{re.escape(date_iso)}\s*\n(?:.*?\n)*?)(?=\n##\s|\n---|\n\*Neue|\Z)"
+        m = re.search(pattern, content, re.DOTALL)
+        if m:
+            new_block = m.group(1).rstrip() + f"\n- {text}\n"
+            new_content = content[:m.start()] + new_block + content[m.end():]
+        else:
+            return False
+    else:
+        # Neuer Datum-Header oben (vor erstem bestehenden ##)
+        new_block = f"\n## {date_iso}\n\n- {text}\n"
+        if re.search(r"\n## \d{4}-\d{2}-\d{2}", content):
+            new_content = re.sub(r"(\n## \d{4}-\d{2}-\d{2})", new_block + r"\1", content, count=1)
+        else:
+            # Kein bestehender Datum-Header → vor `*Neue Tage` oder am Ende
+            if "*Neue Tage" in content:
+                new_content = content.replace("*Neue Tage", new_block + "\n*Neue Tage")
+            else:
+                new_content = content.rstrip() + new_block
+    atomic_write(wins_path, new_content)
+    return True
+
+
+def _book_action(sub_action: str, title: str, payload: dict,
+                slug: str = DEFAULT_GOAL_SLUG) -> str:
+    """sub_action: start | finish | update"""
+    lesen_path = _goal_dir(slug) / "tracker" / "lesen.md"
+    if not lesen_path.exists():
+        return "tracker/lesen.md fehlt"
+    content = lesen_path.read_text(encoding="utf-8")
+    today_str = today_iso()
+
+    if sub_action == "start":
+        author = payload.get("author", "").strip() or "?"
+        focus = payload.get("focus", "").strip() or "–"
+        # Append in "Aktiv"-Tabelle
+        new_row = f"| ? | {title} | {author} | {focus} | {today_str} | | |"
+        new_content, n = re.subn(
+            r"(## Aktiv\s*\n[\s\S]*?\|---[^\n]*\|\n)",
+            r"\g<1>" + new_row + "\n",
+            content, count=1,
+        )
+        if n == 0:
+            return "Konnte 'Aktiv'-Tabelle nicht finden in lesen.md"
+        atomic_write(lesen_path, new_content)
+        return f"✓ Buch begonnen: {title} ({today_str})"
+
+    if sub_action == "finish":
+        lesson = payload.get("lesson", "").strip() or "–"
+        score = payload.get("score") or "–"
+        author = payload.get("author", "").strip() or "–"
+        # Append in "Abgeschlossen"-Tabelle
+        new_row = f"| ? | {title} | {author} | {today_str} | {score} | {lesson} |"
+        new_content, n = re.subn(
+            r"(## Abgeschlossen\s*\n[\s\S]*?\|---[^\n]*\|\n)",
+            r"\g<1>" + new_row + "\n",
+            content, count=1,
+        )
+        if n == 0:
+            return "Konnte 'Abgeschlossen'-Tabelle nicht finden in lesen.md"
+        atomic_write(lesen_path, new_content)
+        return f"✓ Buch abgeschlossen: {title} — Lesson: {lesson[:60]}"
+
+    return f"book.action='{sub_action}' nicht unterstützt (start | finish)"
+
+
+def goal_log(action: str, payload: Optional[dict] = None,
+             date: Optional[str] = None,
+             goal: str = DEFAULT_GOAL_SLUG) -> str:
+    """Logge Daily-Eintrag ins Goal-System.
+
+    action: 'sport' | 'win' | 'lesson' | 'habit' | 'book'
+    payload: action-spezifische Felder (siehe Tool-Description)
+    date: ISO YYYY-MM-DD, default heute
+    """
+    payload = payload or {}
+    try:
+        gdir = _goal_dir(goal)
+    except ValueError as e:
+        return f"goal_log: {e}"
+    if not gdir.exists():
+        return f"Goal-System '{goal}' nicht initialisiert ({gdir}). Erst Phase-1-Setup."
+
+    d = date.strip() if date and re.match(r"^\d{4}-\d{2}-\d{2}$", str(date).strip()) else today_iso()
+    a = (action or "").strip().lower()
+
+    if a == "sport":
+        kind = (payload.get("kind") or "cardio").lower()
+        duration = payload.get("duration_min")
+        note = (payload.get("note") or "").strip()
+        if kind not in ("cardio", "kraft"):
+            return f"sport: kind muss 'cardio' oder 'kraft' sein, nicht '{kind}'"
+        if not isinstance(duration, (int, float)) or duration <= 0:
+            return "sport: duration_min muss positive Zahl sein"
+        if not _append_sport_row(d, kind, int(duration), note, goal):
+            return "Konnte sport-log.md nicht schreiben"
+        # Plus: Habit sport für heute auf ✓ (nur wenn d == today)
+        if d == today_iso():
+            _set_habit(d, "sport", "✓", goal)
+        return f"✓ Sport: {kind} {int(duration)}min am {d}"
+
+    if a == "win":
+        text = (payload.get("text") or "").strip()
+        if not text:
+            return "win: text ist Pflicht"
+        if not _append_win(d, text, goal):
+            return "Konnte wins.md nicht schreiben"
+        return f"✓ Win am {d} festgehalten"
+
+    if a == "lesson":
+        text = (payload.get("text") or "").strip()
+        if not text:
+            return "lesson: text ist Pflicht"
+        # Lesson in heutige Daily-Note unter "Abends" — nur für heute sinnvoll
+        if d != today_iso():
+            return f"lesson: nur für heutiges Datum (du nanntest {d}, heute={today_iso()})"
+        try:
+            append_to_daily("Abends", f"- Lesson: {text}")
+            return f"✓ Lesson in heutiger Daily-Note ergänzt"
+        except Exception as e:
+            return f"lesson append fehlgeschlagen: {e}"
+
+    if a == "habit":
+        name = (payload.get("name") or "").strip().lower()
+        value = payload.get("value")
+        if name not in VALID_HABITS:
+            return f"habit: name muss aus {VALID_HABITS} sein"
+        # Value zu Symbol mappen
+        if value is True or str(value).strip().lower() in ("true", "yes", "ja", "ok", "✓"):
+            symbol = "✓"
+        elif value is False or str(value).strip().lower() in ("false", "no", "nein", "✗"):
+            symbol = "✗"
+        else:
+            symbol = "–"
+        if not _set_habit(d, name, symbol, goal):
+            return f"Konnte habit '{name}' nicht setzen (Tabelle fehlt?)"
+        return f"✓ Habit '{name}' = {symbol} am {d}"
+
+    if a == "book":
+        sub = (payload.get("action") or "").strip().lower()
+        title = (payload.get("title") or "").strip()
+        if sub not in ("start", "finish"):
+            return "book: action muss 'start' oder 'finish' sein"
+        if not title:
+            return "book: title ist Pflicht"
+        return _book_action(sub, title, payload, goal)
+
+    return f"goal_log: unbekannte action '{action}'. Erlaubt: sport, win, lesson, habit, book"
+
+
+def goal_status(scope: str = "all", saeule: Optional[str] = None,
+                goal: str = DEFAULT_GOAL_SLUG) -> str:
+    """Read-only Status des Goal-Systems.
+
+    scope: 'all' | 'saeule' | 'habits' | 'sport' | 'drift'
+    """
+    try:
+        gdir = _goal_dir(goal)
+    except ValueError as e:
+        return f"goal_status: {e}"
+    if not gdir.exists():
+        return f"Goal-System '{goal}' nicht initialisiert."
+
+    today = datetime.now(TIMEZONE).date()
+    parts = []
+
+    # Header: Tag-Countdown
+    if goal == "5y-2031":
+        target = date(2031, 5, 1)
+        days_total = 1826
+        days_left = (target - today).days
+        days_done = days_total - days_left
+        parts.append(f"🎯 5y-2031 · Tag {days_done}/{days_total} · Stichtag 01.05.2031 ({days_left} Tage übrig)")
+    else:
+        parts.append(f"🎯 Goal {goal}")
+    parts.append("")
+
+    s = (scope or "all").strip().lower()
+
+    # Habits: zähle Häkchen letzte 7 Tage
+    def _habits_score(days: int) -> tuple[int, int]:
+        habits_path = gdir / "tracker" / "habits.md"
+        if not habits_path.exists():
+            return (0, 0)
+        content = habits_path.read_text(encoding="utf-8")
+        cutoff = today - timedelta(days=days)
+        check = 0
+        possible = 0
+        for line in content.split("\n"):
+            m = re.match(r"^\| (\d{4}-\d{2}-\d{2}) \|(.+)\|$", line)
+            if not m:
+                continue
+            try:
+                line_date = datetime.strptime(m.group(1), "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            if line_date < cutoff or line_date > today:
+                continue
+            cells = [c.strip() for c in m.group(2).split("|") if c.strip() != ""]
+            for c in cells[:6]:
+                if c == "✓":
+                    check += 1
+                if c in ("✓", "✗"):
+                    possible += 1
+        return (check, possible)
+
+    # Sport: zähle Sessions letzte 30 Tage
+    def _sport_count(days: int) -> int:
+        sport_path = gdir / "tracker" / "sport-log.md"
+        if not sport_path.exists():
+            return 0
+        content = sport_path.read_text(encoding="utf-8")
+        cutoff = today - timedelta(days=days)
+        n = 0
+        for line in content.split("\n"):
+            m = re.match(r"^\| (\d{4}-\d{2}-\d{2}) \| (cardio|kraft) \|", line)
+            if m:
+                try:
+                    d = datetime.strptime(m.group(1), "%Y-%m-%d").date()
+                    if d >= cutoff and d <= today:
+                        n += 1
+                except ValueError:
+                    pass
+        return n
+
+    # Drift: lies readme.md "Letzter X-Anker:" Zeilen
+    def _drift_status() -> dict:
+        readme_path = gdir / "readme.md"
+        if not readme_path.exists():
+            return {}
+        content = readme_path.read_text(encoding="utf-8")
+        out = {}
+        for label, key in (("Letzter Wochen-Anker", "weekly"),
+                           ("Letzter Monats-Anker", "monthly"),
+                           ("Letzter Quartals-Anker", "quarterly")):
+            m = re.search(rf"\*\*{re.escape(label)}:\*\* ([\d-]+|—)", content)
+            out[key] = m.group(1) if m else "?"
+        return out
+
+    if s in ("all", "saeule"):
+        parts.append("📊 **Säulen** (Status manuell gepflegt in saeulen.md / readme.md)")
+        # Lies aus readme.md die Status-Tabelle
+        readme = (gdir / "readme.md").read_text(encoding="utf-8") if (gdir / "readme.md").exists() else ""
+        m = re.search(r"\| Säule \| Status \| Nächster Anker \|.*?\n((?:\|.*?\|\n)+)", readme, re.DOTALL)
+        if m:
+            for row in m.group(1).strip().split("\n"):
+                cells = [c.strip() for c in row.split("|") if c.strip()]
+                if len(cells) >= 2:
+                    parts.append(f"  {cells[0]:<14} – {cells[1]}")
+        parts.append("")
+
+    if s in ("all", "habits"):
+        check_7, poss_7 = _habits_score(7)
+        parts.append(f"📈 **Habits** letzte 7 Tage: {check_7} ✓ / {poss_7} möglich")
+        if poss_7 > 0:
+            pct = int(check_7 / poss_7 * 100)
+            parts.append(f"   Quote: {pct}% (Soll: ≥80%)")
+        parts.append("")
+
+    if s in ("all", "sport"):
+        sport_30 = _sport_count(30)
+        sport_7 = _sport_count(7)
+        parts.append(f"🏃 **Sport** letzte 30 Tage: {sport_30} Sessions · letzte 7 Tage: {sport_7}")
+        parts.append("   Wochen-Soll: 3 Sessions (2× Cardio + 1× Kraft)")
+        parts.append("")
+
+    if s in ("all", "drift"):
+        drift = _drift_status()
+        parts.append(f"⚠️ **Drift-Detektor**")
+        parts.append(f"   Letzter Wochen-Anker:   {drift.get('weekly', '?')}")
+        parts.append(f"   Letzter Monats-Anker:   {drift.get('monthly', '?')}")
+        parts.append(f"   Letzter Quartals-Anker: {drift.get('quarterly', '?')}")
+
+    return "\n".join(parts)
+
+
+def _anchor_questions(action: str) -> list[str]:
+    """Fragen-Liste pro Anker-Typ — werden vom LLM an den User gestellt."""
+    common = [
+        "Habits-Score: wie viele ✓ auf wie vielen möglichen?",
+        "Sport-Sessions diese Woche: wie viele?",
+        "Status pro Säule (1 Satz pro Säule: Karriere, Finanzen, Sport, Wissen, Beziehungen, Mindset)",
+        "Was hat funktioniert?",
+        "Was nicht?",
+        "3 Prios nächste Woche",
+    ]
+    if action == "weekly":
+        return common
+    if action == "monthly":
+        return common + [
+            "Säulen-Bilanz für den Monat (was bleibt nach diesem Monat hängen?)",
+            "Monats-Ziele für nächsten Monat (1 pro Säule)",
+        ]
+    if action == "quarterly":
+        return common + [
+            "Excel-Tracker geöffnet + Quartals-Tab gefüllt? (manueller Schritt!)",
+            "Säulen-Ziele für nächstes Quartal (1 pro Säule)",
+            "Risiken-Review: hat sich was am Plan-B-Auge geändert?",
+            "EINE konkrete Quartals-Aktion definieren",
+        ]
+    return common
+
+
+def goal_anchor(action: str, period: Optional[str] = None,
+                answers: Optional[dict] = None,
+                goal: str = DEFAULT_GOAL_SLUG) -> str:
+    """Anker-Workflow für Wochen/Monats/Quartals-Reviews.
+
+    Step 1 (LLM ruft ohne answers): Tool legt File aus Template an (falls nicht da)
+            und returnt die Frage-Liste, die LLM dem User im Chat stellt.
+    Step 2 (LLM ruft mit answers={...}): Tool schreibt Antworten ins File +
+            updated readme.md (Drift-Detektor).
+
+    action: 'weekly' | 'monthly' | 'quarterly'
+    period: Optional 'YYYY-WXX', 'YYYY-MM', 'qX-YYYY' — default aktuell
+    answers: dict mit den Antworten zum Schreiben
+    """
+    try:
+        gdir = _goal_dir(goal)
+    except ValueError as e:
+        return f"goal_anchor: {e}"
+    if not gdir.exists():
+        return f"Goal-System '{goal}' nicht initialisiert."
+
+    a = (action or "").strip().lower()
+    today_str = today_iso()
+
+    if a == "weekly":
+        per = period or _current_week_iso()
+        per_normalized = per.lower().replace("-w", "-w")  # consistent
+        target = gdir / "wochen" / f"{per_normalized}.md"
+        period_label = "Wochen-Anker"
+        readme_field = "Letzter Wochen-Anker"
+    elif a == "monthly":
+        per = period or _current_month_iso()
+        target = gdir / "monate" / f"{per}.md"
+        period_label = "Monats-Anker"
+        readme_field = "Letzter Monats-Anker"
+    elif a == "quarterly":
+        per = period or _current_quarter_iso()
+        target = gdir / "quartale" / f"{per}.md"
+        period_label = "Quartals-Anker"
+        readme_field = "Letzter Quartals-Anker"
+    else:
+        return f"action muss weekly|monthly|quarterly sein, nicht '{action}'"
+
+    # Helper: robust relative-Pfad (auch bei SSHFS-Mount auf Windows wo
+    # target.resolve() zu UNC-Path wird der nicht mehr unter VAULT liegt)
+    def _rel_or_name(p: Path) -> str:
+        try:
+            return str(p.relative_to(VAULT))
+        except ValueError:
+            return f".../{p.parent.name}/{p.name}"
+
+    # Step 1: keine answers → Frage-Liste returnen + File-Status
+    if not answers:
+        existed = target.exists()
+        msg = f"📋 **{period_label}** für {per}\n"
+        if existed:
+            msg += f"File existiert: `{_rel_or_name(target)}`\n"
+        else:
+            msg += f"⚠️ File fehlt noch: `{_rel_or_name(target)}` — leg sie nach Template an oder ruf goal_anchor erneut mit answers=dict auf, dann wird befüllt.\n"
+        msg += "\n**Fragen für die Reflexion:**\n"
+        for i, q in enumerate(_anchor_questions(a), 1):
+            msg += f"{i}. {q}\n"
+        msg += f"\n→ Wenn fertig: ruf `goal_anchor(action='{a}', period='{per}', answers={{...}})` mit den Antworten."
+        return msg
+
+    # Step 2: answers vorhanden → ins File schreiben + readme updaten
+    if not target.exists():
+        return f"goal_anchor: target {_rel_or_name(target)} fehlt — bitte zuerst manuell anlegen oder ohne answers aufrufen für Hinweise."
+    content = target.read_text(encoding="utf-8")
+    answer_block = f"\n\n## Anker-Antworten ({today_str})\n\n"
+    for k, v in answers.items():
+        answer_block += f"**{k}:** {v}\n\n"
+    new_content = content.rstrip() + answer_block
+    atomic_write(target, new_content)
+
+    # readme.md updaten — Drift-Detektor-Zeile
+    readme_path = gdir / "readme.md"
+    if readme_path.exists():
+        rcontent = readme_path.read_text(encoding="utf-8")
+        new_rcontent, n = re.subn(
+            rf"(\*\*{re.escape(readme_field)}:\*\* )([\d-]+|—)",
+            rf"\g<1>{today_str}",
+            rcontent, count=1,
+        )
+        if n > 0:
+            atomic_write(readme_path, new_rcontent)
+
+    return f"✓ {period_label} für {per} eingetragen + Drift-Detektor in readme.md aktualisiert ({today_str})"
+
+
+# ============================================================================
 # Tool definitions (OpenAI function-calling format)
 # ============================================================================
 
@@ -4395,6 +4904,126 @@ TOOLS = [
             "additionalProperties": False,
         },
     }},
+    {"type": "function", "strict": True, "function": {
+        "name": "goal_log",
+        "description": (
+            "Logge einen Daily-Eintrag ins 5-Jahres-Goal-System (10_Life/goals/<slug>/). "
+            "ACTION 'sport': payload={kind: cardio|kraft, duration_min: int, note: str}. "
+            "Schreibt in tracker/sport-log.md + setzt habit 'sport' für heute auf ✓. "
+            "ACTION 'win': payload={text: str}. Append in tracker/wins.md unter heutigem Datum. "
+            "ACTION 'lesson': payload={text: str}. Append in heutige Daily-Note unter 'Abends'. "
+            "ACTION 'habit': payload={name: sport|lesen|schlaf|bildschirm|vision|wasser, value: bool}. "
+            "Setzt Habit-Spalte in tracker/habits.md für heute (oder 'date' wenn anders). "
+            "ACTION 'book': payload={action: start|finish, title: str, author?: str, focus?: str, lesson?: str, score?: 1-5}. "
+            "Verwaltet tracker/lesen.md. "
+            "Trigger: User sagt z.B. 'heute 30 min gelaufen' → goal_log(action=sport,...). "
+            "'3 wins: vater telefoniert, sport gemacht, lesen geschafft' → 3× goal_log(action=win)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["sport", "win", "lesson", "habit", "book"],
+                },
+                "payload": {
+                    "type": "object",
+                    "description": "Action-spezifische Felder — siehe description oben.",
+                },
+                "date": {
+                    "type": "string",
+                    "description": "ISO YYYY-MM-DD, default heute. Nur sport/habit/win unterstützen non-today.",
+                },
+                "goal": {
+                    "type": "string",
+                    "description": "Goal-Slug, default '5y-2031'.",
+                },
+            },
+            "required": ["action", "payload"],
+            "additionalProperties": False,
+        },
+        "input_examples": [
+            {"action": "sport", "payload": {"kind": "cardio", "duration_min": 32, "note": "Stadtpark, leichter Lauf"}},
+            {"action": "sport", "payload": {"kind": "kraft", "duration_min": 50, "note": "Bodyweight @ home"}},
+            {"action": "win", "payload": {"text": "Maturathema durchgegangen ohne Hänger"}},
+            {"action": "habit", "payload": {"name": "vision", "value": True}},
+            {"action": "habit", "payload": {"name": "schlaf", "value": False}, "date": "2026-05-02"},
+            {"action": "book", "payload": {"action": "start", "title": "Atomic Habits", "author": "James Clear", "focus": "Mindset"}},
+            {"action": "book", "payload": {"action": "finish", "title": "Atomic Habits", "lesson": "1% besser pro Tag macht den Unterschied", "score": 5}},
+        ],
+    }},
+    {"type": "function", "strict": True, "function": {
+        "name": "goal_anchor",
+        "description": (
+            "Anker-Workflow für Wochen/Monats/Quartals-Reviews im 5y-Goal-System. "
+            "ZWEI-STUFIG: "
+            "STEP 1: Ohne 'answers' aufrufen → Tool gibt File-Status + Fragen-Liste zurück. "
+            "Du stellst die Fragen dem User im Chat. "
+            "STEP 2: Mit 'answers' (dict mit Antworten) aufrufen → Tool schreibt Antworten "
+            "ins jeweilige File (wochen/YYYY-WXX.md, monate/YYYY-MM.md, quartale/qX-YYYY.md) "
+            "und updated readme.md (Drift-Detektor-Zeile 'Letzter X-Anker'). "
+            "ACTION 'weekly' (Sonntagabend), 'monthly' (1. Sonntag im Monat, 60 Min), "
+            "'quarterly' (1. Wochenende im Quartal, 90 Min, manuell auch Excel füllen). "
+            "Trigger: User sagt 'wochen-anker', 'sonntag-review', 'monats-bilanz', 'quartals-anker'."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["weekly", "monthly", "quarterly"]},
+                "period": {
+                    "type": "string",
+                    "description": "Optional: 'YYYY-WXX' / 'YYYY-MM' / 'qX-YYYY'. Default aktuell.",
+                },
+                "answers": {
+                    "type": "object",
+                    "description": "Step 2: dict mit den Antworten zum Schreiben (Schlüssel = Frage-Bezeichnung, Wert = Antwort-Text).",
+                },
+                "goal": {"type": "string", "description": "Goal-Slug, default '5y-2031'."},
+            },
+            "required": ["action"],
+            "additionalProperties": False,
+        },
+        "input_examples": [
+            {"action": "weekly"},
+            {"action": "weekly", "period": "2026-W18"},
+            {"action": "weekly", "period": "2026-W18", "answers": {"Habits-Score": "16/18", "Sport-Sessions": "1/1", "Status Karriere": "Matura-Vorbereitung läuft", "3 Prios nächste Woche": "1) Matura, 2) Sport reduziert halten, 3) Atomic Habits Kap. 4"}},
+            {"action": "monthly", "period": "2026-05"},
+            {"action": "quarterly", "period": "q2-2026"},
+        ],
+    }},
+    {"type": "function", "strict": True, "function": {
+        "name": "goal_status",
+        "description": (
+            "Read-only Status des 5y-Goal-Systems: Tag-Countdown, Säulen-Status (aus readme.md), "
+            "Habits-Quote letzte 7 Tage, Sport-Sessions letzte 7+30 Tage, Drift-Detektor "
+            "(letzte Anker-Daten aus readme.md). "
+            "Trigger: User sagt 'wo stehe ich', 'goal status', 'wie läuft mein 5-jahres-plan', "
+            "'habits letzte woche', 'sport-bilanz'."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "scope": {
+                    "type": "string",
+                    "enum": ["all", "saeule", "habits", "sport", "drift"],
+                    "description": "Filtert Output auf Teilbereich. Default 'all'.",
+                },
+                "saeule": {
+                    "type": "string",
+                    "enum": ["karriere", "finanzen", "sport", "wissen", "beziehungen", "mindset"],
+                    "description": "Nur bei scope=saeule sinnvoll (zeigt eine spezifische Säule).",
+                },
+                "goal": {"type": "string", "description": "Goal-Slug, default '5y-2031'."},
+            },
+            "required": [],
+            "additionalProperties": False,
+        },
+        "input_examples": [
+            {"scope": "all"},
+            {"scope": "habits"},
+            {"scope": "drift"},
+        ],
+    }},
     {"type": "function", "function": {
         "name": "backup_vault",
         "description": (
@@ -4434,6 +5063,9 @@ TOOL_HANDLERS = {
     "create_reminder": create_reminder,
     "list_reminders": list_reminders,
     "cancel_reminder": cancel_reminder,
+    "goal_log": goal_log,
+    "goal_anchor": goal_anchor,
+    "goal_status": goal_status,
     "backup_vault": backup_vault,
 }
 
@@ -4477,6 +5109,15 @@ VAULT
 | "jeden Montag 8 Uhr / täglich um 7" | `create_reminder` mit recurrence (daily/weekdays/weekly) |
 | "welche Reminder / cancel reminder" | `list_reminders` / `cancel_reminder` |
 | "mach backup / sicher das vault" | `backup_vault` |
+| "heute X min gelaufen / X min Sport / Kraft heute" | `goal_log(action='sport', payload={kind, duration_min, note?})` |
+| "Win heute: X" / "Wins: a, b, c" | `goal_log(action='win', payload={text})` für jeden Win |
+| "Habit X heute ✓/✗" / "Lesen heute ja" | `goal_log(action='habit', payload={name, value})` |
+| "Buch angefangen: X von Y" | `goal_log(action='book', payload={action='start', title, author?, focus?})` |
+| "Buch fertig: X · Lesson: Y" | `goal_log(action='book', payload={action='finish', title, lesson, score?})` |
+| "Wochen-Anker / Sonntag-Review starten" | `goal_anchor(action='weekly')` (2-step: Fragen stellen, dann mit answers writeback) |
+| "Monats-Bilanz / Monats-Anker" | `goal_anchor(action='monthly')` |
+| "Quartals-Anker / Quartals-Review" | `goal_anchor(action='quarterly')` |
+| "wo stehe ich (Goal) / wie läuft mein 5y-plan / habits-quote" | `goal_status(scope=...)` |
 
 **Nachfragen vs. Direkt-Machen**:
 - Mini-Input ohne Kontext ("ja", "?") → nachfragen.
