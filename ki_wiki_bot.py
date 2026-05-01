@@ -794,53 +794,109 @@ VALID_TASK_CONTEXTS = {"home", "work", "errand", "phone", "computer"}
 VALID_TASK_RECURRENCE = {"daily", "weekdays", "weekly", "monthly"}
 
 
-def create_task(title: str, priority: str = "medium",
-                due: Optional[str] = None, area: Optional[str] = None,
-                project: Optional[str] = None, context: Optional[str] = None,
-                tags: Optional[list] = None,
-                recurrence: Optional[str] = None) -> str:
-    """Create a new task file in 10_Life/tasks/.
+# ─── Task-Tool (konsolidiert: create / update / done / reopen) ──────────────
+# Anthropic-Empfehlung: ein Tool mit action-Param statt N kleine Mini-Tools.
+# Siehe https://platform.claude.com/docs/en/agents-and-tools/tool-use/define-tools
+# "Consolidate related operations into fewer tools."
+#
+# Strict Mode + input_examples → LLM weiß welche Argumente pro Action.
+# Delete bewusst NICHT hier — geht über request_delete/confirm_delete (zwei-stufig).
 
-    Body wird dynamisch gebaut (nicht Template-Substitution) damit
-    Status/Priorität/Fälligkeit korrekt im Body erscheinen.
+# Priority/Recurrence-Normalisierung — wiederverwendbar für create + update
+_PRIORITY_MAP = {
+    "u": "urgent", "urgent": "urgent",
+    "h": "high", "high": "high",
+    "m": "medium", "medium": "medium", "med": "medium", "normal": "medium",
+    "l": "low", "low": "low",
+}
+_RECURRENCE_MAP = {
+    "day": "daily", "daily": "daily", "täglich": "daily",
+    "weekday": "weekdays", "weekdays": "weekdays", "werktags": "weekdays",
+    "week": "weekly", "weekly": "weekly", "wöchentlich": "weekly",
+    "month": "monthly", "monthly": "monthly", "monatlich": "monthly",
+}
 
-    recurrence: optional "daily" / "weekdays" / "weekly" / "monthly".
-      Bei gesetztem recurrence wird die Task nach mark_task_done vom
-      Daily-Reset-Job am nächsten passenden Tag wieder auf 'open' gesetzt.
+
+def _normalize_priority(p: Optional[str]) -> str:
+    return _PRIORITY_MAP.get((p or "").lower().strip(), "medium")
+
+
+def _normalize_recurrence(r: Optional[str]) -> Optional[str]:
+    if not r:
+        return None
+    return _RECURRENCE_MAP.get(r.strip().lower())
+
+
+def _normalize_due(d) -> Optional[str]:
+    """Returns ISO-string oder None. Akzeptiert string, date, None."""
+    if d is None or d == "":
+        return None
+    if isinstance(d, date) and not isinstance(d, datetime):
+        return d.isoformat()
+    if isinstance(d, str):
+        s = d.strip()
+        if not s:
+            return None
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+            return s
+    return None
+
+
+def _resolve_task_path(task_id: str) -> Optional[Path]:
+    """Slug → Path. Strippt 't-'-Präfix, validiert kebab-case, macht safe_path.
+
+    Returns None wenn Slug ungültig oder File nicht existiert.
     """
+    if not task_id:
+        return None
+    filename = task_id[2:] if task_id.startswith("t-") else task_id
+    if not re.match(r"^[a-zA-Z0-9_\-]+$", filename):
+        return None
+    try:
+        path = safe_path(f"10_Life/tasks/{filename}.md")
+    except ValueError:
+        return None
+    return path if path.exists() else None
+
+
+def _sync_task_body(post: "frontmatter.Post") -> None:
+    """Re-rendert die '**Status**: ... · **Priorität**: ... · **Fällig**: ...' Zeile
+    aus dem aktuellen Frontmatter. Wenn keine solche Zeile existiert (z.B. legacy
+    Task), wird nichts geändert.
+    """
+    meta = post.metadata
+    status = meta.get("status", "open")
+    prio = meta.get("priority", "medium")
+    due = meta.get("due")
+    due_str = _normalize_due(due) or "—"
+    rec = meta.get("recurrence")
+    rec_part = f" · **Wiederholung**: {rec}" if rec else ""
+    new_line = (f"**Status**: {status} · **Priorität**: {prio} · "
+                f"**Fällig**: {due_str}{rec_part}")
+    body = post.content or ""
+    new_body, n = re.subn(
+        r"^\*\*Status\*\*:.*?(?=\n|$)",
+        new_line.replace("\\", "\\\\"),
+        body,
+        count=1,
+        flags=re.MULTILINE,
+    )
+    if n > 0:
+        post.content = new_body
+
+
+def _task_create(title: str, priority: str = "medium",
+                 due: Optional[str] = None, area: Optional[str] = None,
+                 project: Optional[str] = None, context: Optional[str] = None,
+                 tags: Optional[list] = None,
+                 recurrence: Optional[str] = None) -> str:
+    """INTERNAL: legt einen neuen Task an. Wird vom task(action='create') gerufen."""
     if not title or not title.strip():
         return "Fehler: Task-Titel darf nicht leer sein."
 
-    # Priority normalisieren — LLM schickt manchmal Abkürzungen wie "M", "high prio" etc.
-    p_lower = (priority or "").lower().strip()
-    p_map = {
-        "u": "urgent", "urgent": "urgent",
-        "h": "high", "high": "high",
-        "m": "medium", "medium": "medium", "med": "medium", "normal": "medium",
-        "l": "low", "low": "low",
-    }
-    priority = p_map.get(p_lower, "medium")
-
-    # Due nur akzeptieren wenn ISO-Format
-    if due:
-        due = due.strip()
-        if not re.match(r"^\d{4}-\d{2}-\d{2}$", due):
-            log.warning(f"create_task: ungültiges due-Format '{due}', ignoriert")
-            due = None
-
-    # Recurrence normalisieren + validieren
-    if recurrence:
-        rec_lower = recurrence.strip().lower()
-        # Aliase: weekday=weekdays, week=weekly, month=monthly, day=daily
-        rec_map = {
-            "day": "daily", "daily": "daily", "täglich": "daily",
-            "weekday": "weekdays", "weekdays": "weekdays", "werktags": "weekdays",
-            "week": "weekly", "weekly": "weekly", "wöchentlich": "weekly",
-            "month": "monthly", "monthly": "monthly", "monatlich": "monthly",
-        }
-        recurrence = rec_map.get(rec_lower)
-        if recurrence is None:
-            log.warning(f"create_task: ungültiges recurrence '{rec_lower}', ignoriert")
+    priority = _normalize_priority(priority)
+    due = _normalize_due(due)
+    recurrence = _normalize_recurrence(recurrence)
 
     slug = slugify(title)
     path = TASKS_DIR / f"{slug}.md"
@@ -922,23 +978,17 @@ def create_task(title: str, priority: str = "medium",
     return f"Task angelegt: [[{task_id}]]{extra_str}"
 
 
-def mark_task_done(slug: str) -> str:
-    """Mark task as done.
+def _task_done(task_id: str) -> str:
+    """INTERNAL: Mark task as done. Wird vom task(action='done') gerufen.
 
     Bei recurring Tasks (frontmatter.recurrence gesetzt): Status bleibt 'done'
     bis der recurring_task_reset_job am passenden nächsten Tag wieder auf
     'open' setzt. last_completed wird gesetzt damit Reset weiß wann es passt.
     """
-    filename = slug[2:] if slug.startswith("t-") else slug
-    # Path-Traversal-Schutz: slug ist LLM-kontrolliert. Nur kebab-case + .md erlauben.
-    if not filename or not re.match(r"^[a-zA-Z0-9_\-]+$", filename):
-        return f"Ungültiger Task-Slug: {slug!r}"
-    try:
-        path = safe_path(f"10_Life/tasks/{filename}.md")
-    except ValueError:
-        return f"Ungültiger Task-Pfad: {slug!r}"
-    if not path.exists():
-        return f"Task nicht gefunden: {slug}"
+    path = _resolve_task_path(task_id)
+    if path is None:
+        return f"Task nicht gefunden oder ungültiger Slug: {task_id!r}"
+    filename = path.stem
     post = frontmatter.load(path)
     today = today_iso()
     post["status"] = "done"
@@ -949,12 +999,198 @@ def mark_task_done(slug: str) -> str:
         log_line = f"\n- {today}: erledigt (recurring={recurrence}, kommt automatisch wieder)\n"
     else:
         log_line = f"\n- {today}: erledigt\n"
+    _sync_task_body(post)
     body = (post.content or "").rstrip() + log_line
     post.content = body
     atomic_write(path, frontmatter.dumps(post) + "\n")
     if recurrence:
         return f"Task erledigt: [[t-{filename}]] — wiederholt sich ({recurrence})"
     return f"Task erledigt: [[t-{filename}]]"
+
+
+def _task_reopen(task_id: str) -> str:
+    """INTERNAL: Setzt status zurück auf 'open'. Wird vom task(action='reopen') gerufen.
+
+    Für Fälle: Task wurde fälschlich done markiert, oder User will recurring
+    manuell vor der nächsten Reaktivierung wieder als open haben.
+    """
+    path = _resolve_task_path(task_id)
+    if path is None:
+        return f"Task nicht gefunden oder ungültiger Slug: {task_id!r}"
+    filename = path.stem
+    post = frontmatter.load(path)
+    today = today_iso()
+    post["status"] = "open"
+    post["updated"] = today
+    # last_completed nicht löschen — recurring-Reset braucht's vielleicht weiter
+    _sync_task_body(post)
+    log_line = f"\n- {today}: wieder geöffnet\n"
+    body = (post.content or "").rstrip() + log_line
+    post.content = body
+    atomic_write(path, frontmatter.dumps(post) + "\n")
+    return f"Task wieder offen: [[t-{filename}]]"
+
+
+# Sentinel für "Feld leeren" in update — None heißt "nicht ändern", wir brauchen
+# einen separaten Marker für "explizit löschen" (z.B. due wegnehmen)
+_TASK_CLEAR = object()
+
+
+def _task_update(task_id: str, **fields) -> str:
+    """INTERNAL: Update einzelne Felder eines Tasks. Wird vom task(action='update') gerufen.
+
+    Nur in `fields` enthaltene Keys werden geändert. Wert _TASK_CLEAR (oder None)
+    entfernt das Frontmatter-Feld komplett. Body-Status-Zeile wird automatisch
+    re-synchronisiert. updated wird auf heute gesetzt.
+
+    Erlaubte Felder: title, priority, due, project, area, context, tags, recurrence, status.
+    """
+    path = _resolve_task_path(task_id)
+    if path is None:
+        return f"Task nicht gefunden oder ungültiger Slug: {task_id!r}"
+    filename = path.stem
+    post = frontmatter.load(path)
+    today = today_iso()
+    changed = []
+
+    if "title" in fields:
+        v = fields["title"]
+        if v and v.strip():
+            post["title"] = v.strip()
+            changed.append(f"title='{v.strip()[:30]}'")
+
+    if "priority" in fields:
+        v = fields["priority"]
+        norm = _normalize_priority(v)
+        post["priority"] = norm
+        changed.append(f"priority={norm}")
+
+    if "due" in fields:
+        v = fields["due"]
+        if v in (None, "", _TASK_CLEAR):
+            if "due" in post.metadata:
+                del post.metadata["due"]
+            changed.append("due=—")
+        else:
+            norm = _normalize_due(v)
+            if norm:
+                post["due"] = norm
+                changed.append(f"due={norm}")
+            else:
+                return f"due='{v}' ist kein gültiges ISO-Datum (YYYY-MM-DD) und nicht leer"
+
+    for f in ("project", "area", "context"):
+        if f in fields:
+            v = fields[f]
+            if v in (None, "", _TASK_CLEAR):
+                if f in post.metadata:
+                    del post.metadata[f]
+                changed.append(f"{f}=—")
+            elif isinstance(v, str) and v.strip():
+                post[f] = v.strip()
+                changed.append(f"{f}={v.strip()}")
+
+    if "tags" in fields:
+        v = fields["tags"]
+        if v in (None, _TASK_CLEAR):
+            post["tags"] = []
+            changed.append("tags=[]")
+        elif isinstance(v, list):
+            clean = []
+            seen = set()
+            for t in v:
+                if isinstance(t, str) and t.strip() and t.strip().lower() not in seen:
+                    clean.append(t.strip().lower())
+                    seen.add(t.strip().lower())
+            post["tags"] = clean
+            changed.append(f"tags={clean}")
+
+    if "recurrence" in fields:
+        v = fields["recurrence"]
+        if v in (None, "", _TASK_CLEAR):
+            if "recurrence" in post.metadata:
+                del post.metadata["recurrence"]
+            changed.append("recurrence=—")
+        else:
+            norm = _normalize_recurrence(v)
+            if norm:
+                post["recurrence"] = norm
+                changed.append(f"recurrence={norm}")
+
+    if "status" in fields:
+        v = (fields["status"] or "").strip().lower()
+        if v in ("open", "in-progress", "blocked", "done", "cancelled"):
+            post["status"] = v
+            changed.append(f"status={v}")
+
+    if not changed:
+        return f"Keine gültigen Änderungen für [[t-{filename}]]"
+
+    post["updated"] = today
+    _sync_task_body(post)
+    atomic_write(path, frontmatter.dumps(post) + "\n")
+    invalidate_link_index()
+    return f"Task aktualisiert: [[t-{filename}]] ({', '.join(changed)})"
+
+
+def task(action: str, task_id: Optional[str] = None,
+         title: Optional[str] = None,
+         priority: Optional[str] = None,
+         due: Optional[str] = None,
+         project: Optional[str] = None,
+         area: Optional[str] = None,
+         context: Optional[str] = None,
+         tags: Optional[list] = None,
+         recurrence: Optional[str] = None,
+         status: Optional[str] = None) -> str:
+    """Konsolidiertes Task-Tool. Dispatcht auf interne Helper je nach action.
+
+    Anthropic-Pattern: ein Tool mit action-Parameter statt N Mini-Tools.
+    Delete läuft separat über request_delete (zwei-stufig, sicher).
+    """
+    a = (action or "").strip().lower()
+
+    if a == "create":
+        if not title:
+            return "create: title ist Pflicht."
+        return _task_create(
+            title=title, priority=priority or "medium", due=due,
+            area=area, project=project, context=context,
+            tags=tags, recurrence=recurrence,
+        )
+
+    if a == "done":
+        if not task_id:
+            return "done: task_id ist Pflicht."
+        return _task_done(task_id)
+
+    if a == "reopen":
+        if not task_id:
+            return "reopen: task_id ist Pflicht."
+        return _task_reopen(task_id)
+
+    if a == "update":
+        if not task_id:
+            return "update: task_id ist Pflicht."
+        # Nur die explicit übergebenen Felder ans Update weiterreichen.
+        # None bei optional-Feldern = "nicht anfassen". Für "leeren" muss LLM
+        # explizit den String "null" oder "" übergeben — wir mappen das auf clear.
+        update_fields = {}
+        for k, v in [("title", title), ("priority", priority), ("due", due),
+                     ("project", project), ("area", area), ("context", context),
+                     ("tags", tags), ("recurrence", recurrence), ("status", status)]:
+            if v is not None:
+                # String "null" (vom LLM) → echtes None für unsere clear-Logik
+                if isinstance(v, str) and v.strip().lower() in ("null", "none", "—", "-"):
+                    update_fields[k] = _TASK_CLEAR
+                else:
+                    update_fields[k] = v
+        if not update_fields:
+            return "update: keine Felder angegeben (nichts zu ändern)."
+        return _task_update(task_id, **update_fields)
+
+    return (f"Unbekannte action: {action!r}. "
+            f"Erlaubt: create, update, done, reopen.")
 
 
 # ─── Tagesplanung: Listings + Agenda ────────────────────────────────────────
@@ -2975,7 +3211,7 @@ Ausnahme: explizite Selbstaussage ("Ich heiße X" / "Mein Beruf ist Y") — die 
 ## Filter 3 — KEIN DOPPEL-SPEICHERN
 Wenn der Inhalt bereits abgedeckt ist durch:
 - bestehende Reminder (siehe Konversation: wurde `create_reminder` gerufen?)
-- bestehende Tasks (`create_task`)
+- bestehende Tasks (`task(action='create')`)
 - bestehende Notes
 → KEIN Memory-Vorschlag dafür. Memory ist für PERMANENTE Bot-Anpassung, nicht für Konversations-Echo.
 
@@ -3661,53 +3897,70 @@ TOOLS = [
             "required": ["section", "text"],
         },
     }},
-    {"type": "function", "function": {
-        "name": "create_task",
+    {"type": "function", "strict": True, "function": {
+        "name": "task",
         "description": (
-            "Legt neuen Task in 10_Life/tasks/ an, verlinkt unter 'Heute' in heutiger Daily. "
-            "WICHTIG: Optionale Parameter NUR setzen wenn explizit aus User-Input ableitbar — "
-            "NIE raten/defaulten. Z.B. due nur wenn User wirklich ein Datum nennt; "
-            "project nur wenn User Projekt nennt oder es klar aus Conversation-Memory hervorgeht. "
-            "tags: 2-5 thematische Schlagworte aus dem Inhalt extrahieren (kebab-case, Deutsch). "
-            "recurrence NUR setzen bei klaren Wiederholungs-Triggern: 'jeden Tag', 'täglich', "
-            "'jede Woche', 'jeden Montag', 'jeden Monat' o.ä. — NICHT bei einmaligen Tasks!"
+            "Verwaltet Tasks (anlegen, ändern, erledigen, wieder-öffnen) im Vault. "
+            "Eine action pro Aufruf. Delete läuft separat über request_delete (zwei-stufig). "
+            "ACTION 'create': Legt neuen Task in 10_Life/tasks/ an, verlinkt unter 'Heute' in "
+            "heutiger Daily. Pflicht: title. Optional: priority, due (NUR wenn User Datum nennt!), "
+            "project, area, context, tags (2-5 kebab-case), recurrence (NUR bei klaren "
+            "Wiederholungs-Wörtern wie 'täglich', 'jede Woche'). "
+            "ACTION 'update': Ändert ein oder mehrere Felder eines existierenden Tasks. "
+            "Pflicht: task_id (mit oder ohne 't-'-Präfix). Nur die übergebenen Felder werden "
+            "geändert. Wert 'null' (String) entfernt das Feld (z.B. due='null' nimmt Deadline weg). "
+            "Body-Status-Zeile wird automatisch synchronisiert. updated wird auf heute gesetzt. "
+            "ACTION 'done': Markiert Task als erledigt. Pflicht: task_id. Setzt status=done, "
+            "last_completed=heute, ergänzt Log-Zeile. Recurring Tasks werden automatisch reaktiviert. "
+            "ACTION 'reopen': Setzt status zurück auf 'open' (z.B. wenn fälschlich done). "
+            "Pflicht: task_id."
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "title": {"type": "string", "description": "Vollständiger Task-Titel (deutsch ok)"},
-                "priority": {"type": "string", "enum": ["low", "medium", "high", "urgent"], "description": "Default medium falls User keine Prio nennt"},
-                "due": {"type": "string", "description": "ISO YYYY-MM-DD. NUR setzen wenn User explizit ein Datum nennt!"},
-                "area": {"type": "string", "description": "Area-ID, NUR wenn User Area nennt"},
-                "project": {"type": "string", "description": "Projekt-Slug (z.B. 'sanierung-kiosk'), NUR wenn aus User-Input oder Memory klar"},
+                "action": {
+                    "type": "string",
+                    "enum": ["create", "update", "done", "reopen"],
+                    "description": "Welche Operation auf dem Task durchführen.",
+                },
+                "task_id": {
+                    "type": "string",
+                    "description": "Slug des Tasks für update/done/reopen. Mit oder ohne 't-'-Präfix.",
+                },
+                "title": {"type": "string", "description": "Task-Titel. Pflicht bei create, optional bei update."},
+                "priority": {"type": "string", "enum": ["low", "medium", "high", "urgent"]},
+                "due": {"type": "string", "description": "ISO YYYY-MM-DD. NUR setzen wenn User Datum nennt. Bei update: 'null' = Deadline entfernen."},
+                "project": {"type": "string", "description": "Projekt-Slug. Bei update: 'null' = Projekt entfernen."},
+                "area": {"type": "string", "description": "Area-Slug. Bei update: 'null' = Area entfernen."},
                 "context": {"type": "string", "enum": ["home", "work", "errand", "phone", "computer"]},
                 "tags": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "2-5 thematische Tags (kebab-case, Deutsch). Topical, nicht 'task'/'todo'. Bei Bedarf vorher list_existing_tags für konsistente Vokabular.",
+                    "description": "2-5 thematische Tags (kebab-case, Deutsch). Topical, nicht 'task'/'todo'.",
                 },
                 "recurrence": {
                     "type": "string",
                     "enum": ["daily", "weekdays", "weekly", "monthly"],
-                    "description": (
-                        "Wiederholungs-Pattern. NUR setzen bei klaren Wiederholungs-Wörtern: "
-                        "'jeden Tag/täglich' → daily, 'werktags/Mo-Fr' → weekdays, "
-                        "'jede Woche/jeden <Wochentag>' → weekly, 'jeden Monat/monatlich' → monthly. "
-                        "Wenn User nur einmal etwas erwähnt: NICHT setzen."
-                    ),
+                    "description": "Wiederholungs-Pattern. NUR bei klaren Wiederholungs-Wörtern.",
+                },
+                "status": {
+                    "type": "string",
+                    "enum": ["open", "in-progress", "blocked", "done", "cancelled"],
+                    "description": "Nur bei action=update sinnvoll. Für reine Done-Operation lieber action=done nutzen.",
                 },
             },
-            "required": ["title"],
+            "required": ["action"],
+            "additionalProperties": False,
         },
-    }},
-    {"type": "function", "function": {
-        "name": "mark_task_done",
-        "description": "Setzt einen Task auf done. Slug ohne 't-'-Präfix möglich.",
-        "parameters": {
-            "type": "object",
-            "properties": {"slug": {"type": "string"}},
-            "required": ["slug"],
-        },
+        "input_examples": [
+            {"action": "create", "title": "Wäsche aufhängen", "priority": "medium"},
+            {"action": "create", "title": "Müll rausstellen", "recurrence": "weekly"},
+            {"action": "create", "title": "Statik anschauen", "due": "2026-05-05", "project": "kiosk-sanierung", "tags": ["statik", "kiosk"]},
+            {"action": "update", "task_id": "t-glastisch-abwischen", "due": "null"},
+            {"action": "update", "task_id": "raum-ausmessen", "priority": "urgent", "project": "kiosk-sanierung"},
+            {"action": "done", "task_id": "t-waesche-aufhaengen"},
+            {"action": "reopen", "task_id": "t-glastisch-abwischen"},
+        ],
     }},
     {"type": "function", "function": {
         "name": "get_today_agenda",
@@ -4026,7 +4279,7 @@ TOOLS = [
         "name": "list_existing_tags",
         "description": (
             "Liste der bereits im Vault verwendeten Tags, sortiert nach Häufigkeit. "
-            "Optional vor create_task/note/meeting aufrufen wenn unklar welche Tags konsistent sind. "
+            "Optional vor task/create_note/create_meeting aufrufen wenn unklar welche Tags konsistent sind. "
             "Hilft Drift zu vermeiden ('arbeit' vs 'work' vs 'job')."
         ),
         "parameters": {
@@ -4109,8 +4362,7 @@ TOOLS = [
 
 TOOL_HANDLERS = {
     "append_to_daily": append_to_daily,
-    "create_task": create_task,
-    "mark_task_done": mark_task_done,
+    "task": task,
     "get_today_agenda": get_today_agenda,
     "list_open_tasks": list_open_tasks,
     "create_meeting": create_meeting,
@@ -4155,14 +4407,17 @@ VAULT
 | Trigger | Tool |
 |---|---|
 | "speicher / merk dir / notiere / ins tagebuch" | `append_to_daily` oder `create_note` |
-| "task: …" / "todo: …" / Imperativ+Frist | `create_task` |
-| "jeden Tag / täglich / jede Woche / jeden <Wochentag> / monatlich" | `create_task` mit `recurrence` (daily/weekdays/weekly/monthly) |
+| "task: …" / "todo: …" / Imperativ+Frist | `task(action='create', title=...)` |
+| "jeden Tag / täglich / jede Woche / jeden <Wochentag> / monatlich" | `task(action='create', ..., recurrence='daily/weekdays/weekly/monthly')` |
 | "was steht heute an / agenda / tagesplan / was muss ich noch tun" | `get_today_agenda` |
 | "alle offenen tasks / todo-liste" | `list_open_tasks()` (gruppiert) |
 | "was ist überfällig / morgen / diese woche / ohne datum" | `list_open_tasks(when=overdue/tomorrow/week/nodate)` |
 | "tasks für <projekt>" | `list_open_tasks(project='<slug>')` |
 | "meeting: … / war im Termin mit" | `create_meeting` |
-| "X erledigt / fertig / done" | `mark_task_done` |
+| "X erledigt / fertig / done" | `task(action='done', task_id=...)` |
+| "Deadline von X entfernen / kein Datum mehr / verschiebe X auf Y" | `task(action='update', task_id=..., due='null'/'YYYY-MM-DD')` |
+| "X wieder öffnen / war versehentlich erledigt" | `task(action='reopen', task_id=...)` |
+| "ändere Priorität von X / verschiebe X ins Projekt Y" | `task(action='update', task_id=..., priority/project=...)` |
 | URL allein | erst fragen, dann `clip_url` |
 | "lösche X" | `request_delete` (Default: ins Archiv = reversibel) |
 | "lösche endgültig / komplett / vollständig / ganz weg / wirklich weg / unwiderruflich / für immer / hart" | `request_delete(permanent=true)` |
@@ -4186,7 +4441,7 @@ VAULT
 
 **TAGESPLAN-EXTRAKTION** (User listet mehrere Items, oft als Antwort aufs Morgens-Briefing):
 - Klare Uhrzeit + Aktivität → `create_reminder` (KEIN Reminder ohne Uhrzeit erfinden!)
-- Verb ohne Uhrzeit ("X machen / Y anrufen") → `create_task` mit `due=heute`
+- Verb ohne Uhrzeit ("X machen / Y anrufen") → `task(action='create', title=..., due=heute)`
 - Vage Tageszeit ("morgens/mittags/abends X") → Reminder mit Default-Stunde (8/12/18)
 
 Pro Item ein Tool-Call (parallel im selben Loop-Step OK). Eine Bestätigung am Ende: "Eingetragen: 2 Reminders, 2 Tasks."
@@ -4198,7 +4453,7 @@ Pro Item ein Tool-Call (parallel im selben Loop-Step OK). Eine Bestätigung am E
 
 # AUSGABE
 - Deutsch, direkt, kein Geschwurbel. Sparsame Emojis (✓ ✗ ⚠️).
-- Aktion-Bestätigung: 1 Satz. Wikilink `[[id]]` NUR bei NEU erstellten Items (create_task/note/meeting/project/area), damit Julius hinklicken kann. Bei `mark_task_done`, `request_delete`, `move`, `edit_file` & Status-Änderungen: NUR Klartext-Titel ohne Slug-Wikilink (User kennt den Task ja schon). Frage: so lang wie nötig.
+- Aktion-Bestätigung: 1 Satz. Wikilink `[[id]]` NUR bei NEU erstellten Items (task/create_note/create_meeting/create_project/area), damit Julius hinklicken kann. Bei `task(action='done'/'update')`, `request_delete`, `move`, `edit_file` & Status-Änderungen: NUR Klartext-Titel ohne Slug-Wikilink (User kennt den Task ja schon). Frage: so lang wie nötig.
 - Format: Bullets/Code/`**bold**`/`*italic*`. Headings nur bei langen Antworten.
 - **TELEGRAM-TABELLEN**: nur ≤2 Spalten + kurze Zellen. Sobald Pfade/lange Texte/≥3 Spalten → kein Tabellen-Format, stattdessen pro Item: `**Name**` + eingerückte `• Label: Wert`-Bullets.
 - **Wikilinks**: nur echte IDs aus search_vault/read_file. Keine Filepaths `[[10_Life/…]]`, keine Platzhalter `[[t-example]]`. Wenn keine ID → Klartext, KEIN Link.
@@ -4232,7 +4487,7 @@ Drei Memory-Typen (alle automatisch im System-Prompt eingespeist):
 Antworten auf Memory- oder Health-Listen ("1 3", "alle", "0", "erkläre 2", oder mit Präfix "memory 1" / "health alle") werden DIREKT vom Bot-Loop verarbeitet, NICHT vom LLM. Du bekommst diese Pattern-Messages gar nicht zu sehen — wenn doch eine kommt heißt das Disambig war unklar (beide pending), dann frag User welche Liste gemeint ist.
 
 # AUTO-TAGGING
-Bei `create_task/note/meeting`: 2-5 thematische Tags via `tags`-Parameter (kebab-case Deutsch, z.B. `gesundheit`, `kunde-mueller`). TOPISCH, nicht strukturell (NICHT `task`/`note`). Bei vage Kontext lieber `[]` als schlechte Tags. Optional vorher `list_existing_tags` für Vokabular-Konsistenz.
+Bei `task(action='create')` / `create_note` / `create_meeting`: 2-5 thematische Tags via `tags`-Parameter (kebab-case Deutsch, z.B. `gesundheit`, `kunde-mueller`). TOPISCH, nicht strukturell (NICHT `task`/`note` selbst als Tag). Bei vage Kontext lieber `[]` als schlechte Tags. Optional vorher `list_existing_tags` für Vokabular-Konsistenz.
 
 # KONVERSATIONS-KONTEXT NUTZEN
 Wenn vorhin ein Projekt erstellt/aktiviert wurde und User danach Tasks oder Notes anlegt die offensichtlich dazu gehören → `project=<slug>` AUTOMATISCH setzen, nicht nachfragen.
