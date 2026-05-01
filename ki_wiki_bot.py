@@ -6793,6 +6793,40 @@ def collect_health_data() -> dict:
             tag_clusters.append((tag, cluster))
             seen.update(t for t, _ in cluster)
 
+    # ── Check 11: 5y-Goal-Drift — fehlt aktuelle Wochen/Monats/Quartals-Datei? ──
+    # Nur wenn das Goal-System aktiv ist (Folder existiert).
+    goal_drift = []
+    goal_root = GOALS_BASE / DEFAULT_GOAL_SLUG
+    if goal_root.exists():
+        try:
+            wk_iso = _current_week_iso().lower()  # "2026-w18"
+            wk_path = goal_root / "wochen" / f"{wk_iso}.md"
+            if not wk_path.exists():
+                goal_drift.append(f"Wochen-Datei fehlt: 10_Life/goals/{DEFAULT_GOAL_SLUG}/wochen/{wk_iso}.md")
+            mo_iso = _current_month_iso()  # "2026-05"
+            mo_path = goal_root / "monate" / f"{mo_iso}.md"
+            if not mo_path.exists():
+                goal_drift.append(f"Monats-Datei fehlt: 10_Life/goals/{DEFAULT_GOAL_SLUG}/monate/{mo_iso}.md")
+            qu_iso = _current_quarter_iso()  # "q2-2026"
+            qu_path = goal_root / "quartale" / f"{qu_iso}.md"
+            if not qu_path.exists():
+                goal_drift.append(f"Quartals-Datei fehlt: 10_Life/goals/{DEFAULT_GOAL_SLUG}/quartale/{qu_iso}.md")
+            # Drift-Detektor in readme.md auswerten — wenn letzter Wochen-Anker
+            # >14 Tage zurück liegt: System ist zu schwer
+            readme_path = goal_root / "readme.md"
+            if readme_path.exists():
+                rc = readme_path.read_text(encoding="utf-8")
+                m = re.search(r"\*\*Letzter Wochen-Anker:\*\* (\d{4}-\d{2}-\d{2})", rc)
+                if m:
+                    try:
+                        last_anchor = datetime.strptime(m.group(1), "%Y-%m-%d").date()
+                        if (today - last_anchor).days > 14:
+                            goal_drift.append(f"⚠️ Letzter Wochen-Anker vor {(today - last_anchor).days}d (>14d) — System ggf. zu schwer, kürzen?")
+                    except ValueError:
+                        pass
+        except Exception as e:
+            log.warning(f"goal-drift check failed: {e}")
+
     return {
         "today": today,
         "today_str": today_str,
@@ -6808,6 +6842,7 @@ def collect_health_data() -> dict:
         "done_old_tasks": done_old_tasks,
         "recurring_stuck": recurring_stuck,
         "tag_clusters": tag_clusters,
+        "goal_drift": goal_drift,
         "total_notes": len(all_notes),
         "all_tags": all_tags,
     }
@@ -7249,6 +7284,18 @@ def write_health_report(data: dict, autofixes: list, proposals: list) -> Path:
             lines.append(f"- _… {len(legacy)-10} weitere_")
         lines.append("")
 
+    # ── 5y-Goal-Drift (Wochen/Monats/Quartals-File fehlt + Anker-Lücke) ──
+    if data.get("goal_drift"):
+        gd = data["goal_drift"]
+        lines.append(f"## 🎯 5y-Goal-Drift ({len(gd)})")
+        lines.append("")
+        lines.append("Aktive Goal-System-Periode hat fehlende Files oder ausbleibende Anker. "
+                     "Anker-Lücken >14 Tage zeigen: System ist zu schwer — kürzen statt aushalten.")
+        lines.append("")
+        for issue in gd:
+            lines.append(f"- {issue}")
+        lines.append("")
+
     # ── Pending Approvals ──
     if proposals:
         lines.append(f"## 🔧 Pending Approvals ({len(proposals)})")
@@ -7324,6 +7371,7 @@ def run_nightly_health() -> dict:
         "issue_summary": {
             "lint": len(data["lint_issues"]),
             "legacy": len(data.get("legacy_files", [])),
+            "goal_drift": len(data.get("goal_drift", [])),
             "broken_links": len(data["broken_links"]),
             "orphans": len(data["orphans"]),
             "duplicate_ids": len(data["duplicate_ids"]),
@@ -7630,6 +7678,39 @@ def compute_briefing() -> str:
                 parts.append(f"  {i}. {_esc_html(p['summary'])}")
             parts.append("  <i>Antworte mit \"health 1\" / \"health 1 2\" / \"health 0\" (skip alle).</i>")
 
+    # ─── 5y-Goal-System: Wochen-Datei-Link + Vision-Reminder ────────────────
+    # Nur wenn das Goal-System aktiv ist (Vault-Folder existiert).
+    goal_dir = GOALS_BASE / DEFAULT_GOAL_SLUG
+    if goal_dir.exists():
+        try:
+            week_iso = _current_week_iso()  # z.B. "2026-W18"
+            week_file = goal_dir / "wochen" / f"{week_iso.lower()}.md"
+            week_id = week_file.stem  # z.B. "2026-w18"
+            goal_block = ["", "━━━━━━━━━━━━━━━━━━━━━━━━",
+                          f"🎯 <b>5y-Goal</b> — aktuelle Woche: <code>[[{week_id}]]</code>"]
+            if week_file.exists():
+                goal_block.append("<i>3 Tages-Prios markieren?</i>")
+            else:
+                goal_block.append(f"<i>⚠️ Wochen-Datei fehlt für {week_iso} — leg sie nach Template an.</i>")
+            # Vision-Satz aus vision.md (Manifesto-Block)
+            vision_path = goal_dir / "vision.md"
+            if vision_path.exists():
+                vt = vision_path.read_text(encoding="utf-8")
+                # Suche den Manifesto-Block (zwischen "> **" am Anfang)
+                vm = re.search(r"> \*\*(.+?)\*\*", vt, re.DOTALL)
+                if vm:
+                    raw = vm.group(1)
+                    # Multi-Line-Blockquote säubern: > weg, Newlines zu Spaces
+                    vision_text = re.sub(r"\n>\s*", " ", raw)
+                    vision_text = re.sub(r"\s+", " ", vision_text).strip()
+                    # Auf 180 Zeichen kürzen für Briefing
+                    if len(vision_text) > 180:
+                        vision_text = vision_text[:180].rsplit(" ", 1)[0] + "…"
+                    goal_block.append(f"💭 <i>{_esc_html(vision_text)}</i>")
+            parts.extend(goal_block)
+        except Exception as e:
+            log.warning(f"briefing 5y-block failed: {e}")
+
     # ─── Tagesplan-Frage am Ende — macht das Briefing zur Conversation ───
     parts.append(
         "\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -7771,6 +7852,43 @@ async def daily_briefing_job(ctx: ContextTypes.DEFAULT_TYPE):
             )
         except Exception:
             pass
+
+
+async def goal_anchor_reminder_job(ctx: ContextTypes.DEFAULT_TYPE):
+    """JobQueue-Callback Sonntag 19:00 — pingt für Wochen-Anker.
+
+    Eskaliert bei 1. Sonntag im Monat zu Monats-Anker und erwähnt zusätzlich
+    am 1. Apr/Jul/Okt/Jan den Quartals-Anker.
+    """
+    try:
+        today = datetime.now(TIMEZONE).date()
+        # Eskalations-Logik
+        is_first_sunday = today.day <= 7
+        # Quartals-Start = 1. Sonntag eines Quartal-Monats (Apr/Jul/Okt/Jan)
+        is_quarter_start = is_first_sunday and today.month in (1, 4, 7, 10)
+
+        if is_quarter_start:
+            msg = (
+                "🌅 <b>Sonntag-Anker</b> — heute auch <b>Quartals-Anker</b> (90 Min)\n\n"
+                "📊 Excel öffnen + Säulen-Review:\n"
+                "<code>OneDrive\\…\\1_Privat\\08_Sonstiges\\Goals\\5-Jahres-Ziel_Tracker.xlsx</code>\n\n"
+                "Antworte mit <b>start</b> wenn bereit, dann ruf ich <code>goal_anchor(action='quarterly')</code>."
+            )
+        elif is_first_sunday:
+            msg = (
+                "🌅 <b>Sonntag-Anker</b> — heute auch <b>Monats-Anker</b> (60 Min, ersetzt Wochen-Anker)\n\n"
+                "Bilanz aller 6 Säulen + Monats-Ziele für nächsten Monat.\n\n"
+                "Antworte mit <b>start</b> wenn bereit, dann ruf ich <code>goal_anchor(action='monthly')</code>."
+            )
+        else:
+            msg = (
+                "🌅 <b>Sonntag-Anker</b> (30-45 Min) — bereit für die Wochen-Reflexion?\n\n"
+                "Antworte mit <b>start</b> oder <b>ja</b> um zu beginnen, oder <b>skip</b> falls heute nicht."
+            )
+        await safe_send(ctx.bot, ALLOWED_USER_ID, msg, is_html=True)
+        log.info(f"Goal-anchor reminder sent ({today.isoformat()}, first_sunday={is_first_sunday}, quarter={is_quarter_start})")
+    except Exception as e:
+        log.exception(f"goal_anchor_reminder_job failed: {e}")
 
 
 @require_auth
@@ -8004,6 +8122,22 @@ def main():
             log.info(f"Nightly-Health-Check scheduled für 02:00 {TIMEZONE.key}")
         except Exception as e:
             log.warning(f"Health-Job-Setup fehlgeschlagen: {e}")
+
+    # 5y-Goal-System: Sonntag 19:00 Wochen-Anker-Reminder
+    # Eskaliert intern bei 1. Sonntag im Monat zu Monats-Anker
+    # bzw. bei 1. Sonntag in Apr/Jul/Okt/Jan zusätzlich Quartals-Anker.
+    if ALLOWED_USER_ID > 0 and (GOALS_BASE / DEFAULT_GOAL_SLUG).exists():
+        try:
+            anchor_time = dtime(hour=19, minute=0, tzinfo=TIMEZONE)
+            app.job_queue.run_daily(
+                goal_anchor_reminder_job,
+                time=anchor_time,
+                days=(6,),  # 6 = Sonntag (Mo=0)
+                name="goal-anchor-sunday",
+            )
+            log.info(f"Goal-Anchor-Reminder scheduled für Sonntag 19:00 {TIMEZONE.key}")
+        except Exception as e:
+            log.warning(f"Goal-Anchor-Setup fehlgeschlagen: {e}")
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
