@@ -4243,8 +4243,12 @@ def goal_status(scope: str = "all", saeule: Optional[str] = None,
         if m:
             for row in m.group(1).strip().split("\n"):
                 cells = [c.strip() for c in row.split("|") if c.strip()]
-                if len(cells) >= 2:
-                    parts.append(f"  {cells[0]:<14} – {cells[1]}")
+                if len(cells) < 2:
+                    continue
+                # Tabellen-Separator-Zeile (|---|---|---|) überspringen
+                if all(re.fullmatch(r"-+", c) for c in cells):
+                    continue
+                parts.append(f"  {cells[0]:<14} – {cells[1]}")
         parts.append("")
 
     if s in ("all", "habits"):
