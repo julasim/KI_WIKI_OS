@@ -1809,10 +1809,17 @@ def search_vault(query: str, limit: int = 5) -> str:
             return f"Keine Treffer für: {query}"
         lines = [f"Suche '{query}' — {len(data)} Treffer (top {limit}):"]
         for hit in data[:limit]:
-            hid = hit.get("id", "?")
-            htype = hit.get("type", "?")
+            # `or "?"` statt default `"?"` — get() returnt None wenn key=None,
+            # nicht den default. Sonst landeten "[[None]]"-Strings im Output.
+            hid = hit.get("id") or "?"
+            htype = hit.get("type") or "?"
             score = hit.get("score", "?")
-            lines.append(f"- [[{hid}]] · `{htype}` · score {score}")
+            path = hit.get("path") or ""
+            # Pfad ist KRITISCH für Folge-Tools (read_file/edit_file).
+            # Ohne Pfad muss LLM aus ID raten — bricht bei Datums-Präfixen
+            # (z.B. echtes File "2026-04-28_<id>.md", nicht "<id>.md").
+            path_part = f" · `{path}`" if path else ""
+            lines.append(f"- [[{hid}]] · `{htype}` · score {score}{path_part}")
         return "\n".join(lines)
     except Exception as e:
         return f"Suche-Fehler: {e}"
@@ -4673,7 +4680,15 @@ TOOLS = [
     }},
     {"type": "function", "function": {
         "name": "search_vault",
-        "description": "Volltextsuche im Vault. Nutze für 'Was weiß ich über X', Wiki-Lookups, Task-Suche.",
+        "description": (
+            "Volltextsuche im Vault. Nutze für 'Was weiß ich über X', Wiki-Lookups, Task-Suche, "
+            "Vorbereitung für edit_file/read_file. "
+            "Output je Treffer: `- [[id]] · type · score N · `relativ/pfad.md``. "
+            "Der Pfad in den Backticks ist die ECHTE Datei — IMMER für read_file/edit_file "
+            "verwenden, NIEMALS aus der ID rekonstruieren (Files haben oft Datums-Präfix wie "
+            "`2026-04-28_<id>.md` der nicht in der ID steht). Multi-Word-Queries OK — Suche "
+            "ist token-basiert (Reihenfolge egal)."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -4702,12 +4717,21 @@ TOOLS = [
     }},
     {"type": "function", "function": {
         "name": "edit_file",
-        "description": "Find/Replace in einer Vault-Datei. Bei regex=true wird find als Regex interpretiert.",
+        "description": (
+            "Find/Replace in einer Vault-Datei. Bei regex=true wird find als Regex interpretiert. "
+            "WORKFLOW wenn rel_path unbekannt (User sagt nur 'in der Notiz X austauschen'): "
+            "1. search_vault(<Stichworte>) → Pfad steht im Output in Backticks am Ende der Zeile. "
+            "2. read_file(<pfad>) → Verifikation des EXAKTEN find-Strings (Wortlaut/Schreibweise/Whitespace). "
+            "3. edit_file(<pfad>, find=<exakt aus read_file>, replace=<neu>). "
+            "NIEMALS rel_path aus ID raten — Files haben oft Datums-Präfix wie `2026-04-28_<id>.md`. "
+            "find muss exakt im File stehen — bei find='EAP610' und im File steht 'TP-Link EAP610' "
+            "ist das ok (Substring), aber NIE 'EAP-610' oder 'eap610' (case-sensitive)."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
-                "rel_path": {"type": "string"},
-                "find": {"type": "string"},
+                "rel_path": {"type": "string", "description": "Vault-relativer Pfad. AUS search_vault-Output ziehen, nicht raten."},
+                "find": {"type": "string", "description": "Exakter Substring/Regex der ersetzt werden soll."},
                 "replace": {"type": "string"},
                 "regex": {"type": "boolean", "default": False},
             },
@@ -5236,6 +5260,14 @@ Wenn deine letzte assistant-Message mit `[Bot-Push HH:MM kind=...]` beginnt, ist
 - `kind=sunday-anchor` → User startet/skipt Anker. Wird normalerweise vor LLM gehandled — falls doch hier, ruf goal_anchor.
 
 **Korrekturen**: User-Reaktionen wie "nein/stopp/falsch/besser X statt Y" auf deine LETZTE Aktion → `edit_file` der bestehenden Datei (NICHT neu anlegen) + `log_correction`. Bei Frust → kurz entschuldigen, klärend nachfragen, KEINE blinde Folge-Aktion.
+
+**BESTEHENDE NOTE/FILE BEARBEITEN** (User redet über alte Note, NICHT deine letzte Aktion): "tausche X in der Notiz aus" / "in meiner Y-Notiz: Z statt W" / "ändere in Note über X" / "aktualisiere die Note zu X":
+1. `search_vault(<Stichworte aus Userrede>)` → Output endet je Treffer mit `` `relativer/pfad.md` `` in Backticks
+2. `read_file(<pfad aus Schritt 1>)` → exakten find-String verifizieren (Wortlaut/Schreibweise)
+3. `edit_file(<pfad>, find=<exakt aus read_file>, replace=<neu>)`
+4. Bestätigen: 1 Satz Klartext, kein Pfad-Dump.
+
+NIEMALS `rel_path` aus ID raten (Files haben oft `2026-04-28_<id>.md`-Präfix). Bei mehreren plausiblen Treffern (gleiche Topic, mehrere Notes): 1× kurz nachfragen "Meintest du [[a]] oder [[b]]?".
 
 **Multi-File-Upload + Projekt-Anlage**: `create_project` → EIN `move(src=[liste], dst='05_Projects/<slug>/')` → optional `activate`. Niemals N× einzelnen move bei mehreren Files.
 
