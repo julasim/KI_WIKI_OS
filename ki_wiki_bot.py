@@ -1335,7 +1335,7 @@ def list_open_tasks(when: Optional[str] = None,
         # Trailing-Empty entfernen
         while sections and not sections[-1]:
             sections.pop()
-        return "\n".join(sections)
+        return "\n".join(sections) + _render_task_id_map(matched)
 
     # Mit when-Filter: flache Liste, nach Prio sortiert
     matched_sorted = sorted(matched, key=lambda t: (_PRIO_ORDER.get(t.get("priority"), 9), _due_date(t) or date.max))
@@ -1344,7 +1344,7 @@ def list_open_tasks(when: Optional[str] = None,
         lines.append(_format_task_line(t, today))
     if len(matched_sorted) > 30:
         lines.append(f"  _… {len(matched_sorted) - 30} weitere_")
-    return "\n".join(lines)
+    return "\n".join(lines) + _render_task_id_map(matched_sorted[:30])
 
 
 def _format_task_line(t: dict, today: date) -> str:
@@ -1385,11 +1385,47 @@ def _format_task_line(t: dict, today: date) -> str:
                 due_str = f" · {dd.isoformat()}"
         else:
             due_str = f" · {d}"
-    # Wikilink bewusst NICHT mehr in der Bullet-Zeile — der LLM kopiert ihn
-    # sonst stumpf in die Telegram-Antwort und User sieht den Slug-Lärm.
-    # ID steht weiter im Frontmatter und ist via search_vault auffindbar,
-    # falls der LLM auf einen Task per ID referenzieren muss.
+    # Wikilink bewusst NICHT in der Bullet-Zeile — der LLM kopiert ihn
+    # sonst stumpf in die Telegram-Antwort und User sieht Slug-Lärm.
+    # Stattdessen wird am Ende der Auflistung ein expliziter [INTERN]-Block
+    # via _render_task_id_map angehängt, den der LLM für Tool-Calls nutzt.
     return f"  {prio_sym} {t['title']}{proj}{due_str}{rec_sym}"
+
+
+def _render_task_id_map(tasks: list, max_entries: int = 50) -> str:
+    """Trailing internal Title→task_id Map für LLM Tool-Calls.
+
+    Die User-sichtbare Bullet-Zeile zeigt nur den Titel (kein Slug-Lärm),
+    aber der LLM braucht den Slug für task(action='done'/'update'/'reopen',
+    task_id=...). Ohne diese Map muss er aus dem Titel selbst slugifizieren —
+    bricht bei Umlauten / 50-char-Cutoff / Hyphen-Titeln. Klar als INTERN
+    markiert, damit der LLM ihn nicht im Output an User dumpt.
+    """
+    if not tasks:
+        return ""
+    seen = set()
+    unique = []
+    for t in tasks:
+        tid = t.get("id")
+        if tid and tid not in seen:
+            seen.add(tid)
+            unique.append(t)
+    if not unique:
+        return ""
+    shown = unique[:max_entries]
+    lines = [
+        "",
+        "—",
+        "[INTERN — NICHT an User zeigen, NUR für task(action=…, task_id=…) Calls:]",
+    ]
+    for t in shown:
+        lines.append(f"• {t['title']} → {t['id']}")
+    if len(unique) > max_entries:
+        lines.append(
+            f"  (… {len(unique) - max_entries} weitere — bei Bedarf "
+            f"list_open_tasks mit Filter erneut aufrufen)"
+        )
+    return "\n".join(lines)
 
 
 def _due_to_date(d) -> Optional[date]:
@@ -1562,7 +1598,13 @@ def get_today_agenda() -> str:
     if len(parts) == 1:
         parts.append("\n_Heute steht aktuell nichts im Vault. Schreib mir was du heute vorhast — ich trag's ein._")
 
-    return "\n".join(parts)
+    # ID-Map über alle gerenderten Tasks (gleiche Caps wie oben)
+    rendered_tasks = (
+        data["overdue_tasks"][:10]
+        + data["today_tasks"][:15]
+        + data["high_nodate_tasks"][:10]
+    )
+    return "\n".join(parts) + _render_task_id_map(rendered_tasks)
 
 
 def create_meeting(title: str, attendees: Optional[list] = None,
@@ -4509,7 +4551,14 @@ TOOLS = [
                 },
                 "task_id": {
                     "type": "string",
-                    "description": "Slug des Tasks für update/done/reopen. Mit oder ohne 't-'-Präfix.",
+                    "description": (
+                        "Slug des Tasks für update/done/reopen. Mit oder ohne 't-'-Präfix. "
+                        "QUELLE: aus dem '[INTERN]'-Block am Ende der vorigen "
+                        "list_open_tasks/get_today_agenda-Antwort. NIEMALS selbst aus dem "
+                        "Title slugifizieren — das schlägt bei Umlauten/Hyphen/50-char-Cutoff fehl. "
+                        "Wenn der Slug nicht in der Map steht: erst list_open_tasks() aufrufen "
+                        "um die Map zu kriegen, oder search_vault('Task-Titel-Stichwort')."
+                    ),
                 },
                 "title": {"type": "string", "description": "Task-Titel. Pflicht bei create, optional bei update."},
                 "priority": {"type": "string", "enum": ["low", "medium", "high", "urgent"]},
@@ -4549,7 +4598,10 @@ TOOLS = [
             "heute feuernde Reminders, heute geplante Meetings, plus High-Prio-Tasks ohne Datum. "
             "PRIMÄRER Tool-Call wenn User fragt 'was steht heute an', 'was muss ich noch erledigen', "
             "'was ist heute zu tun', 'mein Plan für heute', 'agenda', 'tagesplan'. "
-            "Liefert fertig formatiertes Telegram-HTML — direkt zurück an User."
+            "Liefert fertig formatiertes Telegram-HTML — direkt zurück an User. "
+            "WICHTIG: Output endet mit '[INTERN — NICHT an User zeigen]'-Block "
+            "(Title→task_id Map). NIEMALS an User wiedergeben. Wenn User danach "
+            "'X erledigt' sagt: task_id aus dieser Map ziehen, nicht selbst raten."
         ),
         "parameters": {"type": "object", "properties": {}, "required": []},
     }},
@@ -4561,7 +4613,12 @@ TOOLS = [
             "Mit when-Filter: flache Liste. "
             "Beispiele: list_open_tasks() — alle, gruppiert. "
             "list_open_tasks(when='overdue') — nur überfällige. "
-            "list_open_tasks(project='matura', priority='urgent') — nur urgent in Matura."
+            "list_open_tasks(project='matura', priority='urgent') — nur urgent in Matura. "
+            "WICHTIG: Output endet mit '[INTERN — NICHT an User zeigen]'-Block, "
+            "der Title→task_id mappt. Diesen Block NIEMALS an User wiedergeben "
+            "(auch nicht zusammengefasst). Wenn User danach 'X erledigt'/'X verschieben' "
+            "sagt: task_id direkt aus dieser Map ziehen, NICHT selbst aus dem Title "
+            "slugifizieren — das schlägt bei Umlauten/Hyphen-Titeln/50-char-Cutoff fehl."
         ),
         "parameters": {
             "type": "object",
@@ -5201,6 +5258,7 @@ Pro Item ein Tool-Call (parallel im selben Loop-Step OK). Eine Bestätigung am E
 - **TELEGRAM-TABELLEN**: nur ≤2 Spalten + kurze Zellen. Sobald Pfade/lange Texte/≥3 Spalten → kein Tabellen-Format, stattdessen pro Item: `**Name**` + eingerückte `• Label: Wert`-Bullets.
 - **Wikilinks**: nur echte IDs aus search_vault/read_file. Keine Filepaths `[[10_Life/…]]`, keine Platzhalter `[[t-example]]`. Wenn keine ID → Klartext, KEIN Link.
   - **Auto-Linking aktiv**: bei `append_to_daily`, `create_note`, `project_context(action='update', ...)` macht der Renderer Wikilinks aus Klartext (Matura → `[[project-matura|Matura]]`). Bei direkter Telegram-Antwort selbst setzen.
+- **Task-ID-Map** (kritisch!): `list_open_tasks` und `get_today_agenda` enden mit einem `[INTERN — NICHT an User zeigen]`-Block der Title→task_id mappt. Diesen Block NIE an User wiedergeben (auch nicht zusammengefasst). Aber merken: wenn User danach "X erledigt"/"X verschieben"/"X später" sagt → task_id aus dieser Map ziehen. NIEMALS selbst aus dem Title slugifizieren (Umlaute + 50-char-Cutoff brechen das).
 - NIE HTML-Tags. NIE Frontmatter ausgeben.
 
 # DATEN
