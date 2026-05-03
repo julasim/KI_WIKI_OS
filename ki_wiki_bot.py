@@ -60,8 +60,8 @@ TG_TOKEN = os.environ["TG_TOKEN"]
 LLM_API_KEY = os.environ.get("LLM_API_KEY") or os.environ.get("OPENROUTER_API_KEY")
 if not LLM_API_KEY:
     raise RuntimeError("LLM_API_KEY (oder OPENROUTER_API_KEY) muss gesetzt sein.")
-LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://openrouter.ai/api/v1")
-LLM_MODEL = os.environ.get("LLM_MODEL", "anthropic/claude-sonnet-4-5")
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.anthropic.com/v1/")
+LLM_MODEL = os.environ.get("LLM_MODEL", "claude-haiku-4-5")
 # Provider-Detection für Format-Kompatibilität:
 # - Anthropic-direkt + OpenRouter→Anthropic: cache_control + content-as-list erlaubt
 # - Gemini OpenAI-Compat + reine OpenAI: content muss String sein, kein cache_control
@@ -98,8 +98,9 @@ DAILY_DIR = LIFE / "daily"
 TASKS_DIR = LIFE / "tasks"
 NOTES_DIR = LIFE / "notes"
 MEETINGS_DIR = LIFE / "meetings"
-AREAS_DIR = LIFE / "areas"
 PROJECTS_DIR = VAULT / "05_Projects"  # Schema-konform: Projekte sind eigener Top-Level
+# AREAS_DIR entfernt 2026-05-03 — Areas-Konzept wurde nie genutzt, area-Feld ist
+# tote Logik (kein Folder, kein Schema-Eintrag). project + tags decken alle Use-Cases.
 TEMPLATES_DIR = VAULT / "08_Templates"
 ATTACHMENTS_DIR = VAULT / "09_Attachments"
 RAW_ARTICLES_DIR = VAULT / "01_Raw" / "articles"
@@ -542,7 +543,7 @@ _LINK_STOPWORDS = {
     "heute", "morgen", "gestern", "jetzt", "abends", "morgens",
     # Generic Vault-Begriffe
     "test", "todo", "task", "tasks", "meeting", "meetings", "note", "notes",
-    "projekt", "projekte", "project", "projects", "area", "areas", "daily",
+    "projekt", "projekte", "project", "projects", "daily",
     # Häufige Sätze
     "info", "link", "wichtig", "okay", "danke", "bitte", "frage", "antwort",
     # Englisch
@@ -892,7 +893,7 @@ def _sync_task_body(post: "frontmatter.Post") -> None:
 
 
 def _task_create(title: str, priority: str = "medium",
-                 due: Optional[str] = None, area: Optional[str] = None,
+                 due: Optional[str] = None,
                  project: Optional[str] = None, context: Optional[str] = None,
                  tags: Optional[list] = None,
                  recurrence: Optional[str] = None) -> str:
@@ -946,8 +947,6 @@ def _task_create(title: str, priority: str = "medium",
     }
     if due:
         fm_data["due"] = due
-    if area:
-        fm_data["area"] = area
     if project:
         fm_data["project"] = project
     if context:
@@ -1049,7 +1048,7 @@ def _task_update(task_id: str, **fields) -> str:
     entfernt das Frontmatter-Feld komplett. Body-Status-Zeile wird automatisch
     re-synchronisiert. updated wird auf heute gesetzt.
 
-    Erlaubte Felder: title, priority, due, project, area, context, tags, recurrence, status.
+    Erlaubte Felder: title, priority, due, project, context, tags, recurrence, status.
     """
     path = _resolve_task_path(task_id)
     if path is None:
@@ -1085,7 +1084,7 @@ def _task_update(task_id: str, **fields) -> str:
             else:
                 return f"due='{v}' ist kein gültiges ISO-Datum (YYYY-MM-DD) und nicht leer"
 
-    for f in ("project", "area", "context"):
+    for f in ("project", "context"):
         if f in fields:
             v = fields[f]
             if v in (None, "", _TASK_CLEAR):
@@ -1144,7 +1143,6 @@ def task(action: str, task_id: Optional[str] = None,
          priority: Optional[str] = None,
          due: Optional[str] = None,
          project: Optional[str] = None,
-         area: Optional[str] = None,
          context: Optional[str] = None,
          tags: Optional[list] = None,
          recurrence: Optional[str] = None,
@@ -1161,7 +1159,7 @@ def task(action: str, task_id: Optional[str] = None,
             return "create: title ist Pflicht."
         return _task_create(
             title=title, priority=priority or "medium", due=due,
-            area=area, project=project, context=context,
+            project=project, context=context,
             tags=tags, recurrence=recurrence,
         )
 
@@ -1183,7 +1181,7 @@ def task(action: str, task_id: Optional[str] = None,
         # explizit den String "null" oder "" übergeben — wir mappen das auf clear.
         update_fields = {}
         for k, v in [("title", title), ("priority", priority), ("due", due),
-                     ("project", project), ("area", area), ("context", context),
+                     ("project", project), ("context", context),
                      ("tags", tags), ("recurrence", recurrence), ("status", status)]:
             if v is not None:
                 # String "null" (vom LLM) → echtes None für unsere clear-Logik
@@ -1228,7 +1226,6 @@ def _read_open_tasks() -> list:
             "priority": meta.get("priority", "medium"),
             "due": meta.get("due"),
             "project": meta.get("project"),
-            "area": meta.get("area"),
             "context": meta.get("context"),
             "tags": meta.get("tags", []) or [],
             "recurrence": meta.get("recurrence"),
@@ -1239,12 +1236,11 @@ def _read_open_tasks() -> list:
 def list_open_tasks(when: Optional[str] = None,
                     priority: Optional[str] = None,
                     project: Optional[str] = None,
-                    area: Optional[str] = None,
                     context: Optional[str] = None) -> str:
     """Listet offene Tasks mit smartem Filter, gruppiert + sortiert für Telegram.
 
     when: 'today' / 'tomorrow' / 'week' (nächste 7 Tage) / 'overdue' / 'nodate' / None=alle
-    priority/project/area/context: optionale weitere Filter
+    priority/project/context: optionale weitere Filter
     """
     tasks = _read_open_tasks()
     if not tasks:
@@ -1284,9 +1280,6 @@ def list_open_tasks(when: Optional[str] = None,
         if project:
             if (t.get("project") or "").strip().lower() != project.strip().lower():
                 return False
-        if area:
-            if (t.get("area") or "").strip().lower() != area.strip().lower():
-                return False
         if context:
             if (t.get("context") or "").strip().lower() != context.strip().lower():
                 return False
@@ -1298,7 +1291,6 @@ def list_open_tasks(when: Optional[str] = None,
         if when: filter_desc.append(f"when={when}")
         if priority: filter_desc.append(f"prio={priority}")
         if project: filter_desc.append(f"projekt={project}")
-        if area: filter_desc.append(f"area={area}")
         if context: filter_desc.append(f"context={context}")
         f_str = f" (Filter: {', '.join(filter_desc)})" if filter_desc else ""
         return f"Keine offenen Tasks{f_str}."
@@ -2701,7 +2693,7 @@ def list_existing_tags(top_n: int = 30) -> str:
     return "\n".join(lines)
 
 
-def create_project(name: str, description: str = "", area: Optional[str] = None,
+def create_project(name: str, description: str = "",
                    parent: Optional[str] = None) -> str:
     """Legt einen neuen Projekt-Ordner unter 05_Projects/<slug>/ an.
 
@@ -2748,7 +2740,7 @@ def create_project(name: str, description: str = "", area: Optional[str] = None,
 
 ## Status
 - **Status**: active
-- **Gestartet**: {today}{chr(10) + f"- **Area**: [[{area}]]" if area else ""}
+- **Gestartet**: {today}
 
 ## Offene Tasks
 ```dataview
@@ -2786,8 +2778,6 @@ SORT date DESC
         "status": "active",
         "tags": [],
     }
-    if area:
-        post_data["area"] = area
     post = frontmatter.Post(body, **post_data)
     atomic_write(readme_path, frontmatter.dumps(post) + "\n")
 
@@ -3838,10 +3828,15 @@ USAGE_DIR = VAULT / "06_Meta" / "usage"
 # Für Ollama-Cloud / lokale Modelle: 0/0. Bot zeigt im /usage diese Caveat.
 # Werte sind Stand 2025/2026 grob — User updated bei Bedarf in der Datei.
 PRICING_USD_PER_M = {
-    # OpenRouter / Anthropic
+    # Anthropic direkt (ohne Provider-Prefix — Bot nutzt aktuell diesen Pfad)
+    "claude-haiku-4-5": (1.0, 5.0),
+    "claude-sonnet-4-5": (3.0, 15.0),
+    "claude-opus-4-5": (15.0, 75.0),
+    # OpenRouter / Anthropic (mit Provider-Prefix)
     "anthropic/claude-sonnet-4-5": (3.0, 15.0),
     "anthropic/claude-opus-4": (15.0, 75.0),
     "anthropic/claude-haiku-4": (0.8, 4.0),
+    "anthropic/claude-haiku-4-5": (1.0, 5.0),
     # OpenAI
     "openai/gpt-4o": (2.5, 10.0),
     "openai/gpt-4o-mini": (0.15, 0.60),
@@ -4548,7 +4543,7 @@ TOOLS = [
             "Eine action pro Aufruf. Delete läuft separat über request_delete (zwei-stufig). "
             "ACTION 'create': Legt neuen Task in 10_Life/tasks/ an, verlinkt unter 'Heute' in "
             "heutiger Daily. Pflicht: title. Optional: priority, due (NUR wenn User Datum nennt!), "
-            "project, area, context, tags (2-5 kebab-case), recurrence (NUR bei klaren "
+            "project, context, tags (2-5 kebab-case), recurrence (NUR bei klaren "
             "Wiederholungs-Wörtern wie 'täglich', 'jede Woche'). "
             "ACTION 'update': Ändert ein oder mehrere Felder eines existierenden Tasks. "
             "Pflicht: task_id (mit oder ohne 't-'-Präfix). Nur die übergebenen Felder werden "
@@ -4582,7 +4577,6 @@ TOOLS = [
                 "priority": {"type": "string", "enum": ["low", "medium", "high", "urgent"]},
                 "due": {"type": "string", "description": "ISO YYYY-MM-DD. NUR setzen wenn User Datum nennt. Bei update: 'null' = Deadline entfernen."},
                 "project": {"type": "string", "description": "Projekt-Slug. Bei update: 'null' = Projekt entfernen."},
-                "area": {"type": "string", "description": "Area-Slug. Bei update: 'null' = Area entfernen."},
                 "context": {"type": "string", "enum": ["home", "work", "errand", "phone", "computer"]},
                 "tags": {
                     "type": "array",
@@ -4648,7 +4642,6 @@ TOOLS = [
                 },
                 "priority": {"type": "string", "enum": ["low", "medium", "high", "urgent"]},
                 "project": {"type": "string", "description": "Projekt-Slug"},
-                "area": {"type": "string", "description": "Area-Slug"},
                 "context": {"type": "string", "enum": ["home", "work", "errand", "phone", "computer"]},
             },
             "required": [],
@@ -5017,7 +5010,6 @@ TOOLS = [
             "properties": {
                 "name": {"type": "string", "description": "Projekt-Name, wird zu Slug umgewandelt"},
                 "description": {"type": "string", "description": "Optional: kurze Beschreibung fürs README"},
-                "area": {"type": "string", "description": "Optional: zugehörige Area-ID"},
                 "parent": {"type": "string", "description": "Optional: Parent-Projekt-Slug für Subprojekt-Anlage"},
             },
             "required": ["name"],
@@ -5237,7 +5229,7 @@ TOOL_HANDLERS = {
 SYSTEM_PROMPT = """Du bist Julius' Vault-Assistent über Telegram. Deutsch.
 
 VAULT
-- 10_Life/{daily,tasks,notes,meetings,areas}/   Persönliches
+- 10_Life/{daily,tasks,notes,meetings,goals}/   Persönliches
 - 05_Projects/<slug>/                            Projekte (Subprojekte als Subordner)
 - 02_Wiki/                                       Kompiliertes Wissen
 - 01_Raw/                                        Externe Quellen (Articles, Uploads)
@@ -5300,7 +5292,7 @@ Pro Item ein Tool-Call (parallel im selben Loop-Step OK). Eine Bestätigung am E
 
 # AUSGABE
 - Deutsch, direkt, kein Geschwurbel. Sparsame Emojis (✓ ✗ ⚠️).
-- Aktion-Bestätigung: 1 Satz. Wikilink `[[id]]` NUR bei NEU erstellten Items (task/create_note/create_meeting/create_project/area), damit Julius hinklicken kann. Bei `task(action='done'/'update')`, `request_delete`, `move`, `edit_file` & Status-Änderungen: NUR Klartext-Titel ohne Slug-Wikilink (User kennt den Task ja schon). Frage: so lang wie nötig.
+- Aktion-Bestätigung: 1 Satz. Wikilink `[[id]]` NUR bei NEU erstellten Items (task/create_note/create_meeting/create_project), damit Julius hinklicken kann. Bei `task(action='done'/'update')`, `request_delete`, `move`, `edit_file` & Status-Änderungen: NUR Klartext-Titel ohne Slug-Wikilink (User kennt den Task ja schon). Frage: so lang wie nötig.
 - Format: Bullets/Code/`**bold**`/`*italic*`. Headings nur bei langen Antworten.
 - **TELEGRAM-TABELLEN**: nur ≤2 Spalten + kurze Zellen. Sobald Pfade/lange Texte/≥3 Spalten → kein Tabellen-Format, stattdessen pro Item: `**Name**` + eingerückte `• Label: Wert`-Bullets.
 - **Wikilinks**: nur echte IDs aus search_vault/read_file. Keine Filepaths `[[10_Life/…]]`, keine Platzhalter `[[t-example]]`. Wenn keine ID → Klartext, KEIN Link.
@@ -7079,7 +7071,7 @@ REQUIRED_TYPES_WITH_TAGS = {
     "concept", "topic", "person", "organization", "tool", "method",
     "glossary", "timeline", "article", "paper", "repo", "video", "book",
     "dataset", "summary", "report", "slides", "query", "project",
-    "daily", "task", "note", "meeting", "area",
+    "daily", "task", "note", "meeting",
 }
 
 
