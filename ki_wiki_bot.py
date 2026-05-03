@@ -85,10 +85,8 @@ try:
     BRIEFING_HOUR = int(os.environ.get("BRIEFING_HOUR", "0") or "0")
 except ValueError:
     BRIEFING_HOUR = 0
-try:
-    SUGGESTION_HOUR = int(os.environ.get("SUGGESTION_HOUR", "0") or "0")
-except ValueError:
-    SUGGESTION_HOUR = 0
+# SUGGESTION_HOUR entfernt 2026-05-03 — Memory-Vorschläge-Job ist gestrichen,
+# Funktion bleibt für manuelle Trigger ('memory N M') verfügbar.
 TIMEZONE = ZoneInfo(os.environ.get("TIMEZONE", "Europe/Vienna"))
 
 TG_MAX_MESSAGE = 3800
@@ -2341,6 +2339,10 @@ def confirm_delete(action: str = "confirm") -> str:
 # Reminders überleben Bot-Restart: JSON in 06_Meta/reminders.json.
 # Bei Startup werden alle aktiven Reminders neu in die JobQueue eingehängt.
 REMINDERS_FILE = VAULT / "06_Meta" / "reminders.json"
+# System-Default-Tagebuch-Reminder (am 01.05.2026 angelegt). Stable-ID damit
+# reminder_callback ihn auch nach Text-Änderungen sicher erkennt → triggert
+# pending_diary-Bypass für direkten Daily-Note-Append.
+DIARY_REMINDER_ID = "rem-20260501-110251-676"
 ACTIVE_REMINDER_JOBS: dict = {}  # id → telegram.ext.Job
 BOT_APP = None  # wird in main() gesetzt — brauchen Zugriff auf job_queue von Tools aus
 
@@ -2482,37 +2484,84 @@ def _remove_reminder_from_json(rid: str) -> None:
 
 
 async def reminder_callback(ctx: ContextTypes.DEFAULT_TYPE):
-    """Wird von JobQueue ausgelöst wenn ein Reminder fällig wird."""
+    """Wird von JobQueue ausgelöst wenn ein Reminder fällig wird.
+
+    Spezialfall Tagebuch-Reminder am Sonntag: kombinierter Push mit Anchor-
+    Frage (Wochen/Monats/Quartals je nach Tag). Beide pending-States werden
+    gesetzt → User-Reply triggert Diary-Append + Anchor-Workflow.
+    """
     data = ctx.job.data
     rid = data["id"]
     message = data["message"]
     try:
-        await safe_send(
-            ctx.bot, ALLOWED_USER_ID,
-            f"⏰ <b>Erinnerung</b>\n\n{_esc_html(message)}",
-            is_html=True,
-        )
-        log.info(f"Reminder fired: {rid}")
-
         # Tagebuch-Spezialfall: NUR der spezifische System-Default-Reminder
         # triggert den Bypass. User-Reminders die zufällig "tagebuch" enthalten
         # ("Tagebuch schreiben für Klassenkamerad") sollen NICHT auto-einsortiert
-        # werden. Match: "Tagebuch: Highlight" am Anfang (mit oder ohne Emoji-
-        # Präfix für Backward-Compat zu existierenden Reminders).
+        # werden.
+        # Detection via stable Reminder-ID (robust gegen Text-Änderungen) +
+        # Backward-Compat-Patterns für historische Reminder-Texte.
         msg = (message or "").strip()
         msg_lower = msg.lower()
         is_default_diary = (
-            msg_lower.startswith("tagebuch: highlight")
+            rid == DIARY_REMINDER_ID
+            or msg_lower.startswith("wenn du heute zurückblickst")
+            or msg_lower.startswith("tagebuch: highlight")
             or msg.startswith("📔 Tagebuch:")
             or msg_lower.startswith("📔 tagebuch")
         )
-        if is_default_diary:
+
+        # Sonntag-Sonderfall: Tagebuch + Anchor in einem Push kombinieren.
+        # Eskalation: 1. Sonntag/Monat → Monats-Anker, 1. Sonntag in Apr/Jul/
+        # Okt/Jan → Quartals-Anker.
+        today = datetime.now(TIMEZONE).date()
+        push_kind = "reminder"
+        if is_default_diary and today.weekday() == 6 and (GOALS_BASE / DEFAULT_GOAL_SLUG).exists():
+            is_first_sunday = today.day <= 7
+            is_quarter_start = is_first_sunday and today.month in (1, 4, 7, 10)
+            if is_quarter_start:
+                anchor_action = "quarterly"
+                anchor_intro = "<b>Sonntag — heute auch Quartals-Anker (90 Min)</b>"
+                anchor_extra = (
+                    "\nBilanz aller 6 Säulen + Quartals-Ziele für nächstes Quartal.\n"
+                    "Excel öffnen falls vorhanden.\n"
+                )
+            elif is_first_sunday:
+                anchor_action = "monthly"
+                anchor_intro = "<b>Sonntag — heute auch Monats-Anker (60 Min)</b>"
+                anchor_extra = "\nBilanz der Säulen + Monats-Ziele für nächsten Monat.\n"
+            else:
+                anchor_action = "weekly"
+                anchor_intro = "<b>Sonntag — Wochen-Anker (30-45 Min)</b>"
+                anchor_extra = ""
+
+            combined = (
+                f"{anchor_intro}\n"
+                f"{anchor_extra}"
+                f"\n— Tagebuch —\n"
+                f"{_esc_html(message)}\n\n"
+                f"<i>Antwort: erst dein Tagebuch-Eintrag (geht in heutige Daily), "
+                f"dann starten wir den Anker mit 'start' / 'ja' (oder 'skip').</i>"
+            )
+            await safe_send(ctx.bot, ALLOWED_USER_ID, combined, is_html=True)
             _save_pending_diary()
+            _save_pending_goal_anchor(anchor_action)
+            push_kind = "sunday-reflection"
+            log.info(f"Sunday combined push (anchor={anchor_action}) für {today}")
+        else:
+            # Standard-Pfad: normaler Reminder
+            await safe_send(
+                ctx.bot, ALLOWED_USER_ID,
+                f"<b>Erinnerung</b>\n\n{_esc_html(message)}",
+                is_html=True,
+            )
+            log.info(f"Reminder fired: {rid}")
+            if is_default_diary:
+                _save_pending_diary()
 
         # Generischer Bot-Push-Log in History — LLM weiß bei späterer
         # User-Antwort dass gerade ein Reminder kam.
         await _log_bot_push_to_history(
-            ALLOWED_USER_ID, "reminder",
+            ALLOWED_USER_ID, push_kind,
             f"Reminder ausgelöst: {message[:150]}",
         )
     except Exception as e:
@@ -7035,7 +7084,7 @@ def collect_health_data() -> dict:
                     try:
                         last_anchor = datetime.strptime(m.group(1), "%Y-%m-%d").date()
                         if (today - last_anchor).days > 14:
-                            goal_drift.append(f"⚠️ Letzter Wochen-Anker vor {(today - last_anchor).days}d (>14d) — System ggf. zu schwer, kürzen?")
+                            goal_drift.append(f"Letzter Wochen-Anker vor {(today - last_anchor).days}d (>14d) — System ggf. zu schwer, kürzen?")
                     except ValueError:
                         pass
         except Exception as e:
@@ -7518,7 +7567,20 @@ def write_health_report(data: dict, autofixes: list, proposals: list) -> Path:
         for i, p in enumerate(proposals, 1):
             lines.append(f"### {i}. {p['summary']}")
             for item in p["items"][:3]:
+                # Items sind dicts wie {'path': '...', 'target': '...'} —
+                # früher als Python-repr gedruckt (Bug). Jetzt formatiert:
                 if isinstance(item, dict):
+                    if "path" in item and "target" in item:
+                        lines.append(f"- `{item['path']}` → `{item['target']}`")
+                    elif "path" in item:
+                        lines.append(f"- `{item['path']}`")
+                    elif "title" in item:
+                        lines.append(f"- {item['title']}")
+                    else:
+                        # Fallback: alle Keys-Values formatiert
+                        kv = " · ".join(f"{k}={v}" for k, v in item.items())
+                        lines.append(f"- {kv}")
+                else:
                     lines.append(f"- {item}")
             lines.append(f"  Optionen: {', '.join(p['options'])}")
             lines.append("")
@@ -7526,7 +7588,7 @@ def write_health_report(data: dict, autofixes: list, proposals: list) -> Path:
     # ── Tag-Übersicht (immer am Ende, kompakt) ──
     if data["all_tags"]:
         top_tags = sorted(data["all_tags"].items(), key=lambda x: -x[1])[:15]
-        lines.append("## 🏷️ Top-Tags")
+        lines.append("## Top-Tags")
         lines.append("")
         lines.append(", ".join(f"`{t}` ({c})" for t, c in top_tags))
         lines.append("")
@@ -8328,22 +8390,11 @@ def main():
                 log.warning(f"Recurring-Reset-Setup fehlgeschlagen: {e}")
         log.info("Daily-Briefing deaktiviert (BRIEFING_HOUR=0 oder Setup-Modus)")
 
-    # Nightly Memory-Suggestion-Briefing
-    if SUGGESTION_HOUR and ALLOWED_USER_ID > 0:
-        try:
-            sug_time = dtime(hour=SUGGESTION_HOUR, minute=0, tzinfo=TIMEZONE)
-            app.job_queue.run_daily(
-                nightly_suggestion_job,
-                time=sug_time,
-                name="nightly-memory-briefing",
-            )
-            log.info(f"Nightly-Memory-Vorschläge scheduled für {SUGGESTION_HOUR}:00 {TIMEZONE.key}")
-        except Exception as e:
-            log.warning(f"Suggestion-Job-Setup fehlgeschlagen: {e}")
-    else:
-        log.info("Nightly-Memory-Vorschläge deaktiviert (SUGGESTION_HOUR=0)")
+    # Nightly Memory-Vorschläge gestrichen (User-Spec 2026-05-03):
+    # nightly_suggestion_job + compute_memory_suggestions bleiben im Code für
+    # spätere Re-Aktivierung, werden aber nicht mehr scheduled.
 
-    # Nightly Vault-Health-Check (immer auf 02:00 — vor Briefing/Memory/Reset)
+    # Nightly Vault-Health-Check (immer auf 02:00 — vor Briefing/Reset)
     if ALLOWED_USER_ID > 0:
         try:
             health_time = dtime(hour=2, minute=0, tzinfo=TIMEZONE)
@@ -8356,21 +8407,10 @@ def main():
         except Exception as e:
             log.warning(f"Health-Job-Setup fehlgeschlagen: {e}")
 
-    # 5y-Goal-System: Sonntag 19:00 Wochen-Anker-Reminder
-    # Eskaliert intern bei 1. Sonntag im Monat zu Monats-Anker
-    # bzw. bei 1. Sonntag in Apr/Jul/Okt/Jan zusätzlich Quartals-Anker.
-    if ALLOWED_USER_ID > 0 and (GOALS_BASE / DEFAULT_GOAL_SLUG).exists():
-        try:
-            anchor_time = dtime(hour=19, minute=0, tzinfo=TIMEZONE)
-            app.job_queue.run_daily(
-                goal_anchor_reminder_job,
-                time=anchor_time,
-                days=(6,),  # 6 = Sonntag (Mo=0)
-                name="goal-anchor-sunday",
-            )
-            log.info(f"Goal-Anchor-Reminder scheduled für Sonntag 19:00 {TIMEZONE.key}")
-        except Exception as e:
-            log.warning(f"Goal-Anchor-Setup fehlgeschlagen: {e}")
+    # 5y-Goal-System Anchor-Reminder gestrichen als separater Job (User-Spec
+    # 2026-05-03): wird stattdessen am Sonntag 20:00 in den Tagebuch-Reminder-
+    # Pfad integriert (siehe reminder_callback). Werktags: nur Tagebuch.
+    # Sonntag: Tagebuch + Anchor kombiniert in einem Push.
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
