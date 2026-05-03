@@ -7745,8 +7745,20 @@ def apply_health_action(action: str) -> str:
 def compute_briefing() -> str:
     """Generiere die morgendliche Zusammenfassung als HTML-String.
 
-    Inhalt: Datum, überfällige Tasks, heute geplant (aus Daily 'Heute'),
-    offene Tasks (sortiert nach Prio), gestern Abends-Reflexion.
+    Slim-Version (2026-05-03 — Julius-Spec):
+    - Header mit Name + Punkt-Datum
+    - Heute geplant (aus Daily 'Heute'-Sektion, wenn vorhanden)
+    - Erinnerungen heute
+    - Meetings heute (Platz für künftige Calendar-Integration)
+    - Überfällig — nur Counter (Details kommen ins Web-Dashboard)
+    - Vault-Pflege
+
+    Bewusst RAUS (im Dashboard sichtbar, nicht im täglichen Push):
+    - Detaillierte Offene-Tasks-Liste
+    - Gestern Abends-Reflexion
+    - 5y-Goal-Block
+    - "Was hast du sonst vor heute?"-Trigger
+
     Bei fundamentalen Problemen (Vault nicht erreichbar) → klare Fehlermeldung.
     """
     # Vault-Reachability-Check
@@ -7754,12 +7766,13 @@ def compute_briefing() -> str:
         return f"❌ <b>Briefing fehlgeschlagen</b>\nVault unter <code>{VAULT}</code> nicht erreichbar.\nMount oder Container-Volume prüfen."
 
     today = today_iso()
-    yesterday = (datetime.now(TIMEZONE).date() - timedelta(days=1)).isoformat()
+    # Punkt-Format YYYY.MM.DD — Julius-Präferenz statt ISO mit Bindestrich
+    today_dotted = today.replace("-", ".")
 
     # Single Source of Truth — gleiche Daten wie get_today_agenda
     data = collect_today_data()
 
-    parts = [f"☀️ <b>Guten Morgen — {today}</b>"]
+    parts = [f"<b>Guten Morgen Julius — {today_dotted}</b>"]
 
     # ─── Today's Daily: was steht für heute geplant? ───
     today_path = DAILY_DIR / f"{today}.md"
@@ -7770,101 +7783,31 @@ def compute_briefing() -> str:
             m = re.search(r"## Heute\s*\n(.*?)(?=\n## |\Z)", body, re.DOTALL)
             if m and m.group(1).strip() and m.group(1).strip() != "- [ ]":
                 heute_text = m.group(1).strip()[:600]
-                parts.append(f"\n📋 <b>Heute geplant</b>\n<pre>{_esc_html(heute_text)}</pre>")
+                parts.append(f"\n<b>Heute geplant</b>\n<pre>{_esc_html(heute_text)}</pre>")
         except Exception as e:
             log.warning(f"briefing: today daily parse failed: {e}")
 
     # ─── Reminders heute ───
     if data["reminders"]:
-        parts.append("\n⏰ <b>Erinnerungen heute</b>")
+        parts.append("\n<b>Erinnerungen heute</b>")
         for fire_at, r in data["reminders"][:6]:
-            rec = " 🔁" if r.get("recurrence") else ""
+            rec = " (wiederkehrend)" if r.get("recurrence") else ""
             parts.append(f"• {fire_at.strftime('%H:%M')} — {_esc_html(r['message'][:80])}{rec}")
 
-    # ─── Meetings heute ───
+    # ─── Meetings heute (Platz für künftige Calendar-Integration) ───
     if data["meetings"]:
-        parts.append("\n🤝 <b>Meetings heute</b>")
+        parts.append("\n<b>Meetings heute</b>")
         for m in data["meetings"][:5]:
             parts.append(f"• {_esc_html(str(m['title']))}")
 
-    # ─── Überfällig + Heute fällig (kombiniert für Briefing-Übersicht) ───
-    today_date = data["today"]
+    # ─── Überfällig — nur Counter (Details im Web-Dashboard) ───
     if data["overdue_tasks"]:
-        parts.append("\n⚠️ <b>Überfällig</b>")
-        for t in data["overdue_tasks"][:8]:
-            # Konsistente Date-Normalisierung — vorher konnten date-Objekte aus
-            # YAML-Frontmatter als rohe Repr im Telegram landen.
-            due_d = _due_to_date(t.get("due"))
-            if due_d is not None:
-                delta = (today_date - due_d).days
-                due_disp = f"vor {delta}d" if delta > 0 else due_d.isoformat()
-            else:
-                due_disp = "—"
-            parts.append(f"• {_esc_html(str(t['title']))} <i>({due_disp})</i>")
-
-    # Andere offene Tasks (heute + nodate-high-prio + Rest, dedupliziert)
-    seen_ids = {t["id"] for t in data["overdue_tasks"]}
-    other_open = (
-        [t for t in data["today_tasks"] if t["id"] not in seen_ids]
-        + [t for t in data["high_nodate_tasks"] if t["id"] not in seen_ids]
-    )
-    # Resterest aus allen offenen die noch nicht in einem Bucket sind
-    seen_ids.update(t["id"] for t in other_open)
-    extra = [t for t in _read_open_tasks() if t["id"] not in seen_ids]
-    other_open.extend(_sort_tasks_by_prio_due(extra))
-
-    if other_open:
-        parts.append("\n✏️ <b>Offene Tasks</b>")
-        for t in other_open[:8]:
-            due_d = _due_to_date(t.get("due"))
-            if due_d is None:
-                due_str = ""
-            else:
-                delta = (due_d - today_date).days
-                if delta == 0:
-                    due_str = " <i>(heute)</i>"
-                elif delta == 1:
-                    due_str = " <i>(morgen)</i>"
-                elif 0 < delta <= 7:
-                    due_str = f" <i>(in {delta}d)</i>"
-                else:
-                    due_str = f" <i>(bis {due_d.isoformat()})</i>"
-            prio_emoji = PRIO_SYMBOLS.get(t.get("priority"), PRIO_SYMBOLS["medium"])
-            parts.append(f"{prio_emoji} {_esc_html(str(t['title']))}{due_str}")
-        if len(other_open) > 8:
-            parts.append(f"<i>… und {len(other_open)-8} weitere</i>")
-
-    # ─── Gestern: Abends-Reflexion ───
-    yest_path = DAILY_DIR / f"{yesterday}.md"
-    if yest_path.exists():
-        try:
-            ypost = frontmatter.load(yest_path)
-            ybody = ypost.content or ""
-            # Stop bei nächstem "## " ODER bei "---"-Separator (Daily-Footer
-            # mit Wikilinks zum Life-Index/MOC würde sonst mitgenommen — Telegram
-            # hat .md-Pfade als URL erkannt → nested Markdown-Link-Salat).
-            m = re.search(r"## Abends\s*\n(.*?)(?=\n## |\n---\s*\n|\Z)", ybody, re.DOTALL)
-            if m and m.group(1).strip():
-                abends = m.group(1).strip()
-                # Template-Standardtext rausfiltern (+ defensive: Footer-Reste
-                # falls regex-Stop nicht greift — Lines mit MD-Link zu nav)
-                template_lines = ("- Was lief gut?", "- Was nehme ich mit?")
-                _nav_pat = re.compile(r"\[(Life-Index|MOC|Index)\]")
-                non_template = [
-                    l for l in abends.split("\n")
-                    if l.strip()
-                    and l.strip() not in template_lines
-                    and not l.strip().startswith("---")
-                    and not _nav_pat.search(l)
-                ]
-                if non_template:
-                    abends_clean = "\n".join(non_template)[:400]
-                    parts.append(f"\n🌙 <b>Gestern Abends</b>\n<i>{_esc_html(abends_clean)}</i>")
-        except Exception:
-            pass
+        n = len(data["overdue_tasks"])
+        suffix = "Task" if n == 1 else "Tasks"
+        parts.append(f"\n<b>{n} überfällige {suffix}</b>")
 
     # ─── Wenn nichts da: gentle morning ───
-    has_anything = (data["overdue_tasks"] or other_open or data["reminders"]
+    has_anything = (data["overdue_tasks"] or data["reminders"]
                     or data["meetings"] or today_path.exists())
     if not has_anything:
         parts.append("\n<i>Heute steht noch nichts an.</i>")
@@ -7874,7 +7817,7 @@ def compute_briefing() -> str:
     health_today = HEALTH_REPORTS_DIR / f"{today}.md"
     pending_actions = _load_pending_health_actions()
     if health_today.exists() or pending_actions:
-        parts.append("\n🔧 <b>Vault-Pflege</b>")
+        parts.append("\n<b>Vault-Pflege</b>")
         # Auto-Fix-Counter + Issue-Counter aus Report extrahieren
         # (regex schärft auf bekannte Issue-Headlines — sonst zählen wir
         # Auto-Fix-Subsections und Approval-Header doppelt)
@@ -7908,47 +7851,6 @@ def compute_briefing() -> str:
             for i, p in enumerate(pending_actions, 1):
                 parts.append(f"  {i}. {_esc_html(p['summary'])}")
             parts.append("  <i>Antworte mit \"health 1\" / \"health 1 2\" / \"health 0\" (skip alle).</i>")
-
-    # ─── 5y-Goal-System: Wochen-Datei-Link + Vision-Reminder ────────────────
-    # Nur wenn das Goal-System aktiv ist (Vault-Folder existiert).
-    goal_dir = GOALS_BASE / DEFAULT_GOAL_SLUG
-    if goal_dir.exists():
-        try:
-            week_iso = _current_week_iso()  # z.B. "2026-W18"
-            week_file = goal_dir / "wochen" / f"{week_iso.lower()}.md"
-            week_id = week_file.stem  # z.B. "2026-w18"
-            goal_block = ["", "━━━━━━━━━━━━━━━━━━━━━━━━",
-                          f"🎯 <b>5y-Goal</b> — aktuelle Woche: <code>[[{week_id}]]</code>"]
-            if week_file.exists():
-                goal_block.append("<i>3 Tages-Prios markieren?</i>")
-            else:
-                goal_block.append(f"<i>⚠️ Wochen-Datei fehlt für {week_iso} — leg sie nach Template an.</i>")
-            # Vision-Satz aus vision.md (Manifesto-Block)
-            vision_path = goal_dir / "vision.md"
-            if vision_path.exists():
-                vt = vision_path.read_text(encoding="utf-8")
-                # Suche den Manifesto-Block (zwischen "> **" am Anfang)
-                vm = re.search(r"> \*\*(.+?)\*\*", vt, re.DOTALL)
-                if vm:
-                    raw = vm.group(1)
-                    # Multi-Line-Blockquote säubern: > weg, Newlines zu Spaces
-                    vision_text = re.sub(r"\n>\s*", " ", raw)
-                    vision_text = re.sub(r"\s+", " ", vision_text).strip()
-                    # Auf 180 Zeichen kürzen für Briefing
-                    if len(vision_text) > 180:
-                        vision_text = vision_text[:180].rsplit(" ", 1)[0] + "…"
-                    goal_block.append(f"💭 <i>{_esc_html(vision_text)}</i>")
-            parts.extend(goal_block)
-        except Exception as e:
-            log.warning(f"briefing 5y-block failed: {e}")
-
-    # ─── Tagesplan-Frage am Ende — macht das Briefing zur Conversation ───
-    parts.append(
-        "\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "💬 <b>Was hast du sonst noch vor heute?</b>\n"
-        "<i>Schreib einfach in Klartext: \"11 Uhr Bus, 14 Doc Müller, abends einkaufen\". "
-        "Ich trage Termine als Reminders, To-Dos als Tasks ein.</i>"
-    )
 
     return "\n".join(parts)
 
