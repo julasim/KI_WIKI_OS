@@ -166,11 +166,15 @@ log.info("Whisper loaded.")
 # ============================================================================
 
 def slugify(s: str, max_len: int = 50) -> str:
-    """kebab-case slug, deutsche Umlaute behandelt."""
+    """kebab-case slug, Umlaute bleiben erhalten (Julius-Wunsch 2026-05-03).
+
+    Vorher: ä→ae, ö→oe, ü→ue, ß→ss (ASCII-only)
+    Jetzt: Umlaute bleiben — alle modernen Filesysteme + Tools können das.
+    User: 'Ist prinzipiell wichtig dass mit Umlauten geschrieben wird.'
+    """
     s = s.lower().strip()
-    s = (s.replace("ä", "ae").replace("ö", "oe")
-         .replace("ü", "ue").replace("ß", "ss"))
-    s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
+    # Erlaubt: a-z, 0-9, ä, ö, ü, ß, sowie Bindestrich. Alles andere zu '-'.
+    s = re.sub(r"[^a-z0-9äöüß]+", "-", s).strip("-")
     return s[:max_len] or "untitled"
 
 
@@ -518,16 +522,17 @@ def _is_system_file(path: Path) -> bool:
 def _is_legacy_file(path: Path) -> bool:
     """True wenn Datei nicht dem Bot-Schema folgt (Pre-Bot oder manuell).
 
-    Heuristik: Filename hat Spaces, Großbuchstaben, Umlaute oder Sonderzeichen
+    Heuristik: Filename hat Spaces, Großbuchstaben oder Sonderzeichen
     (z.B. "Panama – Budget.md", "K6 Gerätepreis.md") — solche Files werden vom
     Bot nie automatisch angefasst und sind dauerhaftes Health-Check-Rauschen
-    wenn sie im Lint landen. Bot-erzeugte Files folgen kebab-case + ASCII
-    (z.B. `2026-04-29_oenorm-b-2061.md`).
+    wenn sie im Lint landen. Bot-erzeugte Files folgen kebab-case mit
+    erlaubten Umlauten (z.B. `wohnraumlüfter-einbauen.md`) — Umlaute sind
+    seit 2026-05-03 NICHT mehr Legacy.
     """
     if _is_system_file(path):
         return False
     name = path.stem  # ohne .md
-    return bool(re.search(r"[A-ZÄÖÜäöüß \–\—()&,]", name))
+    return bool(re.search(r"[A-ZÄÖÜ \–\—()&,]", name))
 
 
 # Häufige Wörter die Bot oft schreibt — würden sonst nervig auto-linked
@@ -846,11 +851,12 @@ def _resolve_task_path(task_id: str) -> Optional[Path]:
     """Slug → Path. Strippt 't-'-Präfix, validiert kebab-case, macht safe_path.
 
     Returns None wenn Slug ungültig oder File nicht existiert.
+    Umlaute (ä/ö/ü/ß) sind erlaubt seit Schema-Update 2026-05-03.
     """
     if not task_id:
         return None
     filename = task_id[2:] if task_id.startswith("t-") else task_id
-    if not re.match(r"^[a-zA-Z0-9_\-]+$", filename):
+    if not re.match(r"^[a-zA-Z0-9äöüßÄÖÜ_\-]+$", filename):
         return None
     try:
         path = safe_path(f"10_Life/tasks/{filename}.md")
@@ -1398,8 +1404,8 @@ def _render_task_id_map(tasks: list, max_entries: int = 50) -> str:
     Die User-sichtbare Bullet-Zeile zeigt nur den Titel (kein Slug-Lärm),
     aber der LLM braucht den Slug für task(action='done'/'update'/'reopen',
     task_id=...). Ohne diese Map muss er aus dem Titel selbst slugifizieren —
-    bricht bei Umlauten / 50-char-Cutoff / Hyphen-Titeln. Klar als INTERN
-    markiert, damit der LLM ihn nicht im Output an User dumpt.
+    bricht beim 50-char-Cutoff (Slug ist abgeschnitten, raten unmöglich).
+    Klar als INTERN markiert, damit der LLM ihn nicht im Output an User dumpt.
     """
     if not tasks:
         return ""
@@ -4567,7 +4573,7 @@ TOOLS = [
                         "Slug des Tasks für update/done/reopen. Mit oder ohne 't-'-Präfix. "
                         "QUELLE: aus dem '[INTERN]'-Block am Ende der vorigen "
                         "list_open_tasks/get_today_agenda-Antwort. NIEMALS selbst aus dem "
-                        "Title slugifizieren — das schlägt bei Umlauten/Hyphen/50-char-Cutoff fehl. "
+                        "Title slugifizieren — Slugs sind auf 50 Zeichen gecappt, raten geht oft schief. "
                         "Wenn der Slug nicht in der Map steht: erst list_open_tasks() aufrufen "
                         "um die Map zu kriegen, oder search_vault('Task-Titel-Stichwort')."
                     ),
@@ -4630,7 +4636,7 @@ TOOLS = [
             "der Title→task_id mappt. Diesen Block NIEMALS an User wiedergeben "
             "(auch nicht zusammengefasst). Wenn User danach 'X erledigt'/'X verschieben' "
             "sagt: task_id direkt aus dieser Map ziehen, NICHT selbst aus dem Title "
-            "slugifizieren — das schlägt bei Umlauten/Hyphen-Titeln/50-char-Cutoff fehl."
+            "slugifizieren — Slugs sind auf 50 Zeichen gecappt, raten geht oft schief."
         ),
         "parameters": {
             "type": "object",
@@ -5299,7 +5305,7 @@ Pro Item ein Tool-Call (parallel im selben Loop-Step OK). Eine Bestätigung am E
 - **TELEGRAM-TABELLEN**: nur ≤2 Spalten + kurze Zellen. Sobald Pfade/lange Texte/≥3 Spalten → kein Tabellen-Format, stattdessen pro Item: `**Name**` + eingerückte `• Label: Wert`-Bullets.
 - **Wikilinks**: nur echte IDs aus search_vault/read_file. Keine Filepaths `[[10_Life/…]]`, keine Platzhalter `[[t-example]]`. Wenn keine ID → Klartext, KEIN Link.
   - **Auto-Linking aktiv**: bei `append_to_daily`, `create_note`, `project_context(action='update', ...)` macht der Renderer Wikilinks aus Klartext (Matura → `[[project-matura|Matura]]`). Bei direkter Telegram-Antwort selbst setzen.
-- **Task-ID-Map** (kritisch!): `list_open_tasks` und `get_today_agenda` enden mit einem `[INTERN — NICHT an User zeigen]`-Block der Title→task_id mappt. Diesen Block NIE an User wiedergeben (auch nicht zusammengefasst). Aber merken: wenn User danach "X erledigt"/"X verschieben"/"X später" sagt → task_id aus dieser Map ziehen. NIEMALS selbst aus dem Title slugifizieren (Umlaute + 50-char-Cutoff brechen das).
+- **Task-ID-Map** (kritisch!): `list_open_tasks` und `get_today_agenda` enden mit einem `[INTERN — NICHT an User zeigen]`-Block der Title→task_id mappt. Diesen Block NIE an User wiedergeben (auch nicht zusammengefasst). Aber merken: wenn User danach "X erledigt"/"X verschieben"/"X später" sagt → task_id aus dieser Map ziehen. NIEMALS selbst aus dem Title slugifizieren (50-char-Cutoff macht das fragil).
 - NIE HTML-Tags. NIE Frontmatter ausgeben.
 
 # DATEN
@@ -7490,9 +7496,10 @@ def write_health_report(data: dict, autofixes: list, proposals: list) -> Path:
         legacy = data["legacy_files"]
         lines.append(f"## 📦 Migrations-Backlog ({len(legacy)})")
         lines.append("")
-        lines.append("Files mit Legacy-Naming (Spaces/Umlaute/Großbuchstaben), "
+        lines.append("Files mit Legacy-Naming (Spaces, Großbuchstaben), "
                      "die vor dem Bot existierten. Bot fasst sie nicht automatisch an. "
-                     "Manuell ans Schema anpassen wenn gewünscht.")
+                     "Manuell ans Schema anpassen wenn gewünscht. (Umlaute sind seit "
+                     "2026-05-03 ok und werden nicht mehr als Legacy gemeldet.)")
         lines.append("")
         for p in legacy[:10]:
             lines.append(f"- `{p}`")
