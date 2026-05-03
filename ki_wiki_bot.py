@@ -4186,6 +4186,11 @@ def goal_log(action: str, payload: Optional[dict] = None,
     if not gdir.exists():
         return f"Goal-System '{goal}' nicht initialisiert ({gdir}). Erst Phase-1-Setup."
 
+    # Defensive: LLM steckt 'date' manchmal in payload statt top-level
+    # (passierte real bei Sport-Session "4,5 km am 28.04." → wurde auf heute
+    # gespeichert weil top-level date=None war).
+    if not date and isinstance(payload.get("date"), str):
+        date = payload["date"]
     d = date.strip() if date and re.match(r"^\d{4}-\d{2}-\d{2}$", str(date).strip()) else today_iso()
     a = (action or "").strip().lower()
 
@@ -5084,7 +5089,11 @@ TOOLS = [
                 },
                 "date": {
                     "type": "string",
-                    "description": "ISO YYYY-MM-DD, default heute. Nur sport/habit/win unterstützen non-today.",
+                    "description": (
+                        "ISO YYYY-MM-DD, default heute. TOP-LEVEL Parameter (NICHT in payload). "
+                        "Nur sport/habit/win unterstützen non-today. Bsp: User sagt '4,5 km am "
+                        "28.04. gelaufen' → date='2026-04-28' top-level setzen, nicht ins payload."
+                    ),
                 },
                 "goal": {
                     "type": "string",
@@ -7832,12 +7841,23 @@ def compute_briefing() -> str:
         try:
             ypost = frontmatter.load(yest_path)
             ybody = ypost.content or ""
-            m = re.search(r"## Abends\s*\n(.*?)(?=\n## |\Z)", ybody, re.DOTALL)
+            # Stop bei nächstem "## " ODER bei "---"-Separator (Daily-Footer
+            # mit Wikilinks zum Life-Index/MOC würde sonst mitgenommen — Telegram
+            # hat .md-Pfade als URL erkannt → nested Markdown-Link-Salat).
+            m = re.search(r"## Abends\s*\n(.*?)(?=\n## |\n---\s*\n|\Z)", ybody, re.DOTALL)
             if m and m.group(1).strip():
                 abends = m.group(1).strip()
-                # Template-Standardtext rausfiltern
+                # Template-Standardtext rausfiltern (+ defensive: Footer-Reste
+                # falls regex-Stop nicht greift — Lines mit MD-Link zu nav)
                 template_lines = ("- Was lief gut?", "- Was nehme ich mit?")
-                non_template = [l for l in abends.split("\n") if l.strip() and l.strip() not in template_lines]
+                _nav_pat = re.compile(r"\[(Life-Index|MOC|Index)\]")
+                non_template = [
+                    l for l in abends.split("\n")
+                    if l.strip()
+                    and l.strip() not in template_lines
+                    and not l.strip().startswith("---")
+                    and not _nav_pat.search(l)
+                ]
                 if non_template:
                     abends_clean = "\n".join(non_template)[:400]
                     parts.append(f"\n🌙 <b>Gestern Abends</b>\n<i>{_esc_html(abends_clean)}</i>")
@@ -7876,7 +7896,12 @@ def compute_briefing() -> str:
                     if m:
                         issue_count += int(m.group(1))
                 if issue_count > 0:
-                    parts.append(f"• {issue_count} read-only Issues — siehe <code>{health_today.relative_to(VAULT)}</code>")
+                    # .md-Suffix weglassen — Telegram detected '2026-05-03.md'
+                    # als URL und renderte es als '[2026-05-03.md](http://2026-05-03.md)'
+                    # selbst innerhalb von <code>. Ohne Suffix kein Auto-Link.
+                    rel_path = str(health_today.relative_to(VAULT))
+                    rel_display = rel_path[:-3] if rel_path.endswith(".md") else rel_path
+                    parts.append(f"• {issue_count} read-only Issues — siehe <code>{rel_display}</code>")
             except Exception:
                 pass
         if pending_actions:
