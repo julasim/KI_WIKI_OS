@@ -1203,9 +1203,10 @@ def task(action: str, task_id: Optional[str] = None,
 # _format_task_line und compute_briefing wo vorher unterschiedliche
 # Symbol-Maps definiert waren)
 _PRIO_ORDER = {"urgent": 0, "high": 1, "medium": 2, "low": 3}
-# Symbole nach visueller Lautstärke: 🔴 > 🟠 > • > · — low ist quasi unsichtbar,
-# medium dezenter Bullet, urgent/high deutlich
-PRIO_SYMBOLS = {"urgent": "🔴", "high": "🟠", "medium": "•", "low": "·"}
+# Symbole — Voll-Farbskala (User-Spec 2026-05-03):
+# 🔴 urgent, 🟠 high, 🟡 medium, 🟢 low
+# Klare Ampel-Hierarchie für schnelle Visual-Erkennung in Telegram + Dashboard.
+PRIO_SYMBOLS = {"urgent": "🔴", "high": "🟠", "medium": "🟡", "low": "🟢"}
 
 
 def _read_open_tasks() -> list:
@@ -1352,7 +1353,7 @@ def _format_task_line(t: dict, today: date) -> str:
     zu `datetime.date`, nicht zu str → strptime würde TypeError werfen.
     """
     prio_sym = PRIO_SYMBOLS.get(t.get("priority"), PRIO_SYMBOLS["medium"])
-    rec_sym = " 🔁" if t.get("recurrence") else ""
+    rec_sym = " (wiederkehrend)" if t.get("recurrence") else ""
     proj = f" [{t['project']}]" if t.get("project") else ""
     due_str = ""
     d = t.get("due")
@@ -1555,16 +1556,16 @@ def get_today_agenda() -> str:
     """Markdown-Render des collect_today_data-Snapshots für Telegram-Tool-Call."""
     data = collect_today_data()
     today = data["today"]
-    parts = [f"📋 Agenda für heute ({today.strftime('%a %d.%m.%Y')})"]
+    parts = [f"<b>Agenda für heute ({today.strftime('%a %d.%m.%Y')})</b>"]
 
     if data["reminders"]:
         parts.append(f"\n⏰ **Erinnerungen heute** ({len(data['reminders'])})")
         for fire_at, r in data["reminders"]:
-            rec = " 🔁" if r.get("recurrence") else ""
+            rec = " (wiederkehrend)" if r.get("recurrence") else ""
             parts.append(f"  • {fire_at.strftime('%H:%M')} — {r['message'][:80]}{rec}")
 
     if data["meetings"]:
-        parts.append(f"\n🤝 **Meetings heute** ({len(data['meetings'])})")
+        parts.append(f"\n**Meetings heute** ({len(data['meetings'])})")
         for m in data["meetings"]:
             att = ""
             if m["attendees"]:
@@ -1575,21 +1576,21 @@ def get_today_agenda() -> str:
             parts.append(f"  • [[{m['id']}]] {m['title']}{att}")
 
     if data["overdue_tasks"]:
-        parts.append(f"\n⚠️ **Überfällige Tasks** ({len(data['overdue_tasks'])})")
+        parts.append(f"\n**Überfällige Tasks** ({len(data['overdue_tasks'])})")
         for t in data["overdue_tasks"][:10]:
             parts.append(_format_task_line(t, today))
         if len(data["overdue_tasks"]) > 10:
             parts.append(f"  _… {len(data['overdue_tasks'])-10} weitere_")
 
     if data["today_tasks"]:
-        parts.append(f"\n📅 **Heute fällige Tasks** ({len(data['today_tasks'])})")
+        parts.append(f"\n**Heute fällige Tasks** ({len(data['today_tasks'])})")
         for t in data["today_tasks"][:15]:
             parts.append(_format_task_line(t, today))
         if len(data["today_tasks"]) > 15:
             parts.append(f"  _… {len(data['today_tasks'])-15} weitere_")
 
     if data["high_nodate_tasks"]:
-        parts.append(f"\n🔥 **Hohe Prio, kein Datum** ({len(data['high_nodate_tasks'])})")
+        parts.append(f"\n**Hohe Prio, kein Datum** ({len(data['high_nodate_tasks'])})")
         for t in data["high_nodate_tasks"][:10]:
             parts.append(_format_task_line(t, today))
 
@@ -2303,12 +2304,12 @@ def confirm_delete(action: str = "confirm") -> str:
                     shutil.rmtree(src)
                 else:
                     src.unlink()
-                results.append(f"💀 {rel_path}")
+                results.append(f"ENDGÜLTIG GELÖSCHT: {rel_path}")
                 log.info(f"Hard-deleted: {rel_path}")
             except Exception as e:
                 log.exception(f"hard-delete {rel_path} failed")
                 results.append(f"✗ {rel_path} ({e})")
-        header = f"💀 ENDGÜLTIG GELÖSCHT ({len(paths)} Datei(en)):"
+        header = f"ENDGÜLTIG GELÖSCHT ({len(paths)} Datei(en)):"
     else:
         # Soft: nach 99_Archive/ verschieben
         archive_root = VAULT / "99_Archive"
@@ -2496,12 +2497,13 @@ async def reminder_callback(ctx: ContextTypes.DEFAULT_TYPE):
         # Tagebuch-Spezialfall: NUR der spezifische System-Default-Reminder
         # triggert den Bypass. User-Reminders die zufällig "tagebuch" enthalten
         # ("Tagebuch schreiben für Klassenkamerad") sollen NICHT auto-einsortiert
-        # werden. Match: "📔 Tagebuch:" oder "Tagebuch: Highlight" am Anfang.
+        # werden. Match: "Tagebuch: Highlight" am Anfang (mit oder ohne Emoji-
+        # Präfix für Backward-Compat zu existierenden Reminders).
         msg = (message or "").strip()
         msg_lower = msg.lower()
         is_default_diary = (
-            msg.startswith("📔 Tagebuch:")
-            or msg_lower.startswith("tagebuch: highlight")
+            msg_lower.startswith("tagebuch: highlight")
+            or msg.startswith("📔 Tagebuch:")
             or msg_lower.startswith("📔 tagebuch")
         )
         if is_default_diary:
@@ -2536,7 +2538,7 @@ def list_reminders() -> str:
     for r in sorted(reminders, key=lambda x: x.get("fire_at", "")):
         when = datetime.fromisoformat(r["fire_at"])
         when_str = when.strftime("%a %d.%m. %H:%M")
-        rec = f" 🔁 {r['recurrence']}" if r.get("recurrence") else ""
+        rec = f" (wiederkehrend: {r['recurrence']})" if r.get("recurrence") else ""
         lines.append(f"• `{r['id']}` — {when_str}{rec}\n  {r['message'][:80]}")
     return "\n".join(lines)
 
@@ -3357,15 +3359,15 @@ def _format_suggestion_briefing(suggestions: list) -> str:
     if not suggestions:
         return ""
     type_labels = {
-        "preference": "✨ <b>PRÄFERENZEN</b> (Stil/Antwort-Regeln)",
-        "fact": "📌 <b>FAKTEN</b> (Bio/Setup über dich)",
-        "project_context": "🎯 <b>PROJEKT-KONTEXT</b> (Projekt-Regeln)",
+        "preference": "<b>PRÄFERENZEN</b> (Stil/Antwort-Regeln)",
+        "fact": "<b>FAKTEN</b> (Bio/Setup über dich)",
+        "project_context": "<b>PROJEKT-KONTEXT</b> (Projekt-Regeln)",
     }
     by_type: dict = {}
     for i, s in enumerate(suggestions, 1):
         by_type.setdefault(s["type"], []).append((i, s))
 
-    msg = "🌙 <b>Memory-Vorschläge</b> <i>(Analyse der letzten 24h)</i>\n"
+    msg = "<b>Memory-Vorschläge</b> <i>(Analyse der letzten 24h)</i>\n"
     for ptype in ("preference", "fact", "project_context"):
         items = by_type.get(ptype, [])
         if not items:
@@ -3932,7 +3934,7 @@ def get_usage_summary(days: int = 7) -> str:
     total_calls = sum(d["calls"] for d in by_day.values())
     total_cost = sum(d["cost_usd"] for d in by_day.values())
 
-    parts = [f"📊 **Token-Usage** (letzte {days} Tage)"]
+    parts = [f"**Token-Usage** (letzte {days} Tage)"]
     parts.append(f"")
     parts.append(f"**Total:** {total_calls} Calls · {total_in:,} in · {total_out:,} out")
     if total_cost > 0:
@@ -4280,13 +4282,13 @@ def goal_status(scope: str = "all", saeule: Optional[str] = None,
         target = date(2031, 5, 1)
         days_left = (target - today).days
         if days_left > 0:
-            parts.append(f"🎯 5y-2031 · {days_left} Tage bis Stichtag (01.05.2031)")
+            parts.append(f"<b>5y-2031</b> · {days_left} Tage bis Stichtag (01.05.2031)")
         elif days_left == 0:
-            parts.append(f"🎯 5y-2031 · STICHTAG HEUTE (01.05.2031)")
+            parts.append(f"<b>5y-2031</b> · STICHTAG HEUTE (01.05.2031)")
         else:
-            parts.append(f"🎯 5y-2031 · Stichtag {-days_left} Tage vergangen (01.05.2031)")
+            parts.append(f"<b>5y-2031</b> · Stichtag {-days_left} Tage vergangen (01.05.2031)")
     else:
-        parts.append(f"🎯 Goal {goal}")
+        parts.append(f"<b>Goal {goal}</b>")
     parts.append("")
 
     s = (scope or "all").strip().lower()
@@ -4352,7 +4354,7 @@ def goal_status(scope: str = "all", saeule: Optional[str] = None,
         return out
 
     if s in ("all", "saeule"):
-        parts.append("📊 **Säulen** (Status manuell gepflegt in saeulen.md / readme.md)")
+        parts.append("**Säulen** (Status manuell gepflegt in saeulen.md / readme.md)")
         # Lies aus readme.md die Status-Tabelle
         readme = (gdir / "readme.md").read_text(encoding="utf-8") if (gdir / "readme.md").exists() else ""
         m = re.search(r"\| Säule \| Status \| Nächster Anker \|.*?\n((?:\|.*?\|\n)+)", readme, re.DOTALL)
@@ -4369,7 +4371,7 @@ def goal_status(scope: str = "all", saeule: Optional[str] = None,
 
     if s in ("all", "habits"):
         check_7, poss_7 = _habits_score(7)
-        parts.append(f"📈 **Habits** letzte 7 Tage: {check_7} ✓ / {poss_7} möglich")
+        parts.append(f"**Habits** letzte 7 Tage: {check_7} ✓ / {poss_7} möglich")
         if poss_7 > 0:
             pct = int(check_7 / poss_7 * 100)
             parts.append(f"   Quote: {pct}% (Soll: ≥80%)")
@@ -4473,7 +4475,7 @@ def goal_anchor(action: str, period: Optional[str] = None,
     # Step 1: keine answers → Frage-Liste returnen + File-Status
     if not answers:
         existed = target.exists()
-        msg = f"📋 **{period_label}** für {per}\n"
+        msg = f"**{period_label}** für {per}\n"
         if existed:
             msg += f"File existiert: `{_rel_or_name(target)}`\n"
         else:
@@ -5291,7 +5293,7 @@ Pro Item ein Tool-Call (parallel im selben Loop-Step OK). Eine Bestätigung am E
 - Lange Files (>2000 Zeichen) zusammenfassen, nicht raw dumpen.
 
 # AUSGABE
-- Deutsch, direkt, kein Geschwurbel. Sparsame Emojis (✓ ✗ ⚠️).
+- Deutsch, direkt, kein Geschwurbel. **KEINE Emojis** in Antworten — nur ✓/✗ als Status-Marker erlaubt (z.B. "✓ Task erledigt"). Keine ☀️/📋/🎯/📝/🔧/🌙/etc. Priority-Symbole (🔴 🟠 🟡 🟢) kommen NUR aus Tool-Output, nie selbst setzen.
 - Aktion-Bestätigung: 1 Satz. Wikilink `[[id]]` NUR bei NEU erstellten Items (task/create_note/create_meeting/create_project), damit Julius hinklicken kann. Bei `task(action='done'/'update')`, `request_delete`, `move`, `edit_file` & Status-Änderungen: NUR Klartext-Titel ohne Slug-Wikilink (User kennt den Task ja schon). Frage: so lang wie nötig.
 - Format: Bullets/Code/`**bold**`/`*italic*`. Headings nur bei langen Antworten.
 - **TELEGRAM-TABELLEN**: nur ≤2 Spalten + kurze Zellen. Sobald Pfade/lange Texte/≥3 Spalten → kein Tabellen-Format, stattdessen pro Item: `**Name**` + eingerückte `• Label: Wert`-Bullets.
@@ -6259,7 +6261,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # Sonst: in heutige Daily unter Abends einsortieren
         try:
             ts = datetime.now(TIMEZONE).strftime("%H:%M")
-            entry = f"- 📔 ({ts}) {t}"
+            entry = f"- ({ts}) {t}"
             await asyncio.to_thread(append_to_daily, "Abends", entry)
             _clear_pending_diary()
             await safe_reply(
@@ -6330,7 +6332,7 @@ async def handle_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("(Sprachnachricht leer/unverständlich)")
             return
         log.info(f"transcript: {transcript[:120]}")
-        await update.message.reply_text(f"📝 {transcript}")
+        await update.message.reply_text(f"Transkript: {transcript}")
         reply = await llm_loop(transcript, update.effective_user.id)
     except Exception as e:
         log.exception("voice handler failed")
@@ -6411,7 +6413,7 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             log.warning(f"Daily-Link für Photo fehlgeschlagen: {e}")
 
         # Reply — reply ist bereits HTML (mit <b>/<pre>/<code>)
-        reply = f"🖼 {filename}\n\n<b>Vision</b>: {_esc_html(vision_caption)}"
+        reply = f"<b>{filename}</b>\n\n<b>Vision</b>: {_esc_html(vision_caption)}"
         if ocr_text:
             reply += f"\n\n<b>OCR</b> ({len(ocr_text)} Zeichen):\n<pre><code>{_esc_html(ocr_text[:1500])}</code></pre>"
         await safe_reply(update, reply, is_html=True)
@@ -6529,7 +6531,7 @@ def _create_pdf_wrapper(dest: Path, filename: str) -> tuple[Path, str, str, int]
     md_id = slugify(f"paper-{pdf_title}")
     md_body = (
         f"# {pdf_title}\n\n"
-        f"📎 [Original PDF: {dest.name}](./{dest.name})\n\n"
+        f"[Original PDF: {dest.name}](./{dest.name})\n\n"
         f"**Autor**: {pdf_author} · **Seiten**: {total_pages}"
         + (f" · **Subject**: {pdf_meta['subject']}" if pdf_meta.get('subject') else "")
         + "\n\n---\n\n"
@@ -6571,7 +6573,7 @@ def _create_docx_wrapper(dest: Path, filename: str) -> tuple[Path, str, str, int
     md_id = slugify(f"doc-{docx_title}")
     md_body = (
         f"# {docx_title}\n\n"
-        f"📎 [Original DOCX: {dest.name}](./{dest.name})\n\n"
+        f"[Original DOCX: {dest.name}](./{dest.name})\n\n"
         f"**Autor**: {docx_author} · **Absätze**: {para_count}"
         + (f" · **Subject**: {docx_meta['subject']}" if docx_meta.get('subject') else "")
         + "\n\n---\n\n"
@@ -6598,11 +6600,9 @@ def _record_upload_in_daily(rel: Path, wrapper_link: Optional[Path],
     """Eintrag in heutige Daily ('Notizen & Gedanken'-Sektion). Failures werden geloggt."""
     try:
         if wrapper_link and md_id:
-            # Format-spezifisches Emoji
-            emoji = {"PDF": "📑", "Word-Dokument": "📝"}.get(kind, "📄")
-            link_text = f"{emoji} {kind} hochgeladen: <code>{rel}</code> → durchsuchbar als [[{md_id}]]"
+            link_text = f"{kind} hochgeladen: <code>{rel}</code> → durchsuchbar als [[{md_id}]]"
         else:
-            link_text = f"📄 Datei hochgeladen: <code>{rel}</code>"
+            link_text = f"Datei hochgeladen: <code>{rel}</code>"
         if user_caption:
             link_text += f" — {user_caption}"
         append_to_daily("Notizen & Gedanken", link_text)
@@ -6661,7 +6661,7 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             wrapper_link = md_path.relative_to(VAULT)
             body_preview = pdf_text[:1500] if pdf_text else ""
-            extra_html = f"\n📑 Wrapper: <code>{wrapper_link}</code> ({total_pages} S., id <code>{md_id}</code>)"
+            extra_html = f"\nWrapper: <code>{wrapper_link}</code> ({total_pages} S., id <code>{md_id}</code>)"
         elif ext_lower == ".docx":
             await update.message.chat.send_action(constants.ChatAction.TYPING)
             md_path, md_id, docx_text, para_count = await asyncio.to_thread(
@@ -6669,13 +6669,13 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             wrapper_link = md_path.relative_to(VAULT)
             body_preview = docx_text[:1500] if docx_text else ""
-            extra_html = f"\n📝 Wrapper: <code>{wrapper_link}</code> ({para_count} Absätze, id <code>{md_id}</code>)"
+            extra_html = f"\nWrapper: <code>{wrapper_link}</code> ({para_count} Absätze, id <code>{md_id}</code>)"
 
         # 4. Daily-Eintrag (sync, schnell)
         _record_upload_in_daily(rel, wrapper_link, md_id, user_caption, kind=kind)
 
         # 5. Antwort an User (kompakter falls Caption — LLM antwortet danach detailliert)
-        reply = f"📄 <b>{kind}</b> gespeichert: <code>{rel}</code>"
+        reply = f"<b>{kind}</b> gespeichert: <code>{rel}</code>"
         if extra_html:
             reply += extra_html
         if body_preview and not user_caption:
@@ -7416,7 +7416,7 @@ def write_health_report(data: dict, autofixes: list, proposals: list) -> Path:
         "maintained_by: nightly_health_job",
         "---",
         "",
-        f"# 🔧 Vault-Health-Check — {today_str}",
+        f"# Vault-Health-Check — {today_str}",
         "",
         f"**Notes gescannt:** {data['total_notes']}  ",
         f"**Tags total:** {len(data['all_tags'])}  ",
@@ -7429,7 +7429,7 @@ def write_health_report(data: dict, autofixes: list, proposals: list) -> Path:
         by_code: dict = {}
         for code, path, desc in autofixes:
             by_code.setdefault(code, []).append((path, desc))
-        lines.append(f"## ✅ Auto-Fixed ({len(autofixes)})")
+        lines.append(f"## Auto-Fixed ({len(autofixes)})")
         lines.append("")
         for code, items in sorted(by_code.items()):
             lines.append(f"### {code} ({len(items)})")
@@ -7439,7 +7439,7 @@ def write_health_report(data: dict, autofixes: list, proposals: list) -> Path:
                 lines.append(f"- _… {len(items)-20} weitere_")
             lines.append("")
     elif not data["first_run"]:
-        lines.append("## ✅ Auto-Fixed (0)")
+        lines.append("## Auto-Fixed (0)")
         lines.append("")
         lines.append("Nichts zu fixen — Vault ist sauber.")
         lines.append("")
@@ -7477,7 +7477,7 @@ def write_health_report(data: dict, autofixes: list, proposals: list) -> Path:
         issues_blocks.append("\n".join(b))
 
     if issues_blocks:
-        lines.append("## ⚠️ Issues (read-only)")
+        lines.append("## Issues (read-only)")
         lines.append("")
         for block in issues_blocks:
             lines.append(block)
@@ -7486,7 +7486,7 @@ def write_health_report(data: dict, autofixes: list, proposals: list) -> Path:
     # ── Migrations-Backlog (Pre-Bot-Files, separater Bucket) ──
     if data.get("legacy_files"):
         legacy = data["legacy_files"]
-        lines.append(f"## 📦 Migrations-Backlog ({len(legacy)})")
+        lines.append(f"## Migrations-Backlog ({len(legacy)})")
         lines.append("")
         lines.append("Files mit Legacy-Naming (Spaces, Großbuchstaben), "
                      "die vor dem Bot existierten. Bot fasst sie nicht automatisch an. "
@@ -7502,7 +7502,7 @@ def write_health_report(data: dict, autofixes: list, proposals: list) -> Path:
     # ── 5y-Goal-Drift (Wochen/Monats/Quartals-File fehlt + Anker-Lücke) ──
     if data.get("goal_drift"):
         gd = data["goal_drift"]
-        lines.append(f"## 🎯 5y-Goal-Drift ({len(gd)})")
+        lines.append(f"## 5y-Goal-Drift ({len(gd)})")
         lines.append("")
         lines.append("Aktive Goal-System-Periode hat fehlende Files oder ausbleibende Anker. "
                      "Anker-Lücken >14 Tage zeigen: System ist zu schwer — kürzen statt aushalten.")
@@ -7513,7 +7513,7 @@ def write_health_report(data: dict, autofixes: list, proposals: list) -> Path:
 
     # ── Pending Approvals ──
     if proposals:
-        lines.append(f"## 🔧 Pending Approvals ({len(proposals)})")
+        lines.append(f"## Pending Approvals ({len(proposals)})")
         lines.append("")
         for i, p in enumerate(proposals, 1):
             lines.append(f"### {i}. {p['summary']}")
@@ -7763,7 +7763,7 @@ def compute_briefing() -> str:
     """
     # Vault-Reachability-Check
     if not VAULT.exists() or not VAULT.is_dir():
-        return f"❌ <b>Briefing fehlgeschlagen</b>\nVault unter <code>{VAULT}</code> nicht erreichbar.\nMount oder Container-Volume prüfen."
+        return f"<b>Briefing fehlgeschlagen.</b>\nVault unter <code>{VAULT}</code> nicht erreichbar.\nMount oder Container-Volume prüfen."
 
     today = today_iso()
     # Punkt-Format YYYY.MM.DD — Julius-Präferenz statt ISO mit Bindestrich
@@ -7824,7 +7824,9 @@ def compute_briefing() -> str:
         if health_today.exists():
             try:
                 content = health_today.read_text(encoding="utf-8")
-                m = re.search(r"##\s+✅\s+Auto-Fixed\s+\((\d+)\)", content)
+                # Backward-Compat: matched mit oder ohne ✅ (alte Reports
+                # haben das Emoji noch im Header)
+                m = re.search(r"##\s+(?:✅\s+)?Auto-Fixed\s+\((\d+)\)", content)
                 if m and int(m.group(1)) > 0:
                     parts.append(f"• {m.group(1)} Auto-Fixes über Nacht durchgeführt")
                 # Issues-Counter: nur die offiziellen Issue-Headlines aus Schicht 1
@@ -8090,22 +8092,22 @@ async def goal_anchor_reminder_job(ctx: ContextTypes.DEFAULT_TYPE):
         if is_quarter_start:
             anchor_action = "quarterly"
             msg = (
-                "🌅 <b>Sonntag-Anker</b> — heute auch <b>Quartals-Anker</b> (90 Min)\n\n"
-                "📊 Excel öffnen + Säulen-Review:\n"
+                "<b>Sonntag-Anker</b> — heute auch <b>Quartals-Anker</b> (90 Min)\n\n"
+                "Excel öffnen + Säulen-Review:\n"
                 "<code>OneDrive\\…\\1_Privat\\08_Sonstiges\\Goals\\5-Jahres-Ziel_Tracker.xlsx</code>\n\n"
                 "Antworte mit <b>start</b> oder <b>ja</b> um zu beginnen, <b>skip</b> falls heute nicht."
             )
         elif is_first_sunday:
             anchor_action = "monthly"
             msg = (
-                "🌅 <b>Sonntag-Anker</b> — heute auch <b>Monats-Anker</b> (60 Min, ersetzt Wochen-Anker)\n\n"
+                "<b>Sonntag-Anker</b> — heute auch <b>Monats-Anker</b> (60 Min, ersetzt Wochen-Anker)\n\n"
                 "Bilanz aller 6 Säulen + Monats-Ziele für nächsten Monat.\n\n"
                 "Antworte mit <b>start</b> oder <b>ja</b> um zu beginnen, <b>skip</b> falls heute nicht."
             )
         else:
             anchor_action = "weekly"
             msg = (
-                "🌅 <b>Sonntag-Anker</b> (30-45 Min) — bereit für die Wochen-Reflexion?\n\n"
+                "<b>Sonntag-Anker</b> (30-45 Min) — bereit für die Wochen-Reflexion?\n\n"
                 "Antworte mit <b>start</b> oder <b>ja</b> um zu beginnen, oder <b>skip</b> falls heute nicht."
             )
 
@@ -8213,13 +8215,13 @@ async def handle_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "• \"X erledigt\" → markiert Task als done\n"
         "• \"lösche X\" → fragt nach Bestätigung\n\n"
         "<b>Multimedia:</b>\n"
-        "🎤 Sprachnachricht → transkribiert + sortiert\n"
-        "🖼 Foto → in 09_Attachments + Vision-Caption + OCR (Tesseract de+en)\n"
-        "📄 .md/.txt → in 01_Raw/uploads/\n"
-        "📑 .pdf → in 01_Raw/papers/ + Volltext-Extraktion + .md-Wrapper für Suche\n"
-        "📝 .docx → in 01_Raw/uploads/ + Text+Tabellen-Extraktion + .md-Wrapper\n"
-        "📎 sonstige Files → in 09_Attachments\n"
-        "🔗 URL allein → fragt ob clippen\n\n"
+        "Sprachnachricht → transkribiert + sortiert\n"
+        "Foto → in 09_Attachments + Vision-Caption + OCR (Tesseract de+en)\n"
+        ".md/.txt → in 01_Raw/uploads/\n"
+        ".pdf → in 01_Raw/papers/ + Volltext-Extraktion + .md-Wrapper für Suche\n"
+        ".docx → in 01_Raw/uploads/ + Text+Tabellen-Extraktion + .md-Wrapper\n"
+        "sonstige Files → in 09_Attachments\n"
+        "URL allein → fragt ob clippen\n\n"
         "<b>Commands:</b>\n"
         "/today — heutige Daily anzeigen\n"
         "/briefing — Tagesbriefing (überfällig + offen + heute)\n"
@@ -8262,7 +8264,7 @@ def main():
     missing_handlers = declared - handled
     orphan_handlers = handled - declared
     if missing_handlers:
-        log.error(f"❌ Tools im Schema OHNE Handler: {sorted(missing_handlers)}")
+        log.error(f"Tools im Schema OHNE Handler: {sorted(missing_handlers)}")
         return
     if orphan_handlers:
         log.warning(f"⚠️  Handler ohne Tool-Schema (für LLM unsichtbar): {sorted(orphan_handlers)}")
