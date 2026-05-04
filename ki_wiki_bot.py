@@ -8439,6 +8439,14 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    # Boot-Banner mit aktiver Konfiguration — hilft bei Diagnose ob ENV-
+    # Änderungen (z.B. Modell-Switch) wirklich beim Container ankommen.
+    log.info(f"=== KI-OS Bot startet ===")
+    log.info(f"  Modell:    {LLM_MODEL}")
+    log.info(f"  Endpoint:  {LLM_BASE_URL}")
+    log.info(f"  Vault:     {VAULT}")
+    log.info(f"  Timezone:  {TIMEZONE.key}")
+    log.info(f"  Anthropic-Cache: {'aktiv' if USE_ANTHROPIC_CACHE else 'aus'}")
     log.info("Polling started.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
