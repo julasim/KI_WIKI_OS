@@ -2691,7 +2691,7 @@ def backup_vault() -> str:
             return "✓ Keine Änderungen seit letztem Backup."
 
         # Commit
-        commit_msg = f"Backup {datetime.now().isoformat(timespec='seconds')}"
+        commit_msg = f"Backup {datetime.now(TIMEZONE).isoformat(timespec='seconds')}"
         r = _run(["git", "commit", "-m", commit_msg], cwd=backup_dir)
         if r.returncode != 0:
             return f"Commit-Fehler: {r.stderr}"
@@ -2712,7 +2712,7 @@ def backup_vault() -> str:
         return (f"✓ Backup gepusht\n"
                 f"Repo: {repo}@{commit_hash}\n"
                 f"Files: {file_count} .md\n"
-                f"Zeit: {datetime.now().strftime('%H:%M:%S')}")
+                f"Zeit: {datetime.now(TIMEZONE).strftime('%H:%M:%S')}")
 
     except subprocess.TimeoutExpired:
         return "Backup-Fehler: Timeout (>60s). Repo zu groß oder Netz langsam?"
@@ -5623,8 +5623,21 @@ async def llm_loop(user_text: str, user_id: int) -> str:
     now_local = datetime.now(TIMEZONE)
     tz_str = TIMEZONE.key if hasattr(TIMEZONE, "key") else str(TIMEZONE)
 
-    # Dynamischer Block — ändert sich pro Call, nicht gecacht
-    dynamic_block = f"\n\n# AKTUELLER ZUSTAND\n\nHeute ist {today_iso()}, jetzt {now_local.strftime('%H:%M')} ({tz_str}).\n"
+    # Dynamischer Block — ändert sich pro Call, nicht gecacht.
+    # Wochentag EXPLIZIT setzen — LLMs (auch Sonnet) berechnen Datum→Wochentag
+    # oft falsch. User-Bug 2026-05-04: Bot dachte Mo sei So weil ISO-Datum
+    # alleine nicht reicht. Plus DE-Format für menschliche Lesbarkeit.
+    _WD_DE = ["Montag", "Dienstag", "Mittwoch", "Donnerstag",
+              "Freitag", "Samstag", "Sonntag"]
+    _MO_DE = ["", "Januar", "Februar", "März", "April", "Mai", "Juni",
+              "Juli", "August", "September", "Oktober", "November", "Dezember"]
+    wd_name = _WD_DE[now_local.weekday()]
+    de_date = f"{now_local.day:02d}. {_MO_DE[now_local.month]} {now_local.year}"
+    dynamic_block = (
+        f"\n\n# AKTUELLER ZUSTAND\n\n"
+        f"Heute ist **{wd_name}, {de_date}** "
+        f"(ISO: {today_iso()}), jetzt {now_local.strftime('%H:%M')} ({tz_str}).\n"
+    )
 
     # ─── Memory-Tiers in dynamischen Block einspeisen ───
     prefs = get_preferences()
