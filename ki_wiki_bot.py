@@ -7807,16 +7807,17 @@ def apply_health_action(action: str) -> str:
 def compute_briefing() -> str:
     """Generiere die morgendliche Zusammenfassung als HTML-String.
 
-    Slim-Version (2026-05-03 — Julius-Spec):
+    Slim-Version (2026-05-03 — Julius-Spec, erweitert 2026-05-04):
     - Header mit Name + Punkt-Datum
     - Heute geplant (aus Daily 'Heute'-Sektion, wenn vorhanden)
     - Erinnerungen heute
     - Meetings heute (Platz für künftige Calendar-Integration)
-    - Überfällig — nur Counter (Details kommen ins Web-Dashboard)
+    - Überfällig — Liste mit Titel + Priority + 'vor Xd'
+    - Heute fällig — Liste mit Titel + Priority
     - Vault-Pflege
 
     Bewusst RAUS (im Dashboard sichtbar, nicht im täglichen Push):
-    - Detaillierte Offene-Tasks-Liste
+    - Andere offene Tasks (nodate / später)
     - Gestern Abends-Reflexion
     - 5y-Goal-Block
     - "Was hast du sonst vor heute?"-Trigger
@@ -7862,15 +7863,38 @@ def compute_briefing() -> str:
         for m in data["meetings"][:5]:
             parts.append(f"• {_esc_html(str(m['title']))}")
 
-    # ─── Überfällig — nur Counter (Details im Web-Dashboard) ───
+    # ─── Überfällig — Liste mit Details (User-Spec 2026-05-04) ───
+    today_date = data["today"]
     if data["overdue_tasks"]:
         n = len(data["overdue_tasks"])
         suffix = "Task" if n == 1 else "Tasks"
-        parts.append(f"\n<b>{n} überfällige {suffix}</b>")
+        parts.append(f"\n<b>Überfällig ({n} {suffix})</b>")
+        for t in data["overdue_tasks"][:8]:
+            prio = PRIO_SYMBOLS.get(t.get("priority"), PRIO_SYMBOLS["medium"])
+            due_d = _due_to_date(t.get("due"))
+            if due_d is not None:
+                delta = (today_date - due_d).days
+                due_disp = f" <i>(vor {delta}d)</i>"
+            else:
+                due_disp = ""
+            parts.append(f"{prio} {_esc_html(str(t['title']))}{due_disp}")
+        if n > 8:
+            parts.append(f"<i>… und {n - 8} weitere</i>")
+
+    # ─── Heute fällig — Liste mit Details ───
+    if data["today_tasks"]:
+        n = len(data["today_tasks"])
+        suffix = "Task" if n == 1 else "Tasks"
+        parts.append(f"\n<b>Heute fällig ({n} {suffix})</b>")
+        for t in data["today_tasks"][:10]:
+            prio = PRIO_SYMBOLS.get(t.get("priority"), PRIO_SYMBOLS["medium"])
+            parts.append(f"{prio} {_esc_html(str(t['title']))}")
+        if n > 10:
+            parts.append(f"<i>… und {n - 10} weitere</i>")
 
     # ─── Wenn nichts da: gentle morning ───
-    has_anything = (data["overdue_tasks"] or data["reminders"]
-                    or data["meetings"] or today_path.exists())
+    has_anything = (data["overdue_tasks"] or data["today_tasks"]
+                    or data["reminders"] or data["meetings"] or today_path.exists())
     if not has_anything:
         parts.append("\n<i>Heute steht noch nichts an.</i>")
 
