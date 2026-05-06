@@ -87,7 +87,12 @@ class _MCPAsyncClient:
         self._lock = asyncio.Lock()
 
     async def _ensure_session(self) -> Any:
-        """Stellt sicher dass eine offene Session da ist. Lock-protected."""
+        """Stellt sicher dass eine offene Session da ist. Lock-protected.
+
+        Bei Initialize-Failure (z.B. 401 Unauthorized) wird der Stack
+        defensive-cleaned, ohne dass die Original-Exception unter einem
+        Cleanup-Error verschwindet.
+        """
         if self._session is not None:
             return self._session
         async with self._lock:
@@ -97,30 +102,52 @@ class _MCPAsyncClient:
             from mcp import ClientSession
             from mcp.client.streamable_http import streamablehttp_client
 
-            self._stack = AsyncExitStack()
+            stack = AsyncExitStack()
             headers = {}
             if self.token:
                 headers["Authorization"] = f"Bearer {self.token}"
-            # streamablehttp_client kommt als async-context — managed durch Stack
-            read, write, _ = await self._stack.enter_async_context(
-                streamablehttp_client(self.url, headers=headers, timeout=self.timeout)
-            )
-            session = await self._stack.enter_async_context(ClientSession(read, write))
-            await session.initialize()
+            try:
+                # streamablehttp_client kommt als async-context — managed durch Stack
+                read, write, _ = await stack.enter_async_context(
+                    streamablehttp_client(self.url, headers=headers, timeout=self.timeout)
+                )
+                session = await stack.enter_async_context(ClientSession(read, write))
+                await session.initialize()
+            except BaseException as e:
+                # Init failed — Stack zuruecksetzen damit kein Half-State bleibt.
+                # aclose() kann selbst failen (anyio Cancel-Scope-Issue bei
+                # nested-tasks) — wir loggen aber re-raisen die ECHTE Init-Exception.
+                try:
+                    await stack.aclose()
+                except BaseException as cleanup_e:  # noqa: BLE001
+                    log.debug("Cleanup nach Init-Fail: %s (ignoriert)", cleanup_e)
+                self._stack = None
+                self._session = None
+                # Re-raise als MCPError mit klarer Diagnose
+                if "401" in str(e) or "Unauthorized" in str(e):
+                    raise MCPError(
+                        f"401 Unauthorized — MCP_TOKEN fehlt/falsch. "
+                        f"Pruefe: docker exec ki-os-bot env | grep MCP_TOKEN"
+                    ) from e
+                raise MCPError(f"Connect-Fail: {type(e).__name__}: {e}") from e
+            self._stack = stack
             self._session = session
             log.info("MCP-Client: session ready")
             return self._session
 
     async def close(self) -> None:
-        """Sauber Verbindung schliessen. Idempotent."""
+        """Sauber Verbindung schliessen. Idempotent + tolerant gegen
+        anyio Cancel-Scope-Errors (bekanntes Issue bei async-nested-context).
+        """
         async with self._lock:
-            if self._stack is not None:
-                try:
-                    await self._stack.aclose()
-                except Exception as e:  # noqa: BLE001
-                    log.warning("MCP-Client close: %s", e)
+            stack = self._stack
             self._stack = None
             self._session = None
+            if stack is not None:
+                try:
+                    await stack.aclose()
+                except BaseException as e:  # noqa: BLE001
+                    log.debug("MCP-Client close (ignoriert): %s", e)
 
     async def call(self, tool_name: str, args: dict | None = None) -> Any:
         """Ruft `tool_name` mit `args` auf, returnt geparsten Output.
