@@ -136,6 +136,8 @@ async def main() -> int:
             ("task(create no title)", thin.task(action="create")),
             ("append_to_daily(empty text)",
              thin.append_to_daily(section="Notizen & Gedanken", text="")),
+            # Phase X3d: read-only Aggregator
+            ("goal_status(scope=drift)", thin.goal_status(scope="drift")),
         ]:
             try:
                 r = await coro

@@ -336,7 +336,102 @@ async def task(
     return f"Unbekannte action: {action!r}. Erlaubt: create, done, reopen, update."
 
 
+# ─── Maintain-Tools (Phase X3d) ──────────────────────────────────────────────
+
+
+async def goal_status(scope: str = "all", saeule: str | None = None,
+                      goal: str = "5y-2031") -> str:
+    """Goal-System-Status via MCP `goal_status_check`.
+
+    Bot-LLM-Kontrakt: HTML-formatted output mit Tag-Countdown + Saeulen +
+    Habits-Score + Sport-Count + Drift-Anker. Format-kompatibel zur alten
+    lokalen goal_status-Funktion (siehe ki_wiki_bot.py:4313).
+
+    Tag-Countdown wird lokal berechnet (reine Date-Arithmetik, kein Vault-IO).
+    Rest kommt von MCP.
+    """
+    try:
+        data = await mcp.goal_status_check()
+    except MCPError as e:
+        return _err_str("goal_status", e)
+
+    if not isinstance(data, dict):
+        return f"goal_status: unerwartetes Format {type(data).__name__}"
+
+    from datetime import date as _date
+    parts: list[str] = []
+
+    # ─── Header: Tag-Countdown ─────────────────────────────────────────────
+    if goal == "5y-2031":
+        target = _date(2031, 5, 1)
+        today = _date.today()
+        days_left = (target - today).days
+        if days_left > 0:
+            parts.append(f"<b>5y-2031</b> · {days_left} Tage bis Stichtag (01.05.2031)")
+        elif days_left == 0:
+            parts.append(f"<b>5y-2031</b> · STICHTAG HEUTE (01.05.2031)")
+        else:
+            parts.append(f"<b>5y-2031</b> · Stichtag {-days_left} Tage vergangen (01.05.2031)")
+    else:
+        parts.append(f"<b>Goal {goal}</b>")
+    parts.append("")
+
+    s = (scope or "all").strip().lower()
+
+    # Saeulen-Block: MCP liefert dies aktuell nicht in goal_status_check —
+    # das hat MCP's read_saeulen. Wir ziehen separat.
+    if s in ("all", "saeule"):
+        try:
+            saeulen_data = await mcp.read_saeulen()
+            if isinstance(saeulen_data, dict):
+                saeulen_list = saeulen_data.get("saeulen") or []
+                if saeulen_list:
+                    parts.append("<b>Saeulen</b> (Status manuell gepflegt in saeulen.md / readme.md)")
+                    for sa in saeulen_list:
+                        parts.append(f"  {sa.get('label', '?'):<14} – {sa.get('kpi', '')}")
+                    parts.append("")
+        except MCPError:
+            pass  # nicht kritisch wenn Saeulen-Read fehlt
+
+    # Habits-Score
+    if s in ("all", "habits"):
+        h = data.get("habits_7d") or {}
+        check = h.get("check", 0)
+        possible = h.get("possible", 0)
+        parts.append(f"<b>Habits</b> letzte 7 Tage: {check} ✓ / {possible} möglich")
+        if possible > 0:
+            pct = int(check / possible * 100)
+            parts.append(f"   Quote: {pct}% (Soll: ≥80%)")
+        parts.append("")
+
+    # Sport
+    if s in ("all", "sport"):
+        sp = data.get("sport") or {}
+        parts.append(
+            f"🏃 <b>Sport</b> letzte 30 Tage: {sp.get('d30', 0)} Sessions · "
+            f"letzte 7 Tage: {sp.get('d7', 0)}"
+        )
+        parts.append("   Wochen-Soll: 3 Sessions (2× Cardio + 1× Kraft)")
+        parts.append("")
+
+    # Drift
+    if s in ("all", "drift"):
+        drift = data.get("drift") or {}
+        parts.append("⚠️ <b>Drift-Detektor</b>")
+        for label, key in (
+            ("Letzter Wochen-Anker", "weekly"),
+            ("Letzter Monats-Anker", "monthly"),
+            ("Letzter Quartals-Anker", "quarterly"),
+        ):
+            entry = drift.get(key) or {}
+            value = entry.get("value", "?")
+            parts.append(f"   {label}: {value}")
+
+    return "\n".join(parts)
+
+
 __all__ = [
     "search_vault", "read_file", "list_files",
     "append_to_daily", "create_note", "create_meeting", "task",
+    "goal_status",
 ]

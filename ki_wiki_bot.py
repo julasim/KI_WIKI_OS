@@ -5287,7 +5287,8 @@ TOOL_HANDLERS = {
     "cancel_reminder": cancel_reminder,
     "goal_log": goal_log,
     "goal_anchor": goal_anchor,
-    "goal_status": goal_status,
+    # Phase X3d: goal_status via MCP (read-only Aggregator).
+    "goal_status": (mcp_thin_tools.goal_status if _MCP_THIN_AVAILABLE else goal_status),
     "backup_vault": backup_vault,
 }
 
@@ -8075,15 +8076,37 @@ def reset_recurring_tasks() -> dict:
 async def recurring_task_reset_job(ctx: ContextTypes.DEFAULT_TYPE):
     """JobQueue-Callback — läuft täglich vor dem Briefing.
 
-    Setzt fällige recurring Tasks zurück auf 'open'. Schreibt nichts an User
-    (das Briefing-Job zeigt die reaktivierten Tasks ja in der Daily-Note).
+    Phase X3d: callt jetzt MCP `task_reactivate_recurring` statt lokal
+    `reset_recurring_tasks`. MCP-Pipeline laueft eh alle 10 Min, dieser
+    explizite Call ist nur noch Sicherheits-Net falls Pipeline gerade
+    zwischen 04:50 und 05:00 nichts erwischt hat (off-by-window).
+
+    Bei Outage des MCP-Servers: Fallback auf lokale Implementierung
+    (gleiche Funktion war bisher Standard).
     """
     try:
+        if _MCP_THIN_AVAILABLE:
+            from mcp_client import mcp as _mcp, MCPError as _MCPError
+            try:
+                stats = await _mcp.task_reactivate_recurring()
+                reactivated = stats.get("reactivated") or []
+                checked = stats.get("checked", 0)
+                if reactivated:
+                    log.info(f"recurring-reset (MCP): {len(reactivated)}/{checked} reaktiviert: {reactivated}")
+                else:
+                    log.info(f"recurring-reset (MCP): {checked} Tasks geprüft, keine fällig")
+                # Bot-Cache invalidieren da Tasks heute Status-Wechsel hatten
+                if reactivated:
+                    invalidate_today_data_cache()
+                return
+            except _MCPError as e:
+                log.warning(f"recurring-reset MCP fail, fallback lokal: {e}")
+        # Fallback lokal (oder wenn _MCP_THIN_AVAILABLE=False)
         stats = await asyncio.to_thread(reset_recurring_tasks)
         if stats["reactivated"]:
-            log.info(f"recurring-reset: {len(stats['reactivated'])}/{stats['checked']} reaktiviert: {stats['reactivated']}")
+            log.info(f"recurring-reset (lokal): {len(stats['reactivated'])}/{stats['checked']} reaktiviert: {stats['reactivated']}")
         else:
-            log.info(f"recurring-reset: {stats['checked']} Tasks geprüft, keine fällig")
+            log.info(f"recurring-reset (lokal): {stats['checked']} Tasks geprüft, keine fällig")
     except Exception as e:
         log.exception(f"recurring_task_reset_job failed: {e}")
 
