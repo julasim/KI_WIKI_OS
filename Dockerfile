@@ -19,6 +19,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Bot-Code
 COPY ki_wiki_bot.py .
+# Phase X3 Thin-Client: MCP-HTTP-Session + Tool-Wrapper
+COPY mcp_client.py .
+COPY mcp_thin_tools.py .
+# Smoke-Tests + Maintenance-Scripts (Diagnostik im Container)
+COPY scripts/ ./scripts/
 
 # Whisper-Modell-Cache wird persistiert über Volume
 ENV HF_HOME=/root/.cache/huggingface
