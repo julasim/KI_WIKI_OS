@@ -200,6 +200,45 @@ async def create_note(
     return f"Note angelegt: [[{note_id}]]{suffix}"
 
 
+async def create_project(
+    name: str,
+    description: str | None = None,
+    parent: str | None = None,
+    tags: list | None = None,
+) -> str:
+    """Projekt-Container anlegen via MCP `create_project`.
+
+    LLM-Kontrakt (Format-kompatibel zur alten Bot-Funktion):
+      "Projekt angelegt: [[project-<slug>]]" (+ optional " (Subprojekt von ...)")
+      ODER "Projekt existiert bereits: [[project-<slug>]] (`<path>/`)"
+    """
+    if not name or not name.strip():
+        return "Fehler: Projekt-Name darf nicht leer sein."
+    try:
+        res = await mcp.create_project(
+            name=name,
+            description=description or "",
+            parent=parent,
+            tags=tags or [],
+        )
+    except MCPError as e:
+        return _err_str("create_project", e)
+
+    if not isinstance(res, dict):
+        return f"create_project: unerwartetes Format {type(res).__name__}"
+    slug = res.get("slug", "?")
+    pid = res.get("id", f"project-{slug}")
+    status = res.get("status", "?")
+    if status == "exists":
+        return f"Projekt existiert bereits: [[{pid}]] (`{res.get('path', '?')}/`)"
+    parent_info = f" (Subprojekt von `{parent}`)" if parent else ""
+    return (
+        f"Projekt angelegt: [[{pid}]]{parent_info}\n"
+        f"Ordner: `{res.get('path', '?')}/` (README + CONTEXT.md)\n"
+        f"Tipp: `project_context(action='activate', slug='{slug}')` schaltet Projekt-Kontext im Bot scharf."
+    )
+
+
 async def create_meeting(
     title: str,
     attendees: list | None = None,
@@ -827,7 +866,7 @@ DELETE_CONFIRM_TIMEOUT = 300
 
 __all__ = [
     "search_vault", "read_file", "list_files",
-    "append_to_daily", "create_note", "create_meeting", "task",
+    "append_to_daily", "create_note", "create_meeting", "create_project", "task",
     "goal_status",
     "edit_file", "move",
     "list_open_tasks", "get_today_agenda", "compute_briefing",

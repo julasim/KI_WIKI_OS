@@ -1534,6 +1534,20 @@ TOOLS = [
         }
     }},
     {"type": "function", "function": {
+        "name": "create_project",
+        "description": "Neuen Projekt-Container unter 05_Projects/<slug>/ anlegen. parent=<slug> macht Subprojekt. Erstellt README mit Dataview + leere CONTEXT.md.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Anzeige-Name; wird zu slug konvertiert"},
+                "description": {"type": "string"},
+                "parent": {"type": "string", "description": "Slug eines existierenden Projekts fuer Subprojekt"},
+                "tags": {"type": "array", "items": {"type": "string"}}
+            },
+            "required": ["name"]
+        }
+    }},
+    {"type": "function", "function": {
         "name": "search_vault",
         "description": "Volltext-Regex-Suche durch alle .md-Files im Vault.",
         "parameters": {
@@ -1740,6 +1754,7 @@ TOOL_HANDLERS = {
     "append_to_daily":  mcp_thin_tools.append_to_daily,
     "create_note":      mcp_thin_tools.create_note,
     "create_meeting":   mcp_thin_tools.create_meeting,
+    "create_project":   mcp_thin_tools.create_project,
     "task":             mcp_thin_tools.task,
     "goal_status":      mcp_thin_tools.goal_status,
     "edit_file":        mcp_thin_tools.edit_file,
@@ -1782,6 +1797,7 @@ SYSTEM_PROMPT = """Du bist Julius' Vault-Assistent ueber Telegram. Deutsch, dire
 - "loesche X" → `request_delete` (Default Archiv); "endgueltig/hart" → permanent=true; mehrere Files → rel_paths=[...]
 - "ja/bestaetigt" nach request_delete → `confirm_delete()`; "nein/abbrechen" → `confirm_delete(action='cancel')`
 - "verschieb A nach B" → `move(src='A', dst='B')`; mehrere → `move(srcs=[...], dst='ordner/')`; Subprojekt → `move(project_slug='X', parent='Y')`
+- "neues Projekt X" → `create_project(name='X')` (direkt anlegen, nicht nachfragen); Subprojekt → `create_project(name='X', parent='Y')`
 - "erinner mich um Y/in N Min/taeglich um Z" → `create_reminder` (when_iso = absolute Lokalzeit, optional recurrence)
 - "welche Reminder/cancel" → `list_reminders` / `cancel_reminder`
 - "wo stehe ich/5y-Status" → `goal_status` (scope=all/saeule/habits/sport/drift)
