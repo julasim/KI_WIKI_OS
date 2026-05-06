@@ -430,8 +430,116 @@ async def goal_status(scope: str = "all", saeule: str | None = None,
     return "\n".join(parts)
 
 
+# ─── Edit + Move (Phase X3 Erweiterung) ──────────────────────────────────────
+
+
+async def edit_file(rel_path: str, find: str, replace: str, regex: bool = False) -> str:
+    """Find/Replace in einem File via MCP `edit_file_replace`.
+
+    Bot-LLM-Kontrakt unveraendert: Result-String "<n>x ersetzt in <path>"
+    oder "Kein Treffer fuer <find> in <path>".
+
+    MCP-Tool macht ReDoS-Schutz, File-Size-Cap (5MB), Pattern-Length-Cap (500).
+    """
+    if not isinstance(find, str) or not find:
+        return "Edit-Fehler: 'find' muss nicht-leerer String sein."
+    if not isinstance(replace, str):
+        return "Edit-Fehler: 'replace' muss String sein."
+    try:
+        res = await mcp.edit_file_replace(
+            path=rel_path, find=find, replace=replace, regex=regex
+        )
+    except MCPError as e:
+        return _err_str("edit_file", e)
+
+    if not isinstance(res, dict):
+        return f"edit_file: unerwartetes Format {type(res).__name__}"
+    n = res.get("replacements", 0)
+    if n == 0:
+        return f"Kein Treffer fuer {find[:50]!r} in {rel_path}"
+    return f"{n}x ersetzt in {rel_path}"
+
+
+async def move(
+    src: str | None = None,
+    srcs: list | None = None,
+    dst: str | None = None,
+    project_slug: str | None = None,
+    parent: str | None = None,
+    overwrite: bool = False,
+) -> str:
+    """Konsolidiertes Move-Tool — drei Modi je nach Args:
+
+    a) Einzeln: move(src='foo.md', dst='bar.md') → MCP move
+    b) Bulk:    move(srcs=['a.md','b.md'], dst='ordner/') → MCP move_bulk
+    c) Projekt: move(project_slug='matura', parent='dachboden') → MCP move_project
+
+    Bot-LLM-Kontrakt unveraendert: kompakte Result-Strings wie alte Bot-Funktion.
+    """
+    # Mode c) Projekt
+    if project_slug:
+        try:
+            res = await mcp.move_project(slug=project_slug, parent=parent)
+        except MCPError as e:
+            return _err_str("move_project", e)
+        if not isinstance(res, dict):
+            return f"move_project: unerwartetes Format {type(res).__name__}"
+        if res.get("status") == "no_change":
+            return f"Projekt liegt bereits an Zielposition: `{res.get('new_path')}/`"
+        old_p = res.get("old_path", "?")
+        new_p = res.get("new_path", "?")
+        info = f" (jetzt Subprojekt von `{parent}`)" if parent else " (jetzt Top-Level)"
+        return f"OK Projekt verschoben: `{old_p}/` -> `{new_p}/`{info}"
+
+    # Defensive: LLM koennte src statt srcs senden mit Liste
+    if isinstance(src, list) and not srcs:
+        srcs = src
+        src = None
+
+    # Mode b) Bulk
+    if srcs:
+        if not dst:
+            return "Fehler: dst (Ziel-Ordner) noetig fuer Bulk-Move."
+        if not isinstance(srcs, list):
+            return "Fehler: srcs muss eine Liste sein."
+        try:
+            res = await mcp.move_bulk(sources=srcs, dest_dir=dst, overwrite=overwrite)
+        except MCPError as e:
+            return _err_str("move_bulk", e)
+        if not isinstance(res, dict):
+            return f"move_bulk: unerwartetes Format {type(res).__name__}"
+        moved = res.get("moved") or []
+        failed = res.get("failed") or []
+        parts = [f"OK {len(moved)} verschoben -> `{dst}/`"]
+        if moved:
+            preview = ", ".join(moved[:8]) + (f" (+{len(moved)-8})" if len(moved) > 8 else "")
+            parts.append("  " + preview)
+        if failed:
+            parts.append(f"FAIL {len(failed)} fehlgeschlagen:")
+            for f in failed[:5]:
+                parts.append(f"  - {f.get('name', '?')}: {f.get('reason', '?')}")
+            if len(failed) > 5:
+                parts.append(f"  - (+{len(failed)-5} weitere)")
+        return "\n".join(parts)
+
+    # Mode a) Einzeln
+    if src:
+        if not dst:
+            return "Fehler: dst noetig fuer Einzel-Move."
+        try:
+            res = await mcp.move(source=src, dest=dst)
+        except MCPError as e:
+            return _err_str("move", e)
+        if not isinstance(res, dict):
+            return f"move: unerwartetes Format {type(res).__name__}"
+        return f"OK verschoben: `{src}` -> `{dst}`"
+
+    return "Fehler: keiner der drei Modi erkannt — gib src+dst ODER srcs+dst ODER project_slug an."
+
+
 __all__ = [
     "search_vault", "read_file", "list_files",
     "append_to_daily", "create_note", "create_meeting", "task",
     "goal_status",
+    "edit_file", "move",
 ]

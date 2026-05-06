@@ -1230,280 +1230,26 @@ def get_today_agenda() -> str:
 # LLM-Tool 'read_file' laeuft via mcp_thin_tools.read_file() → MCP.
 
 
-def move_path(src_rel: str, dst_rel: str, overwrite: bool = False) -> str:
-    """Verschiebt/Renamet eine Datei oder einen Ordner innerhalb des Vaults.
-
-    src_rel + dst_rel sind relativ zum Vault-Root. Path-Traversal-geschützt
-    via safe_path. Wenn dst ein bestehender Ordner ist, wird src reingelegt.
-    Wenn dst nicht existiert, wird src nach dst umbenannt/verschoben.
-
-    overwrite=False (default): bricht ab wenn Ziel existiert.
-    overwrite=True: überschreibt — nur nutzen wenn explizit gewollt.
-    """
-    if not src_rel or not src_rel.strip():
-        return "Fehler: src darf nicht leer sein."
-    if not dst_rel or not dst_rel.strip():
-        return "Fehler: dst darf nicht leer sein."
-    try:
-        src = safe_path(src_rel)
-        dst = safe_path(dst_rel)
-    except ValueError as e:
-        return f"Pfad-Fehler: {e}"
-
-    if not src.exists():
-        return f"Quelle nicht gefunden: {src_rel}"
-    if src == VAULT.resolve():
-        return "Fehler: Vault-Root selbst kann nicht verschoben werden."
-
-    # Falls dst ein existierender Ordner ist → src darunter legen
-    if dst.is_dir():
-        final = dst / src.name
-    else:
-        final = dst
-
-    if final.exists():
-        if not overwrite:
-            return f"Ziel existiert bereits: {final.relative_to(VAULT).as_posix()} (overwrite=True um zu überschreiben)"
-        # Overwrite: erst alt löschen
-        if final.is_dir():
-            shutil.rmtree(final)
-        else:
-            final.unlink()
-
-    final.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        shutil.move(str(src), str(final))
-    except Exception as e:
-        return f"Move fehlgeschlagen: {e}"
-
-    src_rel_clean = src.relative_to(VAULT).as_posix()
-    final_rel = final.relative_to(VAULT).as_posix()
-    kind = "Ordner" if final.is_dir() else "Datei"
-    # Move kann .md-File in/aus Skip-Dirs (z.B. 99_Archive) bewegen → Index neu bauen
-    invalidate_link_index()
-    return f"✓ {kind} verschoben: `{src_rel_clean}` → `{final_rel}`"
+# ─── move_path entfernt (Phase X3 thin-client) ───────────────────
+# Funktion 'move_path' laeuft via MCP / mcp_thin_tools.
 
 
-def move_paths(srcs: list, dst_dir: str, overwrite: bool = False) -> str:
-    """Bulk-Move: verschiebt mehrere Dateien/Ordner auf einmal in dst_dir.
-
-    Spart massiv Tool-Calls bei Multi-File-Operationen (z.B. 6 Uploads in
-    Projekt verschieben). Pro Item wird Erfolg/Fehler einzeln gemeldet,
-    aber alle Items teilen sich denselben Tool-Call → Loop-Iterationen sparen.
-
-    srcs: Liste von vault-relativen Pfaden (Dateien oder Ordner)
-    dst_dir: vault-relatives Ziel-Verzeichnis (wird angelegt falls nicht da)
-    """
-    if not srcs or not isinstance(srcs, list):
-        return "Fehler: srcs muss eine nicht-leere Liste sein."
-    if not dst_dir or not dst_dir.strip():
-        return "Fehler: dst_dir darf nicht leer sein."
-    try:
-        dst = safe_path(dst_dir)
-    except ValueError as e:
-        return f"Pfad-Fehler dst_dir: {e}"
-
-    # dst_dir muss Ordner sein/werden — falls Datei mit gleichem Namen, ablehnen
-    if dst.exists() and not dst.is_dir():
-        return f"Ziel ist eine Datei, kein Ordner: {dst_dir}"
-    dst.mkdir(parents=True, exist_ok=True)
-
-    successes, failures = [], []
-    for src_rel in srcs:
-        if not isinstance(src_rel, str) or not src_rel.strip():
-            failures.append(f"(leerer Eintrag)")
-            continue
-        try:
-            src = safe_path(src_rel)
-        except ValueError as e:
-            failures.append(f"{src_rel}: Pfad-Fehler {e}")
-            continue
-        if not src.exists():
-            failures.append(f"{src_rel}: nicht gefunden")
-            continue
-        if src == VAULT.resolve():
-            failures.append(f"{src_rel}: Vault-Root unbeweglich")
-            continue
-        final = dst / src.name
-        if final.exists():
-            if not overwrite:
-                failures.append(f"{src.name}: Ziel existiert (overwrite=False)")
-                continue
-            try:
-                if final.is_dir():
-                    shutil.rmtree(final)
-                else:
-                    final.unlink()
-            except Exception as e:
-                failures.append(f"{src.name}: Overwrite-Cleanup fehlschlug: {e}")
-                continue
-        try:
-            shutil.move(str(src), str(final))
-            successes.append(src.name)
-        except Exception as e:
-            failures.append(f"{src.name}: {e}")
-
-    if successes:
-        invalidate_link_index()  # Files könnten in/aus Skip-Dirs verschoben sein
-
-    dst_rel_out = dst.relative_to(VAULT).as_posix()
-    parts = [f"✓ {len(successes)} verschoben → `{dst_rel_out}/`"]
-    if successes:
-        parts.append("  " + ", ".join(successes[:8]) + (f" (+{len(successes)-8})" if len(successes) > 8 else ""))
-    if failures:
-        parts.append(f"✗ {len(failures)} fehlgeschlagen:")
-        for f in failures[:5]:
-            parts.append(f"  • {f}")
-        if len(failures) > 5:
-            parts.append(f"  • (+{len(failures)-5} weitere)")
-    return "\n".join(parts)
+# ─── move_paths entfernt (Phase X3 thin-client) ───────────────────
+# Funktion 'move_paths' laeuft via MCP / mcp_thin_tools.
 
 
-def move_project(slug: str, parent: Optional[str] = None) -> str:
-    """Verschiebt ein bestehendes Projekt — entweder als Subprojekt unter `parent`,
-    oder zurück auf Top-Level wenn parent=None oder parent='' angegeben wird.
-
-    Nutzt rekursive Suche → findet Projekte überall unter 05_Projects/.
-    """
-    if not slug or not slug.strip():
-        return "Slug fehlt."
-    slug = slug.strip().lower()
-    if slug.startswith("project-"):
-        slug = slug[len("project-"):]
-    src = find_project_dir(slug)
-    if src is None:
-        return f"Projekt nicht gefunden (oder mehrdeutig): {slug}"
-
-    # Ziel bestimmen
-    if parent and parent.strip():
-        parent = parent.strip().lower()
-        if parent.startswith("project-"):
-            parent = parent[len("project-"):]
-        if parent == slug:
-            return "Fehler: Projekt kann nicht sich selbst als Parent haben."
-        parent_dir = find_project_dir(parent)
-        if parent_dir is None:
-            return f"Parent-Projekt nicht gefunden: {parent}"
-        # Prevent moving a project into its own subtree
-        try:
-            parent_dir.relative_to(src)
-            return f"Fehler: Parent `{parent}` liegt bereits unter `{slug}` — würde Schleife erzeugen."
-        except ValueError:
-            pass
-        dst = parent_dir / slug
-    else:
-        dst = PROJECTS_DIR / slug
-
-    if dst.resolve() == src.resolve():
-        return f"Projekt liegt bereits an Zielposition: `{src.relative_to(VAULT).as_posix()}/`"
-    if dst.exists():
-        return f"Ziel existiert bereits: `{dst.relative_to(VAULT).as_posix()}/`"
-
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        shutil.move(str(src), str(dst))
-    except Exception as e:
-        return f"Move fehlgeschlagen: {e}"
-
-    src_rel = src.relative_to(VAULT).as_posix()
-    dst_rel = dst.relative_to(VAULT).as_posix()
-    parent_info = f" (jetzt Subprojekt von `{parent}`)" if parent else " (jetzt Top-Level)"
-    invalidate_link_index()
-    return f"✓ Projekt verschoben: `{src_rel}/` → `{dst_rel}/`{parent_info}"
+# ─── move_project entfernt (Phase X3 thin-client) ───────────────────
+# Funktion 'move_project' laeuft via MCP / mcp_thin_tools.
 
 
-def move(src: Optional[str] = None, srcs: Optional[list] = None,
-         dst: Optional[str] = None,
-         project_slug: Optional[str] = None,
-         parent: Optional[str] = None,
-         overwrite: bool = False) -> str:
-    """Vereinheitlichtes Move-Tool — drei Use-Cases mit getrennten Feldern:
-
-    a) Einzeln: move(src='foo.md', dst='bar.md')
-    b) Bulk:    move(srcs=['a.md','b.md'], dst='ordner/')
-    c) Projekt: move(project_slug='matura', parent='dachboden-umbau')
-
-    Getrennte src/srcs-Felder statt anyOf — manche LLM-Provider
-    (OpenAI strict, Ollama-Cloud) lehnen anyOf in Tool-Schemas ab.
-
-    Defensive: src kann auch eine Liste sein (Tippfehler vom LLM) →
-    behandelt wie srcs.
-    """
-    if project_slug:
-        return move_project(project_slug, parent)
-    # Defensive: LLM könnte src statt srcs senden mit Liste
-    if isinstance(src, list) and not srcs:
-        srcs = src
-        src = None
-    if srcs:
-        if not dst:
-            return "Fehler: dst (Ziel-Ordner) nötig für Bulk-Move."
-        if not isinstance(srcs, list):
-            return "Fehler: srcs muss eine Liste sein."
-        return move_paths(srcs, dst, overwrite)
-    if src:
-        if not dst:
-            return "Fehler: dst nötig für Einzel-Move."
-        return move_path(src, dst, overwrite)
-    return "Fehler: keiner der drei Modi erkannt — gib src+dst ODER srcs+dst ODER project_slug an."
+# ─── move entfernt (Phase X3 thin-client) ───────────────────
+# Funktion 'move' laeuft via MCP / mcp_thin_tools.
 
 
-EDIT_FILE_MAX_BYTES = 5 * 1024 * 1024     # 5 MB — keine Massenfile-Edits
-EDIT_FILE_MAX_REGEX_LEN = 500              # Regex >500 Zeichen → wahrscheinlich Halluzination
-# Pathological-Regex-Patterns die ReDoS triggern können (nested quantifiers
-# auf demselben Pattern). Konservativ — fängt die häufigsten Fälle.
-_REDOS_PATTERNS = [
-    re.compile(r"\([^)]*[+*]\)[+*]"),     # (a+)+ / (a*)*
-    re.compile(r"\([^)]*\|[^)]*\)[+*]"),  # (a|a)+ / (a|b)*
-]
 
 
-def edit_file(rel_path: str, find: str, replace: str, regex: bool = False) -> str:
-    """Find/replace in a file.
-
-    SECURITY: rel_path via safe_path. Bei regex=True: ReDoS-Schutz via
-    Pattern-Heuristik + Längen-Cap. File-Cap 5MB gegen accidental DoS.
-    """
-    if not isinstance(find, str) or not find:
-        return "Edit-Fehler: 'find' muss nicht-leerer String sein."
-    if not isinstance(replace, str):
-        return "Edit-Fehler: 'replace' muss String sein."
-    try:
-        path = safe_path(rel_path)
-    except ValueError as e:
-        return f"Pfad-Fehler: {e}"
-    if not path.exists():
-        return f"Datei nicht gefunden: {rel_path}"
-    try:
-        # File-Size-Check VOR dem Lesen — verhindert OOM bei Riesen-Files
-        if path.stat().st_size > EDIT_FILE_MAX_BYTES:
-            return f"Datei zu groß für edit_file ({path.stat().st_size} > {EDIT_FILE_MAX_BYTES}B). Manuell editieren."
-        content = path.read_text(encoding="utf-8")
-        if regex:
-            # ReDoS-Schutz: Pattern-Länge + bekannte pathologische Patterns ablehnen
-            if len(find) > EDIT_FILE_MAX_REGEX_LEN:
-                return f"Regex zu lang ({len(find)} > {EDIT_FILE_MAX_REGEX_LEN}) — vereinfachen oder regex=false."
-            for redos_pat in _REDOS_PATTERNS:
-                if redos_pat.search(find):
-                    return (f"Regex-Pattern '{find[:60]}' enthält pathologisches "
-                            "Konstrukt (nested quantifier) — ReDoS-Risiko, abgelehnt. "
-                            "Vereinfache das Pattern oder nutze regex=false.")
-            try:
-                new, n = re.subn(find, replace, content)
-            except re.error as e:
-                return f"Regex-Syntax-Fehler in '{find[:50]}': {e}"
-        else:
-            n = content.count(find)
-            new = content.replace(find, replace)
-        if n == 0:
-            return f"Kein Treffer für '{find[:50]}' in {rel_path}"
-        atomic_write(path, new)
-        # Edit könnte Frontmatter (id/title/aliases) verändert haben → defensiv neu indexieren
-        if path.suffix == ".md":
-            invalidate_link_index()
-        return f"{n}× ersetzt in {rel_path}"
-    except Exception as e:
-        return f"Edit-Fehler: {e}"
+# ─── edit_file entfernt (Phase X3 thin-client) ───────────────────
+# Funktion 'edit_file' laeuft via MCP / mcp_thin_tools.
 
 
 CLIP_URL_TIMEOUT = 15  # Sekunden — verhindert dass slowloris-Server den Bot hängen lassen
@@ -2496,60 +2242,37 @@ def deactivate_project() -> str:
     return f"Aktives Projekt zurückgesetzt (war: {was or 'keins'})."
 
 
-def update_project_context(slug: str, text: str, mode: str = "append") -> str:
-    """Update CONTEXT.md eines Projekts. mode: 'append' (default) oder 'replace'."""
-    if not slug or not slug.strip():
-        return "Slug fehlt."
-    slug = slug.strip().lower()
-    if slug.startswith("project-"):
-        slug = slug[len("project-"):]
-    proj_dir = find_project_dir(slug)
-    if proj_dir is None:
-        return f"Projekt nicht gefunden: {slug}"
-    if mode not in ("append", "replace"):
-        mode = "append"
+# ─── project_context: Dispatcher fuer activate/deactivate/update ────────────
+# Phase X3d-thin: 'update'-Pfad via MCP, 'activate'/'deactivate' bleiben lokal
+# weil sie Bot-Memory (06_Meta/bot-memory/active-project.txt) anfassen, NICHT
+# Vault-Content. Diese Datei ist Bot-internal-state, nicht Single-Source-Material.
 
-    # Auto-Link bekannte Vault-IDs/Titles im Kontext-Text — exclude das Projekt selbst
-    linked_text = auto_link(text.strip(), exclude_ids={slug, f"project-{slug}"})
-
-    context_file = proj_dir / "CONTEXT.md"
-    header = (
-        f"# Kontext: {slug}\n\n"
-        "_Projekt-spezifischer Kontext für den Bot. Nur aktiv wenn Projekt via "
-        "`activate_project` aktiviert ist._\n\n"
-    )
-
-    if mode == "replace" or not context_file.exists():
-        atomic_write(context_file, header + linked_text + "\n")
-        return f"✓ CONTEXT.md für {slug} {'ersetzt' if mode == 'replace' else 'angelegt'}"
-    else:
-        with context_file.open("a", encoding="utf-8") as f:
-            f.write(f"\n{linked_text}\n")
-        return f"✓ CONTEXT.md für {slug} erweitert"
-
-
-def project_context(action: str, slug: Optional[str] = None,
-                    text: Optional[str] = None, mode: str = "append") -> str:
+async def project_context(action: str, slug: Optional[str] = None,
+                          text: Optional[str] = None, mode: str = "append") -> str:
     """Vereinheitlichtes Projekt-Kontext-Tool.
 
-    action='activate' (slug nötig)   → setzt Projekt aktiv, lädt CONTEXT.md
-    action='deactivate' (slug egal)  → bricht aktives Projekt ab
-    action='update' (slug+text nötig)→ schreibt in CONTEXT.md (mode=append/replace)
-
-    Konsolidiert die 3 Einzel-Tools (activate_project, deactivate_project,
-    update_project_context) zu einem.
+    action='activate' (slug noetig)   → setzt Projekt aktiv (Bot-Memory)
+    action='deactivate' (slug egal)   → bricht aktives Projekt ab (Bot-Memory)
+    action='update' (slug+text noetig) → schreibt CONTEXT.md (via MCP)
     """
     a = (action or "").strip().lower()
+
     if a in ("activate", "aktivier", "an"):
         if not slug:
-            return "Slug fehlt für activate."
+            return "Slug fehlt fuer activate."
         return activate_project(slug)
     if a in ("deactivate", "deaktivier", "aus", "stop"):
         return deactivate_project()
     if a in ("update", "edit", "set"):
         if not slug or not text:
-            return "Slug und text nötig für update."
-        return update_project_context(slug, text, mode)
+            return "Slug und text noetig fuer update."
+        try:
+            from mcp_client import mcp as _mcp, MCPError as _MCPError
+            res = await _mcp.project_context(project=slug, text=text, mode=mode)
+        except _MCPError as e:
+            return f"Fehler bei project_context.update: {type(e).__name__}: {e}"
+        path = res.get("path", "?") if isinstance(res, dict) else "?"
+        return f"OK CONTEXT.md fuer {slug} {mode}: {path}"
     return f"Unbekannte action '{action}'. Erlaubt: activate / deactivate / update."
 
 
@@ -2862,7 +2585,9 @@ def apply_memory_suggestion(action: str) -> str:
             elif s["type"] == "project_context":
                 slug = s.get("project_slug", "")
                 if slug:
-                    update_project_context(slug, s["text"])
+                    # Sync-Bridge weil apply_memory_suggestion sync ist (User-Reply-Handler)
+                    from mcp_client import mcp_sync as _mcp_sync
+                    _mcp_sync.project_context(project=slug, text=s["text"], mode="append")
                     applied.append(f"✓ Proj-Ctx {n} ({slug}): {s['text'][:50]}")
                 else:
                     skipped.append(f"✗ {n}: project_slug fehlt")
@@ -4469,15 +4194,15 @@ TOOL_HANDLERS = {
     "create_meeting":  mcp_thin_tools.create_meeting,
     "task":            mcp_thin_tools.task,
     "goal_status":     mcp_thin_tools.goal_status,
+    "edit_file":       mcp_thin_tools.edit_file,    # → MCP edit_file_replace
+    "move":            mcp_thin_tools.move,         # → MCP move/move_bulk/move_project
+    "project_context": project_context,             # async: dispatch update→MCP, activate/deactivate→Bot-Memory
     # Bot-lokal (API-Mismatch ODER Bot-spezifische Aggregation):
     "get_today_agenda": get_today_agenda,    # Format-Aggregator → Direct-FS schneller
     "list_open_tasks":  list_open_tasks,     # Format-Aggregator → Direct-FS schneller
-    "edit_file":        edit_file,           # Bot find/replace ≠ MCP body-replace
-    "move":             move,                # Bot bulk + project-Modi (MCP single-file)
     "request_delete":   request_delete,      # Stateful pending-list im Bot
     "confirm_delete":   confirm_delete,      # dito
-    "goal_log":         goal_log,            # action-dispatch sport/win/habit/book
-    "project_context":  project_context,     # action='get' fehlt MCP-side
+    "goal_log":         goal_log,            # action-dispatch sport/win/habit/book — MCP generic
     # Bot-only (Telegram/Memory/Backup/URL — keine MCP-Aequivalente):
     "clip_url":          clip_url,
     "list_existing_tags": list_existing_tags,
