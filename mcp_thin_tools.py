@@ -146,4 +146,197 @@ async def list_files(rel_dir: str = "", include_system: bool = False) -> str:
     return f"Inhalt von {base_label}:\n\n" + "\n\n".join(parts)
 
 
-__all__ = ["search_vault", "read_file", "list_files"]
+# ─── Write-Tools (Phase X3c) ─────────────────────────────────────────────────
+
+
+async def append_to_daily(section: str, text: str) -> str:
+    """An die heutige Daily-Note anhaengen, via MCP.
+
+    LLM-Kontrakt unveraendert: result-string `f"In Daily ({section}) ..."`.
+    Bot's lokale Auto-Link-Logik faellt weg — Self-Maintain-Pipeline (alle
+    10 Min) holt Auto-Linking nach. Drift ist innerhalb 10 Min eingeholt,
+    fuer ein User-Tagebuch absolut akzeptabel.
+    """
+    # Bot-Args (section, text) → MCP-Args (text, section)
+    try:
+        res = await mcp.append_to_daily(text=text, section=section)
+    except MCPError as e:
+        return _err_str("append_to_daily", e)
+
+    if not isinstance(res, dict):
+        return f"append_to_daily: unerwartetes Format {type(res).__name__}"
+    path = res.get("path", "?")
+    fname = path.rsplit("/", 1)[-1] if path else "?"
+    return f"In Daily ({section}) eingetragen: {fname}"
+
+
+async def create_note(
+    title: str,
+    body: str,
+    tags: list | None = None,
+    project: str | None = None,
+) -> str:
+    """Note anlegen via MCP. Project-Routing handelt MCP server-side.
+
+    LLM-Kontrakt: `Note angelegt: [[<id>]]` (+ ggf. Projekt-Suffix).
+    """
+    if not title or not title.strip():
+        return "Fehler: Note-Titel darf nicht leer sein."
+    try:
+        res = await mcp.create_note(
+            title=title,
+            project=project,
+            body=body or "",
+            tags=tags or [],
+            subpath="notes",
+        )
+    except MCPError as e:
+        return _err_str("create_note", e)
+
+    if not isinstance(res, dict):
+        return f"create_note: unerwartetes Format {type(res).__name__}"
+    note_id = res.get("id") or res.get("path", "?").rsplit("/", 1)[-1].replace(".md", "")
+    suffix = f" → Projekt {project}" if project else ""
+    return f"Note angelegt: [[{note_id}]]{suffix}"
+
+
+async def create_meeting(
+    title: str,
+    attendees: list | None = None,
+    meeting_date: str | None = None,
+    tags: list | None = None,
+    project: str | None = None,
+) -> str:
+    """Meeting-Protokoll via MCP. Project-Routing + Datum-Validation
+    machen wir client-seitig (gleiche Heuristik wie alte Bot-Funktion),
+    Schreiben + Path-Generation passiert im MCP.
+    """
+    if not title or not title.strip():
+        return "Fehler: Meeting-Titel darf nicht leer sein."
+    # MCP create_meeting verlangt attendees als list (Pflicht via SCHEMA),
+    # leere Liste OK
+    try:
+        res = await mcp.create_meeting(
+            title=title,
+            attendees=attendees or [],
+            project=project,
+            date=meeting_date,
+            tags=tags or [],
+            body="",
+        )
+    except MCPError as e:
+        return _err_str("create_meeting", e)
+
+    if not isinstance(res, dict):
+        return f"create_meeting: unerwartetes Format {type(res).__name__}"
+    meeting_id = res.get("id") or res.get("path", "?").rsplit("/", 1)[-1].replace(".md", "")
+    suffix = f" → Projekt {project}" if project else ""
+    return f"Meeting angelegt: [[{meeting_id}]]{suffix}"
+
+
+# String-Mapping fuer 'null'-Werte vom LLM (Bot-Konvention) → echtes None
+_TASK_NULL_TOKENS = {"null", "none", "—", "-", ""}
+
+
+def _is_null(v: Any) -> bool:
+    return isinstance(v, str) and v.strip().lower() in _TASK_NULL_TOKENS
+
+
+async def task(
+    action: str,
+    task_id: str | None = None,
+    title: str | None = None,
+    priority: str | None = None,
+    due: str | None = None,
+    project: str | None = None,
+    context: str | None = None,
+    tags: list | None = None,
+    recurrence: str | None = None,
+    status: str | None = None,
+) -> str:
+    """Konsolidiertes Task-Tool — dispatcht auf MCP `create_task` (action=create)
+    oder `task` (action=done/reopen/update→edit).
+
+    Bot-API-Kompatibilitaet:
+      - action='create' braucht title
+      - action='done'/'reopen'/'update' brauchen task_id
+      - LLM-Stringtoken 'null'/'none'/'—'/'-' fuer due bedeutet "feld leeren"
+        (bei MCP edit: nicht mitgeben → wird ignoriert; clear-Verhalten ist
+        in dieser Phase NICHT implementiert, MCP supports kein explizites
+        clear via task-tool — das ist ein bekannter Mini-Drift gegen Bot,
+        wird in X3e adressiert wenn relevant)
+    """
+    a = (action or "").strip().lower()
+
+    # ─── CREATE ─────────────────────────────────────────────────────────
+    if a == "create":
+        if not title or not title.strip():
+            return "create: title ist Pflicht."
+        try:
+            res = await mcp.create_task(
+                title=title,
+                project=project,
+                priority=priority or "medium",
+                due=due if due and not _is_null(due) else None,
+                context=context,
+                recurrence=recurrence,
+            )
+        except MCPError as e:
+            return _err_str("task.create", e)
+
+        if not isinstance(res, dict):
+            return f"task.create: unerwartetes Format {type(res).__name__}"
+        tid = res.get("id") or res.get("path", "?").rsplit("/", 1)[-1].replace(".md", "")
+        extras = []
+        if due and not _is_null(due):
+            extras.append(f"due {due}")
+        if priority and priority != "medium":
+            extras.append(f"prio {priority}")
+        if recurrence:
+            extras.append(f"wiederholt {recurrence}")
+        extra_str = f" ({', '.join(extras)})" if extras else ""
+        return f"Task angelegt: [[{tid}]]{extra_str}"
+
+    # ─── DONE / REOPEN / UPDATE ────────────────────────────────────────
+    if a in ("done", "reopen", "update"):
+        if not task_id:
+            return f"{a}: task_id ist Pflicht."
+        # MCP task() action mapping: Bot 'update' → MCP 'edit'
+        mcp_action = "edit" if a == "update" else a
+        kwargs: dict[str, Any] = {"id": task_id, "action": mcp_action}
+        # Bei edit: nur die explizit gesetzten Felder durchreichen
+        if mcp_action == "edit":
+            if priority is not None and not _is_null(priority):
+                kwargs["priority"] = priority
+            if due is not None and not _is_null(due):
+                kwargs["due"] = due
+            # body, snooze_until werden vom Bot-task aktuell nicht uebergeben
+        try:
+            res = await mcp.task(**kwargs)
+        except MCPError as e:
+            return _err_str(f"task.{a}", e)
+
+        if not isinstance(res, dict):
+            return f"task.{a}: unerwartetes Format {type(res).__name__}"
+
+        # Format-Kompatibilitaet zur alten Bot-Implementierung
+        tid_short = task_id.removeprefix("t-")
+        if a == "done":
+            return f"Task erledigt: [[t-{tid_short}]]"
+        if a == "reopen":
+            return f"Task wieder geoeffnet: [[t-{tid_short}]]"
+        # update
+        changes: list[str] = []
+        for k in ("priority", "due"):
+            if k in kwargs:
+                changes.append(f"{k}={kwargs[k]}")
+        change_str = f" ({', '.join(changes)})" if changes else ""
+        return f"Task aktualisiert: [[t-{tid_short}]]{change_str}"
+
+    return f"Unbekannte action: {action!r}. Erlaubt: create, done, reopen, update."
+
+
+__all__ = [
+    "search_vault", "read_file", "list_files",
+    "append_to_daily", "create_note", "create_meeting", "task",
+]

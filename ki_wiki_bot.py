@@ -5255,18 +5255,19 @@ TOOLS = [
 ]
 
 TOOL_HANDLERS = {
-    "append_to_daily": append_to_daily,
-    "task": task,
-    "get_today_agenda": get_today_agenda,
-    "list_open_tasks": list_open_tasks,
-    "create_meeting": create_meeting,
-    "create_note": create_note,
-    # Phase X3b: search_vault/read_file/list_files via MCP (thin-client).
-    # Lokale Implementierungen bleiben als Fallback wenn mcp_thin_tools nicht
-    # verfuegbar (z.B. waehrend Migration / mcp Server down).
+    # Phase X3c: Write-Tools via MCP (thin-client). Mit Fallback auf lokal
+    # wenn mcp_thin_tools nicht verfuegbar (Bot startet trotzdem clean).
+    "append_to_daily": (mcp_thin_tools.append_to_daily if _MCP_THIN_AVAILABLE else append_to_daily),
+    "task":            (mcp_thin_tools.task            if _MCP_THIN_AVAILABLE else task),
+    "create_meeting":  (mcp_thin_tools.create_meeting  if _MCP_THIN_AVAILABLE else create_meeting),
+    "create_note":     (mcp_thin_tools.create_note     if _MCP_THIN_AVAILABLE else create_note),
+    # Phase X3b: Read-Tools via MCP.
     "search_vault": (mcp_thin_tools.search_vault if _MCP_THIN_AVAILABLE else search_vault),
     "read_file":    (mcp_thin_tools.read_file    if _MCP_THIN_AVAILABLE else read_file),
     "list_files":   (mcp_thin_tools.list_files   if _MCP_THIN_AVAILABLE else list_files),
+    # Bleiben lokal (Hot-Path / API-Mismatch / Bot-spezifische Aggregation):
+    "get_today_agenda": get_today_agenda,
+    "list_open_tasks": list_open_tasks,
     "edit_file": edit_file,
     "move": move,
     "clip_url": clip_url,

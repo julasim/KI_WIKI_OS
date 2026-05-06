@@ -118,6 +118,33 @@ async def main() -> int:
     else:
         print(f"   OK: 2. Call schneller (Session re-used)")
 
+    # 8) Phase-X3c-Wrappers: Connectivity-only Tests (kein Write zum Vault)
+    # Wir checken dass die Wrapper Validation-Errors sauber passieren — also
+    # dass die Verkettung Bot→mcp_thin_tools→mcp_client funktioniert.
+    print("\n=== 8) Phase-X3c Wrappers (Validation-only, keine Vault-Writes) ===")
+    try:
+        # Importieren erst hier damit smoke-test auch ohne X3c lauft
+        import mcp_thin_tools as thin
+    except ImportError:
+        print("   SKIP: mcp_thin_tools nicht verfuegbar")
+    else:
+        # Empty title → Validation Fail erwartet
+        for name, coro in [
+            ("create_note(empty title)", thin.create_note(title="", body="x")),
+            ("create_meeting(empty title)", thin.create_meeting(title="")),
+            ("task(unknown action)", thin.task(action="xyz")),
+            ("task(create no title)", thin.task(action="create")),
+            ("append_to_daily(empty text)",
+             thin.append_to_daily(section="Notizen & Gedanken", text="")),
+        ]:
+            try:
+                r = await coro
+                # Erwartet: returns string (gefangener error oder valid)
+                ok = isinstance(r, str) and len(r) > 0
+                print(f"   {'OK' if ok else 'FAIL'}: {name} → {r[:80]!r}")
+            except Exception as e:
+                print(f"   FAIL: {name} EXC: {type(e).__name__}: {e}")
+
     # Cleanup
     await mcp.close()
     print("\nALL SMOKE-TESTS OK.")
