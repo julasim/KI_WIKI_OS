@@ -537,9 +537,300 @@ async def move(
     return "Fehler: keiner der drei Modi erkannt — gib src+dst ODER srcs+dst ODER project_slug an."
 
 
+# ─── Aggregator-Tools (Bot-v2 thin wrappers) ─────────────────────────────────
+
+
+_PRIO_ORDER = {"urgent": 0, "high": 1, "medium": 2, "low": 3}
+_PRIO_SYMBOLS = {"urgent": "🔴", "high": "🟠", "medium": "🟡", "low": "🟢"}
+
+
+def _fmt_due(due: Any) -> str:
+    """Formatiert ein due-Datum kompakt: heute / morgen / +Nd / dd.mm."""
+    if not due:
+        return ""
+    from datetime import date as _date
+    try:
+        d = _date.fromisoformat(str(due))
+    except (ValueError, TypeError):
+        return str(due)
+    today = _date.today()
+    delta = (d - today).days
+    if delta == 0:
+        return "heute"
+    if delta == 1:
+        return "morgen"
+    if delta < 0:
+        return f"-{-delta}d"
+    if delta <= 7:
+        return f"+{delta}d"
+    return d.strftime("%d.%m.")
+
+
+def _fmt_task(t: dict) -> str:
+    """Eine Task-Zeile kompakt fuer Telegram-Output."""
+    sym = _PRIO_SYMBOLS.get(t.get("priority", "medium"), "🟡")
+    title = t.get("title", "?")
+    tid = t.get("id") or t.get("path", "?").rsplit("/", 1)[-1].replace(".md", "")
+    parts = [f"{sym} [[t-{tid.removeprefix('t-')}|{title}]]"]
+    if t.get("due"):
+        parts.append(f"({_fmt_due(t['due'])})")
+    if t.get("project"):
+        parts.append(f"_[{t['project']}]_")
+    return " ".join(parts)
+
+
+async def list_open_tasks(when: str | None = None, project: str | None = None) -> str:
+    """Listet offene Tasks via MCP `list_tasks`, gefiltert + formatiert.
+
+    when: 'overdue' | 'today' | 'tomorrow' | 'week' | 'nodate' | None (alle)
+    project: Optional Projekt-Slug-Filter
+    """
+    try:
+        res = await mcp.list_tasks(status="open")
+    except MCPError as e:
+        return _err_str("list_open_tasks", e)
+
+    if not isinstance(res, dict):
+        return f"list_tasks: unerwartetes Format {type(res).__name__}"
+
+    tasks = res.get("tasks") or []
+    if project:
+        tasks = [t for t in tasks if t.get("project") == project]
+
+    from datetime import date as _date, timedelta
+    today = _date.today().isoformat()
+    in_7d = (_date.today() + timedelta(days=7)).isoformat()
+    tomorrow = (_date.today() + timedelta(days=1)).isoformat()
+
+    when = (when or "").lower().strip()
+    if when == "overdue":
+        tasks = [t for t in tasks if t.get("due") and t["due"] < today]
+    elif when == "today":
+        tasks = [t for t in tasks if t.get("due") == today]
+    elif when == "tomorrow":
+        tasks = [t for t in tasks if t.get("due") == tomorrow]
+    elif when == "week":
+        tasks = [t for t in tasks if t.get("due") and today <= t["due"] <= in_7d]
+    elif when == "nodate":
+        tasks = [t for t in tasks if not t.get("due")]
+
+    if not tasks:
+        filter_label = f" ({when})" if when else ""
+        proj_label = f" Projekt {project}" if project else ""
+        return f"Keine offenen Tasks{filter_label}{proj_label}."
+
+    tasks.sort(key=lambda t: (
+        _PRIO_ORDER.get(t.get("priority", "medium"), 99),
+        t.get("due") or "9999",
+    ))
+
+    label = "Offene Tasks"
+    if when:
+        label += f" ({when})"
+    if project:
+        label += f" — {project}"
+    label += f" — {len(tasks)}"
+
+    return f"<b>{label}</b>\n" + "\n".join(_fmt_task(t) for t in tasks[:50])
+
+
+async def get_today_agenda() -> str:
+    """Heute-Agenda via MCP `daily_briefing` — formatiert fuer Telegram (HTML)."""
+    try:
+        d = await mcp.daily_briefing()
+    except MCPError as e:
+        return _err_str("get_today_agenda", e)
+
+    if not isinstance(d, dict):
+        return f"daily_briefing: unerwartetes Format {type(d).__name__}"
+
+    parts: list[str] = []
+    summary = d.get("summary") or {}
+
+    overdue = d.get("overdue") or []
+    if overdue:
+        parts.append(f"<b>⚠️ Ueberfaellig — {len(overdue)}</b>")
+        for t in overdue[:10]:
+            parts.append(_fmt_task(t))
+        parts.append("")
+
+    today = d.get("today") or []
+    if today:
+        parts.append(f"<b>Heute faellig — {len(today)}</b>")
+        for t in today[:15]:
+            parts.append(_fmt_task(t))
+        parts.append("")
+
+    upcoming = d.get("upcoming_3d") or []
+    if upcoming:
+        parts.append(f"<b>Naechste 3 Tage — {len(upcoming)}</b>")
+        for t in upcoming[:10]:
+            parts.append(_fmt_task(t))
+        parts.append("")
+
+    inbox = d.get("inbox") or []
+    if inbox:
+        parts.append(f"<b>Inbox (ohne Projekt/Datum) — {len(inbox)}</b>")
+        for t in inbox[:5]:
+            parts.append(_fmt_task(t))
+        parts.append("")
+
+    if not parts:
+        return "<b>Heute</b>\n\nKeine offenen Tasks. Frei."
+
+    parts.insert(0, f"<b>📅 Agenda</b>")
+    return "\n".join(parts).rstrip()
+
+
+async def compute_briefing() -> str:
+    """Tages-Briefing fuer den Daily-Briefing-Job (morgens 08:00).
+
+    Reicht get_today_agenda + Recently-Done-Recap + Streak.
+    Returnt HTML (Telegram-tauglich).
+    """
+    parts = [await get_today_agenda()]
+
+    # Recently Done — Motivations-Recap
+    try:
+        bf = await mcp.daily_briefing()
+        if isinstance(bf, dict):
+            done = bf.get("recently_done") or []
+            if done:
+                parts.append(f"\n<b>✅ Erledigt</b>")
+                for t in done[:5]:
+                    title = t.get("title", "?")
+                    parts.append(f"• {title}")
+    except MCPError:
+        pass
+
+    # Streak
+    try:
+        s = await mcp.compute_streak()
+        if isinstance(s, dict):
+            cur = s.get("current", 0)
+            best = s.get("best", 0)
+            if cur > 0:
+                parts.append(f"\n<b>🔥 Streak</b>: {cur} Tage (Best: {best})")
+    except MCPError:
+        pass
+
+    return "\n".join(parts)
+
+
+# ─── Delete-Pair (Phase X3-finale: stateful Bot, MCP-Calls pro Pfad) ─────────
+
+
+async def request_delete(rel_path: str | None = None,
+                         rel_paths: list | None = None,
+                         permanent: bool = False) -> str:
+    """Loesch-Anfrage. Akkumuliert Pfade lokal im Bot-State (PENDING_DELETIONS),
+    macht aber KEINE Vault-Operations bis confirm_delete.
+
+    Validiert die Pfade gegen MCP via read_file probe (existence-check).
+    """
+    paths_in: list[str] = []
+    if rel_path is not None:
+        if isinstance(rel_path, str):
+            paths_in.append(rel_path)
+        elif isinstance(rel_path, list):
+            paths_in.extend(rel_path)
+    if rel_paths is not None:
+        if isinstance(rel_paths, list):
+            paths_in.extend(rel_paths)
+        elif isinstance(rel_paths, str):
+            paths_in.append(rel_paths)
+    if not paths_in:
+        return "request_delete: keine Pfade angegeben."
+
+    # Existence-Check via MCP request_delete (das gibt einen Token zurueck der
+    # als Existenz-Beweis dient + Vorbereitung fuer confirm).
+    valid: list[tuple[str, str]] = []  # (rel_path, mcp_token)
+    errors: list[str] = []
+    for rp in paths_in:
+        try:
+            r = await mcp.request_delete(path=rp, reason="bot multi-delete")
+        except MCPError as e:
+            errors.append(f"{rp}: {e}")
+            continue
+        if isinstance(r, dict) and r.get("token"):
+            valid.append((rp, r["token"]))
+        else:
+            errors.append(f"{rp}: kein Token erhalten")
+
+    if not valid:
+        return "Keine gueltigen Pfade. " + "; ".join(errors[:5])
+
+    # Im Bot-State akkumulieren — confirm_delete liest das aus
+    import time
+    PENDING_DELETIONS[ALLOWED_USER_ID] = (
+        valid,
+        time.time(),
+        "permanent" if permanent else "archive",
+    )
+    mode = "PERMANENT (irreversibel)" if permanent else "Archiv (reversibel)"
+    return (
+        f"⚠️ Loesch-Anfrage: {len(valid)} File(s) — Modus {mode}.\n"
+        + "\n".join(f"  • `{rp}`" for rp, _ in valid[:10])
+        + (f"\n  • (+{len(valid)-10} weitere)" if len(valid) > 10 else "")
+        + "\n\nMit `confirm_delete()` bestaetigen oder einfach ignorieren (300s timeout)."
+    )
+
+
+async def confirm_delete(action: str = "confirm") -> str:
+    """Confirm pending delete-list. Calls MCP confirm_delete pro Token."""
+    import time
+    pending = PENDING_DELETIONS.get(ALLOWED_USER_ID)
+    if not pending:
+        return "Keine Loesch-Anfrage offen."
+    paths_tokens, ts, mode = pending
+
+    if (time.time() - ts) > DELETE_CONFIRM_TIMEOUT:
+        del PENDING_DELETIONS[ALLOWED_USER_ID]
+        return "Loesch-Anfrage abgelaufen (>300s). Erst neu via request_delete."
+
+    if action.lower() in ("cancel", "abbrechen", "nein", "no"):
+        del PENDING_DELETIONS[ALLOWED_USER_ID]
+        return f"Loeschung abgebrochen ({len(paths_tokens)} File(s) erhalten)."
+
+    deleted: list[str] = []
+    failed: list[str] = []
+    for rp, token in paths_tokens:
+        try:
+            r = await mcp.confirm_delete(token=token)
+        except MCPError as e:
+            failed.append(f"{rp}: {e}")
+            continue
+        if isinstance(r, dict):
+            deleted.append(rp)
+        else:
+            failed.append(f"{rp}: unerwartetes Format")
+
+    del PENDING_DELETIONS[ALLOWED_USER_ID]
+
+    parts = [f"✓ {len(deleted)} geloescht ({mode}):"]
+    for rp in deleted[:8]:
+        parts.append(f"  • `{rp}`")
+    if len(deleted) > 8:
+        parts.append(f"  • (+{len(deleted)-8} weitere)")
+    if failed:
+        parts.append(f"\nFAIL {len(failed)}:")
+        for f in failed[:5]:
+            parts.append(f"  • {f}")
+    return "\n".join(parts)
+
+
+# Bot-side state — wird vom Bot importiert + befuellt
+PENDING_DELETIONS: dict = {}
+ALLOWED_USER_ID = 0  # wird vom Bot beim Boot ueberschrieben
+DELETE_CONFIRM_TIMEOUT = 300
+
+
 __all__ = [
     "search_vault", "read_file", "list_files",
     "append_to_daily", "create_note", "create_meeting", "task",
     "goal_status",
     "edit_file", "move",
+    "list_open_tasks", "get_today_agenda", "compute_briefing",
+    "request_delete", "confirm_delete",
+    "PENDING_DELETIONS",
 ]
