@@ -41,6 +41,20 @@ from telegram.ext import (
     ContextTypes,
 )
 
+# Phase X3 thin-client: alle Vault-Reads/Writes laufen via MCP-Server.
+# Bei import-fail (z.B. mcp-Package fehlt) lasse ich Bot trotzdem starten —
+# nur die thin-tools fallen aus. Lokaler Code bleibt fallback.
+try:
+    import mcp_thin_tools  # noqa: F401
+    _MCP_THIN_AVAILABLE = True
+except ImportError as _e:
+    logging.getLogger("ki-os-bot").warning(
+        "mcp_thin_tools nicht verfuegbar (%s) — Bot laeuft mit lokalen Tools",
+        _e,
+    )
+    mcp_thin_tools = None  # type: ignore[assignment]
+    _MCP_THIN_AVAILABLE = False
+
 # ============================================================================
 # Config
 # ============================================================================
@@ -5247,14 +5261,17 @@ TOOL_HANDLERS = {
     "list_open_tasks": list_open_tasks,
     "create_meeting": create_meeting,
     "create_note": create_note,
-    "search_vault": search_vault,
-    "read_file": read_file,
+    # Phase X3b: search_vault/read_file/list_files via MCP (thin-client).
+    # Lokale Implementierungen bleiben als Fallback wenn mcp_thin_tools nicht
+    # verfuegbar (z.B. waehrend Migration / mcp Server down).
+    "search_vault": (mcp_thin_tools.search_vault if _MCP_THIN_AVAILABLE else search_vault),
+    "read_file":    (mcp_thin_tools.read_file    if _MCP_THIN_AVAILABLE else read_file),
+    "list_files":   (mcp_thin_tools.list_files   if _MCP_THIN_AVAILABLE else list_files),
     "edit_file": edit_file,
     "move": move,
     "clip_url": clip_url,
     "request_delete": request_delete,
     "confirm_delete": confirm_delete,
-    "list_files": list_files,
     "list_existing_tags": list_existing_tags,
     "remember": remember,
     "forget": forget,
@@ -5751,18 +5768,24 @@ async def llm_loop(user_text: str, user_id: int) -> str:
                     tool_failed = True
                 else:
                     log.info(f"tool[{iteration+1}/{LOOP_LIMIT}]: {tc.function.name}({args})")
-                    # KRITISCH: handler in Threadpool — sonst blockiert
-                    # backup_vault/clip_url/_build_link_index/extract_pdf_text
-                    # den ganzen Telegram-Event-Loop minutenlang.
-                    # PLUS: hard timeout pro Tool — egal was es tut, nach
-                    # TOOL_TIMEOUT_SEC ist Schluss. Verhindert dass ein
-                    # hängendes Tool den ganzen Bot lahmlegt.
+                    # Handler kann sync ODER async sein (MCP-Wrapper sind async).
+                    # KRITISCH bei sync: Threadpool damit lokale Hot-Pfade
+                    # (backup_vault/clip_url/_build_link_index/extract_pdf_text)
+                    # den Telegram-Event-Loop nicht blockieren.
+                    # PLUS: hard timeout pro Tool egal was es tut.
                     tool_start = time.time()
                     try:
-                        result = await asyncio.wait_for(
-                            asyncio.to_thread(handler, **args),
-                            timeout=TOOL_TIMEOUT_SEC,
-                        )
+                        if asyncio.iscoroutinefunction(handler):
+                            # Async handler (z.B. MCP-Thin-Client) — direkt awaiten,
+                            # KEIN to_thread (sonst kommt unawaited coroutine zurueck)
+                            result = await asyncio.wait_for(
+                                handler(**args), timeout=TOOL_TIMEOUT_SEC
+                            )
+                        else:
+                            result = await asyncio.wait_for(
+                                asyncio.to_thread(handler, **args),
+                                timeout=TOOL_TIMEOUT_SEC,
+                            )
                     except asyncio.TimeoutError:
                         result = (f"Tool-Timeout: `{tc.function.name}` lief länger "
                                   f"als {TOOL_TIMEOUT_SEC}s und wurde abgebrochen.")
