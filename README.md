@@ -1,23 +1,32 @@
 # KI Wiki Bot
 
 Telegram-Bot der Julius' KI_WIKI_Vault als zweites Gehirn bedient.
+**Thin Client** seit Phase X3 — Vault-Operationen laufen via MCP-Server.
 
 ## Features
 
-- **Freitext** → wird via LLM klassifiziert und ins richtige Vault-File einsortiert
+- **Freitext** → wird via LLM klassifiziert und via MCP-Tool ausgeführt
 - **Sprachnachrichten** → lokal via faster-whisper transkribiert → wie Text behandelt
 - **Fotos** → in `09_Attachments/` gespeichert + automatische Vision-Beschreibung
 - **URLs** → via trafilatura zu sauberem Markdown extrahiert → `01_Raw/articles/`
-- **Tools die das LLM nutzen kann**: `append_to_daily`, `create_task`, `mark_task_done`, `create_meeting`, `create_note`, `search_vault`, `read_file`, `edit_file`, `clip_url`
+- **LLM-Tools (via MCP-Server):** `task`, `append_to_daily`, `create_note`, `create_meeting`, `search_vault`, `read_file`, `list_files`, `goal_status`
+- **LLM-Tools (lokal — Bot-spezifisch):** `clip_url`, `edit_file`, `move`, `request_delete`/`confirm_delete`, `goal_log`, `project_context`, `remember`/`forget`, `create_reminder`, `backup_vault`
 
 ## Architektur
 
 ```
-Telegram ─▶ Bot-Container ─schreibt──▶ /vault (= /opt/vault/KI_WIKI_Vault auf VPS)
-                │
-                ├─▶ OpenRouter (LLM + Vision)
-                └─▶ Lokales Whisper (Voice → Text)
+Telegram ─▶ Bot-Container ─┬─▶ MCP-Server (wiki-mcp.sima.business) ─▶ /vault
+                           │     • Schema-Validation
+                           │     • Self-Maintenance (alle 10 Min)
+                           │     • Audit-Log + Snapshots
+                           │
+                           ├─▶ Anthropic Claude (LLM + Vision)
+                           ├─▶ Lokales Whisper (Voice → Text)
+                           └─▶ /vault (read-only Hot-Paths: Briefing, Auto-Link)
 ```
+
+LLM-exposed Vault-Operationen laufen via `mcp_thin_tools.py` → MCP-HTTP. Bot
+hat zusätzlich Direct-FS-Mount für interne Hot-Paths (Briefing-Aggregation).
 
 ## Setup
 
@@ -63,13 +72,14 @@ Schreib dem Bot einfach:
 
 | Du sagst | Bot tut |
 |---|---|
-| "war heute am Dachboden, viel geschafft" | append_to_daily section="Abends" |
-| "morgen Schreibtisch fertigskizzieren" | create_task |
-| "t-dachboden-saugen erledigt" | mark_task_done |
-| "Meeting morgen 15 Uhr mit Schneider" | create_meeting + create_task |
-| "Was steht heute an?" | liest Daily + offene Tasks |
-| "Was weiß ich über RAG?" | search_vault → Antwort |
-| (forwarded URL) | clip_url |
+| "war heute am Dachboden, viel geschafft" | `append_to_daily` (section "Abends") |
+| "morgen Schreibtisch fertigskizzieren" | `task(action=create)` |
+| "t-dachboden-saugen erledigt" | `task(action=done)` |
+| "Meeting morgen 15 Uhr mit Schneider" | `create_meeting` + `task(action=create)` |
+| "Was steht heute an?" | `get_today_agenda` (lokal aggregiert) |
+| "Was weiß ich über RAG?" | `search_vault` → Antwort |
+| "Wo stehe ich beim 5y-Goal?" | `goal_status` → Drift + Habits + Sport |
+| (forwarded URL) | `clip_url` |
 | (Sprachnachricht) | Whisper → wie Text |
 | (Foto) | speichern + Vision-Caption |
 

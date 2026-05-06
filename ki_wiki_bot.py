@@ -41,19 +41,11 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# Phase X3 thin-client: alle Vault-Reads/Writes laufen via MCP-Server.
-# Bei import-fail (z.B. mcp-Package fehlt) lasse ich Bot trotzdem starten —
-# nur die thin-tools fallen aus. Lokaler Code bleibt fallback.
-try:
-    import mcp_thin_tools  # noqa: F401
-    _MCP_THIN_AVAILABLE = True
-except ImportError as _e:
-    logging.getLogger("ki-os-bot").warning(
-        "mcp_thin_tools nicht verfuegbar (%s) — Bot laeuft mit lokalen Tools",
-        _e,
-    )
-    mcp_thin_tools = None  # type: ignore[assignment]
-    _MCP_THIN_AVAILABLE = False
+# Phase X3: alle LLM-exposed Vault-Operationen laufen via MCP-Server.
+# Bei import-fail bricht Bot beim Boot ab — bewusst hart, weil ohne MCP
+# 80% der LLM-Tools nicht funktionieren wuerden (kein silent-degradation).
+import mcp_thin_tools
+import mcp_client  # noqa: F401  — ensure session-singleton importiert
 
 # ============================================================================
 # Config
@@ -292,8 +284,7 @@ def today_iso() -> str:
 
     KRITISCH: nutzt TIMEZONE statt date.today(). Container läuft typisch
     UTC — `date.today()` liefert nach 22:00 Wien-Zeit schon morgen.
-    Folge wäre: Tasks landen in falscher Daily, recurring Tasks
-    reaktivieren nie (last_completed = morgen → _is_recurrence_due False).
+    Folge wäre: Tasks landen in falscher Daily.
     """
     return datetime.now(TIMEZONE).date().isoformat()
 
@@ -805,408 +796,13 @@ def append_to_daily(section: str, text: str) -> str:
     return f"In Daily ({section}) eingetragen: {path.name}"
 
 
-VALID_PRIORITIES = {"low", "medium", "high", "urgent"}
-VALID_TASK_CONTEXTS = {"home", "work", "errand", "phone", "computer"}
-# WICHTIG: getrennt von Reminder-Recurrence — Tasks haben monthly, Reminders nicht.
-# Frühere Doppeldefinition als VALID_RECURRENCE hat sich überschrieben → Bug.
-VALID_TASK_RECURRENCE = {"daily", "weekdays", "weekly", "monthly"}
+# ─── Task-Helpers entfernt (Phase X3 Cleanup) ──────────────────────────
+# Lokale Task-Implementierungen (_task_create/done/reopen/update,
+# _normalize_priority/recurrence/due, _resolve_task_path, _sync_task_body,
+# VALID_PRIORITIES, VALID_TASK_CONTEXTS, VALID_TASK_RECURRENCE, _PRIORITY_MAP,
+# _RECURRENCE_MAP, _TASK_CLEAR, lokale task()) wurden entfernt.
+# LLM-Tool 'task' laeuft jetzt komplett via mcp_thin_tools.task() → MCP.
 
-
-# ─── Task-Tool (konsolidiert: create / update / done / reopen) ──────────────
-# Anthropic-Empfehlung: ein Tool mit action-Param statt N kleine Mini-Tools.
-# Siehe https://platform.claude.com/docs/en/agents-and-tools/tool-use/define-tools
-# "Consolidate related operations into fewer tools."
-#
-# Strict Mode + input_examples → LLM weiß welche Argumente pro Action.
-# Delete bewusst NICHT hier — geht über request_delete/confirm_delete (zwei-stufig).
-
-# Priority/Recurrence-Normalisierung — wiederverwendbar für create + update
-_PRIORITY_MAP = {
-    "u": "urgent", "urgent": "urgent",
-    "h": "high", "high": "high",
-    "m": "medium", "medium": "medium", "med": "medium", "normal": "medium",
-    "l": "low", "low": "low",
-}
-_RECURRENCE_MAP = {
-    "day": "daily", "daily": "daily", "täglich": "daily",
-    "weekday": "weekdays", "weekdays": "weekdays", "werktags": "weekdays",
-    "week": "weekly", "weekly": "weekly", "wöchentlich": "weekly",
-    "month": "monthly", "monthly": "monthly", "monatlich": "monthly",
-}
-
-
-def _normalize_priority(p: Optional[str]) -> str:
-    return _PRIORITY_MAP.get((p or "").lower().strip(), "medium")
-
-
-def _normalize_recurrence(r: Optional[str]) -> Optional[str]:
-    if not r:
-        return None
-    return _RECURRENCE_MAP.get(r.strip().lower())
-
-
-def _normalize_due(d) -> Optional[str]:
-    """Returns ISO-string oder None. Akzeptiert string, date, None."""
-    if d is None or d == "":
-        return None
-    if isinstance(d, date) and not isinstance(d, datetime):
-        return d.isoformat()
-    if isinstance(d, str):
-        s = d.strip()
-        if not s:
-            return None
-        if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
-            return s
-    return None
-
-
-def _resolve_task_path(task_id: str) -> Optional[Path]:
-    """Slug → Path. Strippt 't-'-Präfix, validiert kebab-case, macht safe_path.
-
-    Returns None wenn Slug ungültig oder File nicht existiert.
-    Umlaute (ä/ö/ü/ß) sind erlaubt seit Schema-Update 2026-05-03.
-    """
-    if not task_id:
-        return None
-    filename = task_id[2:] if task_id.startswith("t-") else task_id
-    if not re.match(r"^[a-zA-Z0-9äöüßÄÖÜ_\-]+$", filename):
-        return None
-    try:
-        path = safe_path(f"10_Life/tasks/{filename}.md")
-    except ValueError:
-        return None
-    return path if path.exists() else None
-
-
-def _sync_task_body(post: "frontmatter.Post") -> None:
-    """Re-rendert die '**Status**: ... · **Priorität**: ... · **Fällig**: ...' Zeile
-    aus dem aktuellen Frontmatter. Wenn keine solche Zeile existiert (z.B. legacy
-    Task), wird nichts geändert.
-    """
-    meta = post.metadata
-    status = meta.get("status", "open")
-    prio = meta.get("priority", "medium")
-    due = meta.get("due")
-    due_str = _normalize_due(due) or "—"
-    rec = meta.get("recurrence")
-    rec_part = f" · **Wiederholung**: {rec}" if rec else ""
-    new_line = (f"**Status**: {status} · **Priorität**: {prio} · "
-                f"**Fällig**: {due_str}{rec_part}")
-    body = post.content or ""
-    new_body, n = re.subn(
-        r"^\*\*Status\*\*:.*?(?=\n|$)",
-        new_line.replace("\\", "\\\\"),
-        body,
-        count=1,
-        flags=re.MULTILINE,
-    )
-    if n > 0:
-        post.content = new_body
-
-
-def _task_create(title: str, priority: str = "medium",
-                 due: Optional[str] = None,
-                 project: Optional[str] = None, context: Optional[str] = None,
-                 tags: Optional[list] = None,
-                 recurrence: Optional[str] = None) -> str:
-    """INTERNAL: legt einen neuen Task an. Wird vom task(action='create') gerufen."""
-    if not title or not title.strip():
-        return "Fehler: Task-Titel darf nicht leer sein."
-
-    priority = _normalize_priority(priority)
-    due = _normalize_due(due)
-    recurrence = _normalize_recurrence(recurrence)
-
-    slug = slugify(title)
-    path = TASKS_DIR / f"{slug}.md"
-    n = 2
-    while path.exists():
-        path = TASKS_DIR / f"{slug}-{n}.md"
-        n += 1
-    today = today_iso()
-    task_id = f"t-{path.stem}"
-
-    # Body dynamisch bauen (statt Template mit Hardcoded-Defaults)
-    rec_line = f" · **Wiederholung**: {recurrence}" if recurrence else ""
-    body = (
-        f"# {title}\n\n"
-        f"**Status**: open · **Priorität**: {priority} · **Fällig**: {due or '—'}{rec_line}\n\n"
-        f"## Was\n\n"
-        f"## Warum\n\n"
-        f"## Subschritte\n- [ ]\n\n"
-        f"## Notizen\n\n"
-        f"## Log\n- {today}: angelegt\n"
-    )
-
-    # Tags filtern (nur strings, nicht-leer, deduplizieren)
-    clean_tags = []
-    if tags and isinstance(tags, list):
-        seen = set()
-        for t in tags:
-            if isinstance(t, str) and t.strip() and t.strip() not in seen:
-                clean_tags.append(t.strip().lower())
-                seen.add(t.strip())
-
-    fm_data = {
-        "id": task_id,
-        "title": title,
-        "type": "task",
-        "created": today,
-        "updated": today,
-        "tags": clean_tags,
-        "status": "open",
-        "priority": priority,
-    }
-    if due:
-        fm_data["due"] = due
-    if project:
-        fm_data["project"] = project
-    if context:
-        ctx_lower = context.lower().strip()
-        if ctx_lower in VALID_TASK_CONTEXTS:
-            fm_data["context"] = ctx_lower
-    if recurrence:
-        fm_data["recurrence"] = recurrence
-
-    post = frontmatter.Post(body, **fm_data)
-    atomic_write(path, frontmatter.dumps(post) + "\n")
-
-    # Link in heutige Daily
-    try:
-        # Pipe-Syntax: title ist im Stash von auto_link geschützt → kein
-        # nested-Wikilink-Bug wenn title Substring von einem anderen ID ist
-        # (vorher: "Matura" im Title → auto_link nested daraus [[project-matura|...]])
-        append_to_daily("Heute", f"- [ ] [[{task_id}|{title}]]")
-    except Exception as e:
-        log.warning(f"Daily-Link für Task fehlgeschlagen: {e}")
-
-    invalidate_link_index()  # ruft auch invalidate_today_data_cache (siehe dort)
-
-    extras = []
-    if due:
-        extras.append(f"fällig {due}")
-    if project:
-        extras.append(f"projekt {project}")
-    if priority != "medium":
-        extras.append(f"prio {priority}")
-    if recurrence:
-        extras.append(f"wiederholt {recurrence}")
-    extra_str = f" ({', '.join(extras)})" if extras else ""
-    return f"Task angelegt: [[{task_id}]]{extra_str}"
-
-
-def _task_done(task_id: str) -> str:
-    """INTERNAL: Mark task as done. Wird vom task(action='done') gerufen.
-
-    Bei recurring Tasks (frontmatter.recurrence gesetzt): Status bleibt 'done'
-    bis der recurring_task_reset_job am passenden nächsten Tag wieder auf
-    'open' setzt. last_completed wird gesetzt damit Reset weiß wann es passt.
-    """
-    path = _resolve_task_path(task_id)
-    if path is None:
-        return f"Task nicht gefunden oder ungültiger Slug: {task_id!r}"
-    filename = path.stem
-    post = frontmatter.load(path)
-    today = today_iso()
-    post["status"] = "done"
-    post["updated"] = today
-    recurrence = post.metadata.get("recurrence")
-    if recurrence:
-        post["last_completed"] = today
-        log_line = f"\n- {today}: erledigt (recurring={recurrence}, kommt automatisch wieder)\n"
-    else:
-        log_line = f"\n- {today}: erledigt\n"
-    _sync_task_body(post)
-    body = (post.content or "").rstrip() + log_line
-    post.content = body
-    atomic_write(path, frontmatter.dumps(post) + "\n")
-    if recurrence:
-        return f"Task erledigt: [[t-{filename}]] — wiederholt sich ({recurrence})"
-    return f"Task erledigt: [[t-{filename}]]"
-
-
-def _task_reopen(task_id: str) -> str:
-    """INTERNAL: Setzt status zurück auf 'open'. Wird vom task(action='reopen') gerufen.
-
-    Für Fälle: Task wurde fälschlich done markiert, oder User will recurring
-    manuell vor der nächsten Reaktivierung wieder als open haben.
-    """
-    path = _resolve_task_path(task_id)
-    if path is None:
-        return f"Task nicht gefunden oder ungültiger Slug: {task_id!r}"
-    filename = path.stem
-    post = frontmatter.load(path)
-    today = today_iso()
-    post["status"] = "open"
-    post["updated"] = today
-    # last_completed nicht löschen — recurring-Reset braucht's vielleicht weiter
-    _sync_task_body(post)
-    log_line = f"\n- {today}: wieder geöffnet\n"
-    body = (post.content or "").rstrip() + log_line
-    post.content = body
-    atomic_write(path, frontmatter.dumps(post) + "\n")
-    return f"Task wieder offen: [[t-{filename}]]"
-
-
-# Sentinel für "Feld leeren" in update — None heißt "nicht ändern", wir brauchen
-# einen separaten Marker für "explizit löschen" (z.B. due wegnehmen)
-_TASK_CLEAR = object()
-
-
-def _task_update(task_id: str, **fields) -> str:
-    """INTERNAL: Update einzelne Felder eines Tasks. Wird vom task(action='update') gerufen.
-
-    Nur in `fields` enthaltene Keys werden geändert. Wert _TASK_CLEAR (oder None)
-    entfernt das Frontmatter-Feld komplett. Body-Status-Zeile wird automatisch
-    re-synchronisiert. updated wird auf heute gesetzt.
-
-    Erlaubte Felder: title, priority, due, project, context, tags, recurrence, status.
-    """
-    path = _resolve_task_path(task_id)
-    if path is None:
-        return f"Task nicht gefunden oder ungültiger Slug: {task_id!r}"
-    filename = path.stem
-    post = frontmatter.load(path)
-    today = today_iso()
-    changed = []
-
-    if "title" in fields:
-        v = fields["title"]
-        if v and v.strip():
-            post["title"] = v.strip()
-            changed.append(f"title='{v.strip()[:30]}'")
-
-    if "priority" in fields:
-        v = fields["priority"]
-        norm = _normalize_priority(v)
-        post["priority"] = norm
-        changed.append(f"priority={norm}")
-
-    if "due" in fields:
-        v = fields["due"]
-        if v in (None, "", _TASK_CLEAR):
-            if "due" in post.metadata:
-                del post.metadata["due"]
-            changed.append("due=—")
-        else:
-            norm = _normalize_due(v)
-            if norm:
-                post["due"] = norm
-                changed.append(f"due={norm}")
-            else:
-                return f"due='{v}' ist kein gültiges ISO-Datum (YYYY-MM-DD) und nicht leer"
-
-    for f in ("project", "context"):
-        if f in fields:
-            v = fields[f]
-            if v in (None, "", _TASK_CLEAR):
-                if f in post.metadata:
-                    del post.metadata[f]
-                changed.append(f"{f}=—")
-            elif isinstance(v, str) and v.strip():
-                post[f] = v.strip()
-                changed.append(f"{f}={v.strip()}")
-
-    if "tags" in fields:
-        v = fields["tags"]
-        if v in (None, _TASK_CLEAR):
-            post["tags"] = []
-            changed.append("tags=[]")
-        elif isinstance(v, list):
-            clean = []
-            seen = set()
-            for t in v:
-                if isinstance(t, str) and t.strip() and t.strip().lower() not in seen:
-                    clean.append(t.strip().lower())
-                    seen.add(t.strip().lower())
-            post["tags"] = clean
-            changed.append(f"tags={clean}")
-
-    if "recurrence" in fields:
-        v = fields["recurrence"]
-        if v in (None, "", _TASK_CLEAR):
-            if "recurrence" in post.metadata:
-                del post.metadata["recurrence"]
-            changed.append("recurrence=—")
-        else:
-            norm = _normalize_recurrence(v)
-            if norm:
-                post["recurrence"] = norm
-                changed.append(f"recurrence={norm}")
-
-    if "status" in fields:
-        v = (fields["status"] or "").strip().lower()
-        if v in ("open", "in-progress", "blocked", "done", "cancelled"):
-            post["status"] = v
-            changed.append(f"status={v}")
-
-    if not changed:
-        return f"Keine gültigen Änderungen für [[t-{filename}]]"
-
-    post["updated"] = today
-    _sync_task_body(post)
-    atomic_write(path, frontmatter.dumps(post) + "\n")
-    invalidate_link_index()
-    return f"Task aktualisiert: [[t-{filename}]] ({', '.join(changed)})"
-
-
-def task(action: str, task_id: Optional[str] = None,
-         title: Optional[str] = None,
-         priority: Optional[str] = None,
-         due: Optional[str] = None,
-         project: Optional[str] = None,
-         context: Optional[str] = None,
-         tags: Optional[list] = None,
-         recurrence: Optional[str] = None,
-         status: Optional[str] = None) -> str:
-    """Konsolidiertes Task-Tool. Dispatcht auf interne Helper je nach action.
-
-    Anthropic-Pattern: ein Tool mit action-Parameter statt N Mini-Tools.
-    Delete läuft separat über request_delete (zwei-stufig, sicher).
-    """
-    a = (action or "").strip().lower()
-
-    if a == "create":
-        if not title:
-            return "create: title ist Pflicht."
-        return _task_create(
-            title=title, priority=priority or "medium", due=due,
-            project=project, context=context,
-            tags=tags, recurrence=recurrence,
-        )
-
-    if a == "done":
-        if not task_id:
-            return "done: task_id ist Pflicht."
-        return _task_done(task_id)
-
-    if a == "reopen":
-        if not task_id:
-            return "reopen: task_id ist Pflicht."
-        return _task_reopen(task_id)
-
-    if a == "update":
-        if not task_id:
-            return "update: task_id ist Pflicht."
-        # Nur die explicit übergebenen Felder ans Update weiterreichen.
-        # None bei optional-Feldern = "nicht anfassen". Für "leeren" muss LLM
-        # explizit den String "null" oder "" übergeben — wir mappen das auf clear.
-        update_fields = {}
-        for k, v in [("title", title), ("priority", priority), ("due", due),
-                     ("project", project), ("context", context),
-                     ("tags", tags), ("recurrence", recurrence), ("status", status)]:
-            if v is not None:
-                # String "null" (vom LLM) → echtes None für unsere clear-Logik
-                if isinstance(v, str) and v.strip().lower() in ("null", "none", "—", "-"):
-                    update_fields[k] = _TASK_CLEAR
-                else:
-                    update_fields[k] = v
-        if not update_fields:
-            return "update: keine Felder angegeben (nichts zu ändern)."
-        return _task_update(task_id, **update_fields)
-
-    return (f"Unbekannte action: {action!r}. "
-            f"Erlaubt: create, update, done, reopen.")
 
 
 # ─── Tagesplanung: Listings + Agenda ────────────────────────────────────────
@@ -1618,241 +1214,20 @@ def get_today_agenda() -> str:
     return "\n".join(parts) + _render_task_id_map(rendered_tasks)
 
 
-def create_meeting(title: str, attendees: Optional[list] = None,
-                   meeting_date: Optional[str] = None,
-                   tags: Optional[list] = None,
-                   project: Optional[str] = None) -> str:
-    """Create meeting protocol. Routing analog zu create_note:
-
-    - explizit `project=<slug>` ODER aktives Projekt im Bot-Kontext
-      → `05_Projects/<slug>/meetings/YYYY-MM-DD_<slug>.md`
-        (+ `project: <slug>` im Frontmatter)
-    - sonst → `10_Life/meetings/YYYY-MM-DD_<slug>.md` (Default für privat)
-
-    meeting_date: NUR ISO YYYY-MM-DD akzeptiert. Bei Garbage/Path-Traversal
-    Fallback auf heute (LLM darf nicht beliebige Strings in den Pfad pumpen).
-    """
-    if not title or not title.strip():
-        return "Fehler: Meeting-Titel darf nicht leer sein."
-    # Datum strikt validieren — sonst Path-Traversal über meeting_date möglich
-    if meeting_date and re.match(r"^\d{4}-\d{2}-\d{2}$", str(meeting_date).strip()):
-        try:
-            datetime.strptime(meeting_date.strip(), "%Y-%m-%d")
-            today = meeting_date.strip()
-        except ValueError:
-            log.warning(f"create_meeting: ungültiges Datum '{meeting_date}', nutze heute")
-            today = today_iso()
-    else:
-        if meeting_date:
-            log.warning(f"create_meeting: kein ISO-Datum '{meeting_date}', nutze heute")
-        today = today_iso()
-    slug = slugify(title)
-
-    # Project-Routing: explizit > aktives Projekt > generisch
-    project_slug: Optional[str] = None
-    target_dir = MEETINGS_DIR
-    if project:
-        proj_dir = find_project_dir(project)
-        if proj_dir is None:
-            return (f"Projekt '{project}' nicht gefunden in 05_Projects/. "
-                    f"Meeting nicht angelegt.")
-        project_slug = proj_dir.name
-        target_dir = proj_dir / "meetings"
-    else:
-        active = get_active_project()
-        if active:
-            proj_dir = find_project_dir(active)
-            if proj_dir is not None:
-                project_slug = proj_dir.name
-                target_dir = proj_dir / "meetings"
-
-    target_dir.mkdir(parents=True, exist_ok=True)
-
-    final_slug = slug  # ID muss mit Filename mitwachsen
-    path = target_dir / f"{today}_{slug}.md"
-    n = 2
-    while path.exists():
-        final_slug = f"{slug}-{n}"
-        path = target_dir / f"{today}_{final_slug}.md"
-        n += 1
-    slug = final_slug
-
-    # Tags filtern
-    clean_tags = []
-    if tags and isinstance(tags, list):
-        seen = set()
-        for t in tags:
-            if isinstance(t, str) and t.strip() and t.strip() not in seen:
-                clean_tags.append(t.strip().lower())
-                seen.add(t.strip())
-
-    attendees_list = attendees or []
-    attendees_str = ", ".join(f"[[{a}]]" for a in attendees_list) if attendees_list else "—"
-    status = "done" if today <= today_iso() else "planned"
-
-    body = (
-        f"# {title}\n\n"
-        f"**Datum**: {today} · **Teilnehmer**: {attendees_str} · **Status**: {status}\n\n"
-        f"## Agenda\n- \n\n"
-        f"## Diskussion\n\n"
-        f"## Entscheidungen\n- \n\n"
-        f"## Action Items\n- [ ] \n"
-    )
-
-    meeting_id = f"meeting-{today}-{slug}"
-    fm_data = {
-        "id": meeting_id,
-        "title": title,
-        "type": "meeting",
-        "date": today,
-        "created": today_iso(),
-        "updated": today_iso(),
-        "attendees": attendees_list,
-        "status": status,
-        "tags": clean_tags,
-    }
-    if project_slug:
-        fm_data["project"] = project_slug
-    post = frontmatter.Post(body, **fm_data)
-    atomic_write(path, frontmatter.dumps(post) + "\n")
-    invalidate_link_index()
-    suffix = f" → Projekt {project_slug}" if project_slug else ""
-    return f"Meeting angelegt: [[{meeting_id}]]{suffix}"
+# ─── create_meeting entfernt (Phase X3 Cleanup) ──────────────────────────
+# LLM-Tool 'create_meeting' laeuft via mcp_thin_tools.create_meeting() → MCP.
 
 
-def create_note(title: str, body: str, tags: Optional[list] = None,
-                project: Optional[str] = None) -> str:
-    """Create a free note. Routing-Logik:
-
-    - explizit `project=<slug>` ODER aktives Projekt im Bot-Kontext
-      → `05_Projects/<slug>/notes/YYYY-MM-DD_<slug>.md` (+ `project: <slug>`
-        im Frontmatter)
-    - sonst → `10_Life/notes/YYYY-MM-DD_<slug>.md` (Default)
-    """
-    if not title or not title.strip():
-        return "Fehler: Note-Titel darf nicht leer sein."
-
-    today = today_iso()
-    slug = slugify(title)
-
-    # Project-Routing: explizit > aktives Projekt > generisch
-    project_slug: Optional[str] = None
-    target_dir = NOTES_DIR
-    if project:
-        proj_dir = find_project_dir(project)
-        if proj_dir is None:
-            return (f"Projekt '{project}' nicht gefunden in 05_Projects/. "
-                    f"Note nicht angelegt.")
-        project_slug = proj_dir.name
-        target_dir = proj_dir / "notes"
-    else:
-        active = get_active_project()
-        if active:
-            proj_dir = find_project_dir(active)
-            if proj_dir is not None:
-                project_slug = proj_dir.name
-                target_dir = proj_dir / "notes"
-
-    target_dir.mkdir(parents=True, exist_ok=True)
-
-    path = target_dir / f"{today}_{slug}.md"
-    final_slug = slug  # ID muss mit Filename mitwachsen, sonst ID-Duplikat
-    n = 2
-    while path.exists():
-        final_slug = f"{slug}-{n}"
-        path = target_dir / f"{today}_{final_slug}.md"
-        n += 1
-    slug = final_slug
-
-    # Tags filtern (nur strings, nicht-leer, deduplizieren, lowercase)
-    clean_tags = []
-    if tags and isinstance(tags, list):
-        seen = set()
-        for t in tags:
-            if isinstance(t, str) and t.strip() and t.strip() not in seen:
-                clean_tags.append(t.strip().lower())
-                seen.add(t.strip())
-
-    # Auto-Link bekannte Vault-IDs/Titles — exclude die Note selbst
-    linked_body = auto_link(body.strip(), exclude_ids={slug})
-
-    # Body dynamisch — direkt H1 + User-Body, kein Template-Comment
-    note_body = f"# {title}\n\n{linked_body}\n"
-
-    fm_data = {
-        "id": slug,
-        "title": title,
-        "type": "note",
-        "created": today,
-        "updated": today,
-        "tags": clean_tags,
-        "status": "draft",
-        "quelle": "telegram",
-    }
-    if project_slug:
-        fm_data["project"] = project_slug
-    post = frontmatter.Post(note_body, **fm_data)
-    atomic_write(path, frontmatter.dumps(post) + "\n")
-    invalidate_link_index()
-    suffix = f" → Projekt {project_slug}" if project_slug else ""
-    return f"Notiz angelegt: [[{slug}]]{suffix}"
+# ─── create_note entfernt (Phase X3 Cleanup) ──────────────────────────
+# LLM-Tool 'create_note' laeuft via mcp_thin_tools.create_note() → MCP.
 
 
-def search_vault(query: str, limit: int = 5) -> str:
-    """Volltext-Suche via vault_search.py (subprocess)."""
-    script = VAULT / "07_Tools" / "search" / "vault_search.py"
-    if not script.exists():
-        return "vault_search.py nicht gefunden."
-    try:
-        # Minimales env: vault_search braucht keine Tokens.
-        # Sonst würden TG_TOKEN/LLM_API_KEY/GITHUB_BACKUP_TOKEN an subprocess geleakt.
-        minimal_env = {k: v for k, v in os.environ.items()
-                       if k in ("PATH", "PYTHONPATH", "PYTHONIOENCODING", "LANG", "LC_ALL", "HOME")}
-        result = subprocess.run(
-            ["python3", str(script), "--json", query],
-            capture_output=True, text=True, timeout=30, cwd=str(VAULT),
-            env=minimal_env,
-        )
-        if result.returncode != 0:
-            return f"Suche fehlgeschlagen: {result.stderr.strip()[:300]}"
-        data = json.loads(result.stdout) if result.stdout.strip() else []
-        if not data:
-            return f"Keine Treffer für: {query}"
-        lines = [f"Suche '{query}' — {len(data)} Treffer (top {limit}):"]
-        for hit in data[:limit]:
-            # `or "?"` statt default `"?"` — get() returnt None wenn key=None,
-            # nicht den default. Sonst landeten "[[None]]"-Strings im Output.
-            hid = hit.get("id") or "?"
-            htype = hit.get("type") or "?"
-            score = hit.get("score", "?")
-            path = hit.get("path") or ""
-            # Pfad ist KRITISCH für Folge-Tools (read_file/edit_file).
-            # Ohne Pfad muss LLM aus ID raten — bricht bei Datums-Präfixen
-            # (z.B. echtes File "2026-04-28_<id>.md", nicht "<id>.md").
-            path_part = f" · `{path}`" if path else ""
-            lines.append(f"- [[{hid}]] · `{htype}` · score {score}{path_part}")
-        return "\n".join(lines)
-    except Exception as e:
-        return f"Suche-Fehler: {e}"
+# ─── search_vault entfernt (Phase X3 Cleanup) ──────────────────────────
+# LLM-Tool 'search_vault' laeuft via mcp_thin_tools.search_vault() → MCP.
 
 
-def read_file(rel_path: str, strip_frontmatter: bool = True) -> str:
-    """Read a file (relative to vault root). Capped at 8KB.
-
-    strip_frontmatter=True (default): YAML-Frontmatter wird entfernt für
-    saubere Anzeige. Auf False setzen wenn du Metadaten brauchst.
-    """
-    try:
-        path = safe_path(rel_path)
-        if not path.exists():
-            return f"Datei nicht gefunden: {rel_path}"
-        content = path.read_text(encoding="utf-8")
-        if strip_frontmatter:
-            # Frontmatter zwischen --- ... --- am Anfang entfernen
-            content = re.sub(r"^---\n.*?\n---\n+", "", content, count=1, flags=re.DOTALL)
-        return content[:8000]
-    except Exception as e:
-        return f"Lese-Fehler: {e}"
+# ─── read_file entfernt (Phase X3 Cleanup) ──────────────────────────
+# LLM-Tool 'read_file' laeuft via mcp_thin_tools.read_file() → MCP.
 
 
 def move_path(src_rel: str, dst_rel: str, overwrite: bool = False) -> str:
@@ -2878,50 +2253,8 @@ LIST_FILES_NOISE_FILES = {
 }
 
 
-def list_files(rel_dir: str = "", include_system: bool = False) -> str:
-    """Liste alle .md-Files in einem Vault-Unterordner.
-
-    Standardmäßig werden System-Verzeichnisse (Templates, Meta, Tools, Trash, Archive)
-    und System-Docs (CLAUDE.md etc.) ausgefiltert — User sieht nur eigenen Content.
-    Mit include_system=True wird alles gezeigt (für Debug).
-    """
-    try:
-        base = safe_path(rel_dir) if rel_dir else VAULT
-        if not base.exists() or not base.is_dir():
-            return f"Verzeichnis nicht gefunden: {rel_dir}"
-
-        def is_visible(p: Path) -> bool:
-            if include_system:
-                return True
-            if p.name in LIST_FILES_NOISE_FILES:
-                return False
-            return not any(part in LIST_FILES_NOISE_DIRS for part in p.parts)
-
-        files = sorted(p for p in base.rglob("*.md") if is_visible(p))
-        if not files:
-            return f"Keine User-Files in {rel_dir or 'Vault-Root'} (System-Files via include_system=true sichtbar)."
-
-        rels = [str(f.relative_to(VAULT)).replace("\\", "/") for f in files]
-
-        # Bei vielen Files: nach Top-Level-Ordner gruppieren für lesbare Ausgabe
-        if len(rels) > 12:
-            from collections import defaultdict
-            grouped = defaultdict(list)
-            for r in rels:
-                top = r.split("/", 1)[0]
-                grouped[top].append(r)
-            lines = [f"{len(rels)} Files in {rel_dir or 'Vault-Root'}, gruppiert:"]
-            for top in sorted(grouped):
-                lines.append(f"\n**{top}/** ({len(grouped[top])})")
-                for r in grouped[top][:8]:
-                    lines.append(f"• `{r}`")
-                if len(grouped[top]) > 8:
-                    lines.append(f"  _… {len(grouped[top])-8} weitere_")
-            return "\n".join(lines)
-
-        return f"{len(rels)} Files in {rel_dir or 'Vault-Root'}:\n" + "\n".join(f"• `{r}`" for r in rels)
-    except Exception as e:
-        return f"List-Fehler: {e}"
+# ─── list_files entfernt (Phase X3 Cleanup) ──────────────────────────
+# LLM-Tool 'list_files' laeuft via mcp_thin_tools.list_files() → MCP.
 
 
 # ─── Conversation Memory (3-Tier) ────────────────────────────────────────────
@@ -4324,137 +3657,8 @@ def goal_log(action: str, payload: Optional[dict] = None,
     return f"goal_log: unbekannte action '{action}'. Erlaubt: sport, win, lesson, habit, book"
 
 
-def goal_status(scope: str = "all", saeule: Optional[str] = None,
-                goal: str = DEFAULT_GOAL_SLUG) -> str:
-    """Read-only Status des Goal-Systems.
-
-    scope: 'all' | 'saeule' | 'habits' | 'sport' | 'drift'
-    """
-    try:
-        gdir = _goal_dir(goal)
-    except ValueError as e:
-        return f"goal_status: {e}"
-    if not gdir.exists():
-        return f"Goal-System '{goal}' nicht initialisiert."
-
-    today = datetime.now(TIMEZONE).date()
-    parts = []
-
-    # Header: Tag-Countdown
-    if goal == "5y-2031":
-        target = date(2031, 5, 1)
-        days_left = (target - today).days
-        if days_left > 0:
-            parts.append(f"<b>5y-2031</b> · {days_left} Tage bis Stichtag (01.05.2031)")
-        elif days_left == 0:
-            parts.append(f"<b>5y-2031</b> · STICHTAG HEUTE (01.05.2031)")
-        else:
-            parts.append(f"<b>5y-2031</b> · Stichtag {-days_left} Tage vergangen (01.05.2031)")
-    else:
-        parts.append(f"<b>Goal {goal}</b>")
-    parts.append("")
-
-    s = (scope or "all").strip().lower()
-
-    # Habits: zähle Häkchen letzte 7 Tage
-    def _habits_score(days: int) -> tuple[int, int]:
-        habits_path = gdir / "tracker" / "habits.md"
-        if not habits_path.exists():
-            return (0, 0)
-        content = habits_path.read_text(encoding="utf-8")
-        cutoff = today - timedelta(days=days)
-        check = 0
-        possible = 0
-        for line in content.split("\n"):
-            m = re.match(r"^\| (\d{4}-\d{2}-\d{2}) \|(.+)\|$", line)
-            if not m:
-                continue
-            try:
-                line_date = datetime.strptime(m.group(1), "%Y-%m-%d").date()
-            except ValueError:
-                continue
-            if line_date < cutoff or line_date > today:
-                continue
-            cells = [c.strip() for c in m.group(2).split("|") if c.strip() != ""]
-            for c in cells[:6]:
-                if c == "✓":
-                    check += 1
-                if c in ("✓", "✗"):
-                    possible += 1
-        return (check, possible)
-
-    # Sport: zähle Sessions letzte 30 Tage
-    def _sport_count(days: int) -> int:
-        sport_path = gdir / "tracker" / "sport-log.md"
-        if not sport_path.exists():
-            return 0
-        content = sport_path.read_text(encoding="utf-8")
-        cutoff = today - timedelta(days=days)
-        n = 0
-        for line in content.split("\n"):
-            m = re.match(r"^\| (\d{4}-\d{2}-\d{2}) \| (cardio|kraft) \|", line)
-            if m:
-                try:
-                    d = datetime.strptime(m.group(1), "%Y-%m-%d").date()
-                    if d >= cutoff and d <= today:
-                        n += 1
-                except ValueError:
-                    pass
-        return n
-
-    # Drift: lies readme.md "Letzter X-Anker:" Zeilen
-    def _drift_status() -> dict:
-        readme_path = gdir / "readme.md"
-        if not readme_path.exists():
-            return {}
-        content = readme_path.read_text(encoding="utf-8")
-        out = {}
-        for label, key in (("Letzter Wochen-Anker", "weekly"),
-                           ("Letzter Monats-Anker", "monthly"),
-                           ("Letzter Quartals-Anker", "quarterly")):
-            m = re.search(rf"\*\*{re.escape(label)}:\*\* ([\d-]+|—)", content)
-            out[key] = m.group(1) if m else "?"
-        return out
-
-    if s in ("all", "saeule"):
-        parts.append("**Säulen** (Status manuell gepflegt in saeulen.md / readme.md)")
-        # Lies aus readme.md die Status-Tabelle
-        readme = (gdir / "readme.md").read_text(encoding="utf-8") if (gdir / "readme.md").exists() else ""
-        m = re.search(r"\| Säule \| Status \| Nächster Anker \|.*?\n((?:\|.*?\|\n)+)", readme, re.DOTALL)
-        if m:
-            for row in m.group(1).strip().split("\n"):
-                cells = [c.strip() for c in row.split("|") if c.strip()]
-                if len(cells) < 2:
-                    continue
-                # Tabellen-Separator-Zeile (|---|---|---|) überspringen
-                if all(re.fullmatch(r"-+", c) for c in cells):
-                    continue
-                parts.append(f"  {cells[0]:<14} – {cells[1]}")
-        parts.append("")
-
-    if s in ("all", "habits"):
-        check_7, poss_7 = _habits_score(7)
-        parts.append(f"**Habits** letzte 7 Tage: {check_7} ✓ / {poss_7} möglich")
-        if poss_7 > 0:
-            pct = int(check_7 / poss_7 * 100)
-            parts.append(f"   Quote: {pct}% (Soll: ≥80%)")
-        parts.append("")
-
-    if s in ("all", "sport"):
-        sport_30 = _sport_count(30)
-        sport_7 = _sport_count(7)
-        parts.append(f"🏃 **Sport** letzte 30 Tage: {sport_30} Sessions · letzte 7 Tage: {sport_7}")
-        parts.append("   Wochen-Soll: 3 Sessions (2× Cardio + 1× Kraft)")
-        parts.append("")
-
-    if s in ("all", "drift"):
-        drift = _drift_status()
-        parts.append(f"⚠️ **Drift-Detektor**")
-        parts.append(f"   Letzter Wochen-Anker:   {drift.get('weekly', '?')}")
-        parts.append(f"   Letzter Monats-Anker:   {drift.get('monthly', '?')}")
-        parts.append(f"   Letzter Quartals-Anker: {drift.get('quarterly', '?')}")
-
-    return "\n".join(parts)
+# ─── goal_status entfernt (Phase X3 Cleanup) ──────────────────────────
+# LLM-Tool 'goal_status' laeuft via mcp_thin_tools.goal_status() → MCP.
 
 
 def _anchor_questions(action: str) -> list[str]:
@@ -5255,41 +4459,38 @@ TOOLS = [
 ]
 
 TOOL_HANDLERS = {
-    # Phase X3c: Write-Tools via MCP (thin-client). Mit Fallback auf lokal
-    # wenn mcp_thin_tools nicht verfuegbar (Bot startet trotzdem clean).
-    "append_to_daily": (mcp_thin_tools.append_to_daily if _MCP_THIN_AVAILABLE else append_to_daily),
-    "task":            (mcp_thin_tools.task            if _MCP_THIN_AVAILABLE else task),
-    "create_meeting":  (mcp_thin_tools.create_meeting  if _MCP_THIN_AVAILABLE else create_meeting),
-    "create_note":     (mcp_thin_tools.create_note     if _MCP_THIN_AVAILABLE else create_note),
-    # Phase X3b: Read-Tools via MCP.
-    "search_vault": (mcp_thin_tools.search_vault if _MCP_THIN_AVAILABLE else search_vault),
-    "read_file":    (mcp_thin_tools.read_file    if _MCP_THIN_AVAILABLE else read_file),
-    "list_files":   (mcp_thin_tools.list_files   if _MCP_THIN_AVAILABLE else list_files),
-    # Bleiben lokal (Hot-Path / API-Mismatch / Bot-spezifische Aggregation):
-    "get_today_agenda": get_today_agenda,
-    "list_open_tasks": list_open_tasks,
-    "edit_file": edit_file,
-    "move": move,
-    "clip_url": clip_url,
-    "request_delete": request_delete,
-    "confirm_delete": confirm_delete,
+    # MCP-routed Tools (Phase X3): alle Vault-Reads/Writes via MCP-Server.
+    # Single Source of Truth fuer Schema, Validation, Self-Maintenance.
+    "search_vault":    mcp_thin_tools.search_vault,
+    "read_file":       mcp_thin_tools.read_file,
+    "list_files":      mcp_thin_tools.list_files,
+    "append_to_daily": mcp_thin_tools.append_to_daily,
+    "create_note":     mcp_thin_tools.create_note,
+    "create_meeting":  mcp_thin_tools.create_meeting,
+    "task":            mcp_thin_tools.task,
+    "goal_status":     mcp_thin_tools.goal_status,
+    # Bot-lokal (API-Mismatch ODER Bot-spezifische Aggregation):
+    "get_today_agenda": get_today_agenda,    # Format-Aggregator → Direct-FS schneller
+    "list_open_tasks":  list_open_tasks,     # Format-Aggregator → Direct-FS schneller
+    "edit_file":        edit_file,           # Bot find/replace ≠ MCP body-replace
+    "move":             move,                # Bot bulk + project-Modi (MCP single-file)
+    "request_delete":   request_delete,      # Stateful pending-list im Bot
+    "confirm_delete":   confirm_delete,      # dito
+    "goal_log":         goal_log,            # action-dispatch sport/win/habit/book
+    "project_context":  project_context,     # action='get' fehlt MCP-side
+    # Bot-only (Telegram/Memory/Backup/URL — keine MCP-Aequivalente):
+    "clip_url":          clip_url,
     "list_existing_tags": list_existing_tags,
-    "remember": remember,
-    "forget": forget,
-    "set_preference": set_preference,
-    "project_context": project_context,
-    "log_correction": log_correction,
-    # apply_memory_suggestion + apply_health_action sind KEINE LLM-Tools mehr —
-    # werden via _detect_pending_reply_intent in handle_text direkt gerufen.
-    "create_project": create_project,
-    "create_reminder": create_reminder,
-    "list_reminders": list_reminders,
-    "cancel_reminder": cancel_reminder,
-    "goal_log": goal_log,
-    "goal_anchor": goal_anchor,
-    # Phase X3d: goal_status via MCP (read-only Aggregator).
-    "goal_status": (mcp_thin_tools.goal_status if _MCP_THIN_AVAILABLE else goal_status),
-    "backup_vault": backup_vault,
+    "remember":          remember,
+    "forget":            forget,
+    "set_preference":    set_preference,
+    "log_correction":    log_correction,
+    "create_project":    create_project,
+    "create_reminder":   create_reminder,
+    "list_reminders":    list_reminders,
+    "cancel_reminder":   cancel_reminder,
+    "goal_anchor":       goal_anchor,
+    "backup_vault":      backup_vault,
 }
 
 # ============================================================================
@@ -7986,137 +7187,43 @@ def compute_briefing() -> str:
 # wenn sie done sind und das Pattern fällig ist. So lebt EINE Task-Datei für
 # alle Wiederholungen, History sammelt sich im Log.
 
-def _is_recurrence_due(pattern: str, last_completed: str, today: date) -> bool:
-    """Bestimmt ob eine recurring Task heute reaktiviert werden soll.
+async def _trigger_recurring_reset() -> int:
+    """Triggert MCP task_reactivate_recurring + invalidiert Bot-Cache.
 
-    pattern: 'daily' | 'weekdays' | 'weekly' | 'monthly'
-    last_completed: ISO-Datum (str) ODER date-Objekt (PyYAML kann unquoted
-                    YYYY-MM-DD direkt zu date parsen). _due_to_date handlet beide.
-    today: aktuelles Datum
+    Returns Anzahl reaktivierter Tasks. Bei MCP-Fail wird geloggt aber
+    keine Exception propagiert (Bot soll trotzdem weiter funktionieren).
     """
-    last = _due_to_date(last_completed)
-    if last is None:
-        # Kein gültiges last_completed → nicht reaktivieren
-        # (sicherer als raten — User soll erst einmal manuell done markieren)
-        return False
-    if last >= today:
-        return False  # heute schon done oder in Zukunft (defensiv)
-
-    if pattern == "daily":
-        return True  # jeden Tag wieder
-    if pattern == "weekdays":
-        return today.weekday() < 5  # Mo-Fr (0-4)
-    if pattern == "weekly":
-        # Reaktivieren wenn ≥7 Tage seit letztem Done
-        return (today - last).days >= 7
-    if pattern == "monthly":
-        # Reaktivieren wenn anderer Monat UND wir den last.day-Tag-of-Month
-        # erreicht haben — bzw. am Monatsende falls last.day > Monatslänge
-        # (sonst würde 31er-Task in Februar/April/... NIE reaktivieren).
-        if today.month == last.month and today.year == last.year:
-            return False
-        # Letzter Tag des aktuellen Monats:
-        if today.month == 12:
-            next_first = date(today.year + 1, 1, 1)
-        else:
-            next_first = date(today.year, today.month + 1, 1)
-        last_day_of_month = (next_first - timedelta(days=1)).day
-        target_day = min(last.day, last_day_of_month)
-        return today.day >= target_day
-    return False
-
-
-def reset_recurring_tasks() -> dict:
-    """Walked alle Tasks, reaktiviert fällige recurring Tasks.
-
-    Returns: dict mit Statistik {"checked": n, "reactivated": [slugs]}
-    """
-    if not TASKS_DIR.exists():
-        return {"checked": 0, "reactivated": []}
-    today = datetime.now(TIMEZONE).date()
-    today_str = today.strftime("%Y-%m-%d")
-    checked = 0
-    reactivated = []
-
-    for task_file, post in iter_vault_md(TASKS_DIR, recursive=False, skip_noise=False):
-        checked += 1
-        meta = post.metadata
-        recurrence = meta.get("recurrence")
-        if not recurrence or recurrence not in VALID_TASK_RECURRENCE:
-            continue
-        if meta.get("status") != "done":
-            continue
-        last_completed = meta.get("last_completed", "")
-        if not _is_recurrence_due(recurrence, last_completed, today):
-            continue
-
-        # Reaktivieren
-        post["status"] = "open"
-        post["updated"] = today_str
-        body = (post.content or "").rstrip() + f"\n- {today_str}: reaktiviert (recurring={recurrence})\n"
-        post.content = body
-        try:
-            atomic_write(task_file, frontmatter.dumps(post) + "\n")
-            slug = task_file.stem
-            reactivated.append(slug)
-            # Link in heutige Daily damit User es im Briefing sieht
-            try:
-                title = meta.get("title", slug)
-                append_to_daily("Heute", f"- [ ] [[t-{slug}|{title}]] (wiederkehrend)")
-            except Exception as e:
-                log.warning(f"Daily-Link für reaktivierten Task fehlgeschlagen: {e}")
-        except Exception as e:
-            log.warning(f"recurring-reset: konnte {task_file.name} nicht schreiben: {e}")
-
+    from mcp_client import mcp as _mcp, MCPError as _MCPError
+    try:
+        stats = await _mcp.task_reactivate_recurring()
+    except _MCPError as e:
+        log.warning("recurring-reset MCP fail: %s", e)
+        return 0
+    reactivated = stats.get("reactivated") or [] if isinstance(stats, dict) else []
+    checked = stats.get("checked", 0) if isinstance(stats, dict) else 0
     if reactivated:
-        invalidate_today_data_cache()  # Tasks haben heute Status-Wechsel
-    return {"checked": checked, "reactivated": reactivated}
+        log.info("recurring-reset: %d/%d reaktiviert: %s", len(reactivated), checked, reactivated)
+        invalidate_today_data_cache()
+    else:
+        log.info("recurring-reset: %d Tasks geprueft, keine faellig", checked)
+    return len(reactivated)
 
 
 async def recurring_task_reset_job(ctx: ContextTypes.DEFAULT_TYPE):
-    """JobQueue-Callback — läuft täglich vor dem Briefing.
+    """JobQueue-Callback — läuft täglich um 05:00 (oder vor Briefing).
 
-    Phase X3d: callt jetzt MCP `task_reactivate_recurring` statt lokal
-    `reset_recurring_tasks`. MCP-Pipeline laueft eh alle 10 Min, dieser
-    explizite Call ist nur noch Sicherheits-Net falls Pipeline gerade
-    zwischen 04:50 und 05:00 nichts erwischt hat (off-by-window).
-
-    Bei Outage des MCP-Servers: Fallback auf lokale Implementierung
-    (gleiche Funktion war bisher Standard).
+    MCP's Maintain-Pipeline reaktiviert recurring tasks alle 10 Min auto.
+    Dieser explizite Call ist Sicherheits-Net (deterministischer Tagesstart).
     """
-    try:
-        if _MCP_THIN_AVAILABLE:
-            from mcp_client import mcp as _mcp, MCPError as _MCPError
-            try:
-                stats = await _mcp.task_reactivate_recurring()
-                reactivated = stats.get("reactivated") or []
-                checked = stats.get("checked", 0)
-                if reactivated:
-                    log.info(f"recurring-reset (MCP): {len(reactivated)}/{checked} reaktiviert: {reactivated}")
-                else:
-                    log.info(f"recurring-reset (MCP): {checked} Tasks geprüft, keine fällig")
-                # Bot-Cache invalidieren da Tasks heute Status-Wechsel hatten
-                if reactivated:
-                    invalidate_today_data_cache()
-                return
-            except _MCPError as e:
-                log.warning(f"recurring-reset MCP fail, fallback lokal: {e}")
-        # Fallback lokal (oder wenn _MCP_THIN_AVAILABLE=False)
-        stats = await asyncio.to_thread(reset_recurring_tasks)
-        if stats["reactivated"]:
-            log.info(f"recurring-reset (lokal): {len(stats['reactivated'])}/{stats['checked']} reaktiviert: {stats['reactivated']}")
-        else:
-            log.info(f"recurring-reset (lokal): {stats['checked']} Tasks geprüft, keine fällig")
-    except Exception as e:
-        log.exception(f"recurring_task_reset_job failed: {e}")
+    await _trigger_recurring_reset()
 
 
 async def daily_briefing_job(ctx: ContextTypes.DEFAULT_TYPE):
     """JobQueue-Callback — wird täglich um BRIEFING_HOUR ausgeführt."""
     try:
-        # Erst recurring Tasks reaktivieren, dann Briefing — so sieht User
-        # die wiederkehrenden Tasks in der heutigen Daily.
-        await asyncio.to_thread(reset_recurring_tasks)
+        # Erst recurring Tasks reaktivieren (via MCP), dann Briefing —
+        # so sieht User die wiederkehrenden Tasks in der heutigen Daily.
+        await _trigger_recurring_reset()
         text = await asyncio.to_thread(compute_briefing)
         # compute_briefing returnt bereits HTML — safe_send muss is_html=True
         # nutzen, sonst werden die <b>/<i>-Tags doppelt-escaped.
