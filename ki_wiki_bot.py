@@ -823,14 +823,14 @@ def get_active_project() -> Optional[str]:
         return None
 
 
-def get_project_context(slug: str) -> str:
-    """Liest CONTEXT.md eines Projekts via MCP read_project_context.
+async def get_project_context(slug: str) -> str:
+    """Liest CONTEXT.md eines Projekts via MCP read_project_context (async).
 
-    Wird im LLM-loop sync aufgerufen (System-Prompt-Building) — nutzt mcp_sync.
+    Aufruf aus llm_loop (async). Caller muss `await` vor get_project_context.
     """
     try:
-        from mcp_client import mcp_sync as _mcp_sync, MCPError as _MCPError
-        res = _mcp_sync.read_project_context(project=slug)
+        from mcp_client import mcp as _mcp, MCPError as _MCPError
+        res = await _mcp.read_project_context(project=slug)
     except Exception as e:
         log.warning(f"project context read failed for {slug}: {e}")
         return ""
@@ -840,7 +840,7 @@ def get_project_context(slug: str) -> str:
     return _strip_md_intro(content) if content else ""
 
 
-def activate_project(slug: str) -> str:
+async def activate_project(slug: str) -> str:
     """Setzt ein Projekt als aktiv. Nutzt MCP read_project_context fuer Existenz-Check."""
     if not slug or not slug.strip():
         return "Projekt-Slug fehlt."
@@ -849,8 +849,8 @@ def activate_project(slug: str) -> str:
         slug = slug[len("project-"):]
     # Existenz-Check via MCP
     try:
-        from mcp_client import mcp_sync as _mcp_sync
-        res = _mcp_sync.read_project_context(project=slug)
+        from mcp_client import mcp as _mcp
+        res = await _mcp.read_project_context(project=slug)
     except Exception as e:
         return f"Projekt-Check fehlgeschlagen: {e}"
     if not isinstance(res, dict) or res.get("path") is None:
@@ -888,7 +888,7 @@ async def project_context(action: str, slug: Optional[str] = None,
     if a in ("activate", "aktivier", "an"):
         if not slug:
             return "Slug fehlt fuer activate."
-        return activate_project(slug)
+        return await activate_project(slug)
     if a in ("deactivate", "deaktivier", "aus", "stop"):
         return deactivate_project()
     if a in ("update", "edit", "set"):
@@ -2031,7 +2031,7 @@ async def llm_loop(user_text: str, user_id: int) -> str:
         dynamic_block += f"\n# PERSISTENTE FAKTEN (Hintergrund über Julius)\n\n{facts}\n"
     active_proj = get_active_project()
     if active_proj:
-        proj_ctx = get_project_context(active_proj)
+        proj_ctx = await get_project_context(active_proj)
         if proj_ctx:
             dynamic_block += f"\n# AKTIVES PROJEKT: {active_proj}\n\n{proj_ctx}\n"
         else:
