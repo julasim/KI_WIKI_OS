@@ -22,6 +22,7 @@ import time
 import asyncio
 import logging
 import tempfile
+import threading  # fuer _REMINDERS_LOCK
 from datetime import date, datetime, time as dtime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -297,64 +298,7 @@ def extract_pdf_text(pdf_path: Path, max_pages: int = 200) -> tuple:
 
 VALID_SECTIONS = {"Heute", "Notizen & Gedanken", "Offen / Einsortieren", "Abends"}
 
-# Platzhalter aus dem daily_template, die beim ersten Append entfernt werden sollen
-EMPTY_PLACEHOLDERS = {"- [ ]", "- [x]", "-", "•", "- Was lief gut?", "- Was nehme ich mit?"}
-
-
-# ─── Auto-Linking ───────────────────────────────────────────────────────────
-# Wandelt erkannte Vault-IDs/Titles im Schreiber-Output in [[wikilinks]] um.
-# Conservative-by-default: nur exakte Matches, Stop-Wörter ausgenommen, Code/
-# bestehende Links unangetastet, mit Cache und expliziter Invalidierung.
-
-# Cache: (timestamp, phrase_lower → canonical_id)
-_AUTO_LINK_CACHE: tuple = (0.0, {})
-_AUTO_LINK_TTL_SEC = 300  # 5 Min — bei Schreibvorgang explizit invalidiert
-_AUTO_LINK_LOCK = threading.Lock()
-
-# Verzeichnisse die NIE für Auto-Link/Listings/Indexes gescannt werden
-# (Templates/Tools/Memory/Archive würden False-Positives erzeugen und
-# nichts Sinnvolles beitragen). Genutzt von iter_vault_md() + auto_link.
-VAULT_NOISE_DIRS = {
-    ".obsidian", ".trash", "99_Archive",
-    "06_Meta", "07_Tools", "08_Templates",
-}
-
-# Doku-Files im Vault-Root die KEIN Frontmatter haben sollen.
-_VAULT_ROOT_SYSTEM_DOCS = {
-    "README.md", "MOC.md", "CLAUDE.md", "SCHEMA.md", "COMMANDS.md", "PIPELINES.md",
-}
-
-
-_LINK_STOPWORDS = {
-    # Zeit
-    "heute", "morgen", "gestern", "jetzt", "abends", "morgens",
-    # Generic Vault-Begriffe
-    "test", "todo", "task", "tasks", "meeting", "meetings", "note", "notes",
-    "projekt", "projekte", "project", "projects", "daily",
-    # Häufige Sätze
-    "info", "link", "wichtig", "okay", "danke", "bitte", "frage", "antwort",
-    # Englisch
-    "what", "where", "when", "this", "that", "these", "those",
-}
-
-# Min-Length für Phrase-Kandidaten — verhindert dass jeder 3-Buchstaben-Slug
-# (RAG, API, etc.) jeden Vorkommnis kapert
-_LINK_MIN_LEN = 4
-
-# Schutz-Regex: alles was wir NICHT auto-linken (geschützte Bereiche werden
-# durch Sentinels ersetzt, am Ende zurückgetauscht)
-_PROTECT_RE = re.compile(
-    r"```.*?```"             # fenced code
-    r"|`[^`\n]+`"             # inline code
-    r"|\[\[[^\]\n]+\]\]"      # already-wikilink
-    r"|\[[^\]\n]+\]\([^)\n]+\)"  # markdown-link
-    r"|https?://\S+"          # URL
-    r"|<[^>\n]+>",            # HTML-Tag
-    re.DOTALL,
-)
-
-
-_AUTO_LINK_INVALIDATE_FLOOR_SEC = 30  # Cache nach Mutation max so alt — nicht sofort reset
+# Auto-Link entfernt (Phase X3 Cleanup) — laeuft jetzt in MCP-Maintain-Pipeline.
 
 
 # ─── Task-Helpers entfernt (Phase X3 Cleanup) ──────────────────────────
