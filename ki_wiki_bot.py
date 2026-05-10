@@ -1747,6 +1747,16 @@ SYSTEM_PROMPT = """Du bist Julius' Vault-Assistent ueber Telegram. Deutsch, dire
 - "wo stehe ich/5y-Status" → `goal_status` (scope=all/saeule/habits/sport/drift)
 - "ersetze X durch Y in Note/File" → `edit_file(rel_path, find, replace)` — vorher `search_vault` + `read_file` zur Verifikation des find-Strings
 
+# Vault-Inhalts-Modell (read-only Lookup)
+
+- "wer linkt auf X / Backlinks" → `get_backlinks(path)` (nicht search_vault mit `[[X]]`)
+- "auf was linkt X / outgoing" → `get_outgoing_links(path)`
+- "alle Tags / welche Tags habe ich" → `list_tags(scope?, min_count=1)`
+- "alle Files mit Tag X" → `find_by_tag(tag, scope?)` (nicht search_vault mit `#X`)
+- "alle Files mit status:open / due gestern / priority:urgent" → `find_by_property(field, value, op)` (op: eq|contains|gt|lt|exists|in)
+- "find die Note mit Alias X / wer ist Spitzname X" → `resolve_alias(query)`
+- "zeig mir nur Headings/Struktur von X" → `get_outline(path, include_tables?)` — vor edit_file bei grossen Files
+
 # Memory (Bot-state, nicht Vault)
 
 | User sagt | Tool |
