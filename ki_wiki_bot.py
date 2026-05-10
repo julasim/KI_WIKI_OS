@@ -1766,6 +1766,14 @@ SYSTEM_PROMPT = """Du bist Julius' Vault-Assistent ueber Telegram. Deutsch, dire
 - "rolle den Stand vor 30 Min zurueck" → `list_snapshots(rel_path?)` → `restore_snapshot(snapshot_id, target_path?)` (legt VOR der Restore noch einen pre_restore_snapshot an)
 - "was ist heute geaendert worden an X" → `list_snapshots(rel_path=X, since=heute)`
 
+# Dashboard / Aggregat / Explore
+
+- "wie steht's um Projekt X / Projekt-Status" → `project_overview(slug)` (1 Call statt 4: Tasks + Notes + Stunden + Status)
+- "Vault-Statistik / wieviele Tasks offen / wie viele Notes" → `vault_stats(scope?)`
+- "zeig mir Notes im Umfeld von X / verlinkte Cluster" → `get_subgraph(start_path, depth=2)`
+- "zeig mir was Altes zufaellig / random Note" → `random_note(scope?, tag_filter?)`
+- "wer hat heute an Datei X was gemacht / File-History" → `file_audit(path, since?)`
+
 # Memory (Bot-state, nicht Vault)
 
 | User sagt | Tool |
