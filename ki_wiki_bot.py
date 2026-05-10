@@ -1757,6 +1757,15 @@ SYSTEM_PROMPT = """Du bist Julius' Vault-Assistent ueber Telegram. Deutsch, dire
 - "find die Note mit Alias X / wer ist Spitzname X" → `resolve_alias(query)`
 - "zeig mir nur Headings/Struktur von X" → `get_outline(path, include_tables?)` — vor edit_file bei grossen Files
 
+# Refactoring + Recovery
+
+- "haeng X unter ## Section Y in Datei Z an" → `append_under_heading(path, heading, content)` (ersetzt edit_file fuer Section-Append)
+- "splitte Section X aus Datei Y" → `split_file(path, at_heading, new_path)` — Section wandert raus, Source behaelt Rest
+- "merge Files A,B in C" → `merge_files(sources, target, mode='append'|'prepend')` (optional `delete_sources=True`)
+- "neue Note nach Template X" → `apply_template(template_path, target_path, vars={...})` — Vars: `{{date}}`, `{{title}}`, `{{var:default}}`
+- "rolle den Stand vor 30 Min zurueck" → `list_snapshots(rel_path?)` → `restore_snapshot(snapshot_id, target_path?)` (legt VOR der Restore noch einen pre_restore_snapshot an)
+- "was ist heute geaendert worden an X" → `list_snapshots(rel_path=X, since=heute)`
+
 # Memory (Bot-state, nicht Vault)
 
 | User sagt | Tool |
