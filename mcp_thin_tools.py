@@ -84,8 +84,10 @@ async def read_file(rel_path: str, strip_frontmatter: bool = True) -> str:
     if not isinstance(res, dict):
         return f"Unerwartetes Result-Format: {type(res).__name__}"
 
-    # MCP read_file liefert {path, frontmatter, content}
-    content = res.get("content") or ""
+    # MCP read_file liefert fuer .md: {path, frontmatter, body}
+    # Fuer non-.md: {path, raw}
+    # Fallback-Reihenfolge: body → raw → content (legacy)
+    content = res.get("body") or res.get("raw") or res.get("content") or ""
     if not strip_frontmatter:
         # Ggf. FM rekonstruieren als Header
         fm = res.get("frontmatter")
@@ -781,9 +783,9 @@ async def request_delete(rel_path: str | None = None,
     if not paths_in:
         return "request_delete: keine Pfade angegeben."
 
-    # Existence-Check via MCP request_delete (das gibt einen Token zurueck der
-    # als Existenz-Beweis dient + Vorbereitung fuer confirm).
-    valid: list[tuple[str, str]] = []  # (rel_path, mcp_token)
+    # Existence-Check via MCP request_delete (das gibt einen confirm_token
+    # zurueck der als Existenz-Beweis dient + Vorbereitung fuer confirm).
+    valid: list[tuple[str, str]] = []  # (rel_path, mcp_confirm_token)
     errors: list[str] = []
     for rp in paths_in:
         try:
@@ -791,10 +793,12 @@ async def request_delete(rel_path: str | None = None,
         except MCPError as e:
             errors.append(f"{rp}: {e}")
             continue
-        if isinstance(r, dict) and r.get("token"):
-            valid.append((rp, r["token"]))
+        # MCP-Server-Response: {confirm_token, path, preview, ...}
+        token = r.get("confirm_token") if isinstance(r, dict) else None
+        if token:
+            valid.append((rp, token))
         else:
-            errors.append(f"{rp}: kein Token erhalten")
+            errors.append(f"{rp}: kein confirm_token erhalten")
 
     if not valid:
         return "Keine gueltigen Pfade. " + "; ".join(errors[:5])
@@ -835,6 +839,9 @@ async def confirm_delete(action: str = "confirm") -> str:
     failed: list[str] = []
     for rp, token in paths_tokens:
         try:
+            # MCP confirm_delete-Signatur ist `confirm_delete(token: str)`.
+            # request_delete RETURNT zwar `confirm_token` (Output-Key), der
+            # Input-Param fuer confirm_delete heisst aber `token`.
             r = await mcp.confirm_delete(token=token)
         except MCPError as e:
             failed.append(f"{rp}: {e}")
@@ -858,6 +865,465 @@ async def confirm_delete(action: str = "confirm") -> str:
     return "\n".join(parts)
 
 
+# ─── Phase X4-X6 Tools: thin pass-through Wrapper ───────────────────────────
+# Diese Wrapper exposen die MCP-Server-Tools (get_backlinks, find_by_tag, etc.)
+# an den LLM. Pattern: 1× MCP-Call, Result als Markdown-String formatiert.
+# Bei Errors: _err_str.
+
+def _fmt_count(n: int, singular: str, plural: str | None = None) -> str:
+    return f"{n} {singular}" if n == 1 else f"{n} {plural or singular + 's'}"
+
+
+# ─── X4: Vault-Inhalts-Modell ──────────────────────────────────────────────
+
+
+async def get_backlinks(rel_path: str, scope: str | None = None) -> str:
+    """Wer linkt auf <rel_path>? Wikilinks + Frontmatter `related:[]`."""
+    try:
+        r = await mcp.get_backlinks(path=rel_path, scope=scope)
+    except MCPError as e:
+        return _err_str("get_backlinks", e)
+    if not isinstance(r, dict):
+        return f"get_backlinks: unerwartetes Format {type(r).__name__}"
+    hits = r.get("hits", [])
+    if not hits:
+        return f"Keine Backlinks auf `{r.get('target_id', rel_path)}`."
+    lines = [f"Backlinks auf `{r.get('target_id', rel_path)}` ({r.get('total', 0)}):"]
+    for h in hits[:20]:
+        via = h.get("via", "wikilink")
+        line_info = f" L{h['lines'][0]}" if h.get("lines") else ""
+        lines.append(f"  • `{h['path']}`{line_info} ({via})")
+    if len(hits) > 20:
+        lines.append(f"  • (+{len(hits)-20} weitere)")
+    return "\n".join(lines)
+
+
+async def get_outgoing_links(rel_path: str) -> str:
+    """Auf was linkt <rel_path>? Mit ID-Resolution gegen Vault."""
+    try:
+        r = await mcp.get_outgoing_links(path=rel_path)
+    except MCPError as e:
+        return _err_str("get_outgoing_links", e)
+    if not isinstance(r, dict):
+        return f"get_outgoing_links: unerwartetes Format {type(r).__name__}"
+    links = r.get("links", [])
+    if not links:
+        return f"`{rel_path}` linkt nirgends hin."
+    resolved = [l for l in links if l.get("resolved")]
+    broken = [l for l in links if not l.get("resolved")]
+    parts = [f"Outgoing von `{rel_path}` ({r.get('total', 0)}):"]
+    for l in resolved[:15]:
+        parts.append(f"  • [[{l['target_id']}]] → `{l.get('resolved_path')}`")
+    for l in broken[:10]:
+        parts.append(f"  • [[{l['target_id']}]] (broken)")
+    return "\n".join(parts)
+
+
+async def list_tags(scope: str | None = None, min_count: int = 1) -> str:
+    """Tag-Index ueber den Vault. Counts pro Tag, sortiert."""
+    try:
+        r = await mcp.list_tags(scope=scope, min_count=min_count)
+    except MCPError as e:
+        return _err_str("list_tags", e)
+    if not isinstance(r, dict):
+        return f"list_tags: unerwartetes Format {type(r).__name__}"
+    tags = r.get("tags", [])
+    if not tags:
+        return "Keine Tags gefunden (oder unter min_count)."
+    parts = [f"Tags ({r.get('total_unique', 0)} unique):"]
+    for t in tags[:30]:
+        parts.append(f"  • `#{t['tag']}` ({t['count']}×)")
+    if len(tags) > 30:
+        parts.append(f"  • (+{len(tags)-30} weitere)")
+    return "\n".join(parts)
+
+
+async def find_by_tag(tag: str, scope: str | None = None) -> str:
+    """Files mit <tag> (Frontmatter ODER inline)."""
+    try:
+        r = await mcp.find_by_tag(tag=tag, scope=scope)
+    except MCPError as e:
+        return _err_str("find_by_tag", e)
+    if not isinstance(r, dict):
+        return f"find_by_tag: unerwartetes Format {type(r).__name__}"
+    hits = r.get("hits", [])
+    if not hits:
+        return f"Keine Files mit Tag `#{r.get('tag', tag)}`."
+    parts = [f"Files mit `#{r.get('tag', tag)}` ({r.get('total', 0)}):"]
+    for h in hits[:20]:
+        parts.append(f"  • `{h['path']}` ({h.get('via', '?')})")
+    if len(hits) > 20:
+        parts.append(f"  • (+{len(hits)-20} weitere)")
+    return "\n".join(parts)
+
+
+async def find_by_property(
+    field: str,
+    value: Any = None,
+    op: str = "eq",
+    scope: str | None = None,
+) -> str:
+    """Files mit Frontmatter-Property `field <op> value`. ops: eq|contains|gt|lt|exists|in"""
+    try:
+        r = await mcp.find_by_property(field=field, value=value, op=op, scope=scope)
+    except MCPError as e:
+        return _err_str("find_by_property", e)
+    if not isinstance(r, dict):
+        return f"find_by_property: unerwartetes Format {type(r).__name__}"
+    hits = r.get("hits", [])
+    if not hits:
+        return f"Keine Files mit `{field} {op} {value}`."
+    parts = [f"Files mit `{field} {op} {value}` ({r.get('total', 0)}):"]
+    for h in hits[:20]:
+        v = h.get("value", "")
+        v_short = (str(v)[:50] + "…") if len(str(v)) > 50 else str(v)
+        parts.append(f"  • `{h['path']}` → {v_short}")
+    if len(hits) > 20:
+        parts.append(f"  • (+{len(hits)-20} weitere)")
+    return "\n".join(parts)
+
+
+async def resolve_alias(query: str, scope: str | None = None) -> str:
+    """Findet Files via Frontmatter `aliases:[]`. Exact zuerst, dann substring."""
+    try:
+        r = await mcp.resolve_alias(query=query, scope=scope)
+    except MCPError as e:
+        return _err_str("resolve_alias", e)
+    if not isinstance(r, dict):
+        return f"resolve_alias: unerwartetes Format {type(r).__name__}"
+    hits = r.get("hits", [])
+    if not hits:
+        return f"Kein Alias-Match fuer `{query}`."
+    parts = [f"Alias-Matches fuer `{query}` ({r.get('total', 0)}):"]
+    for h in hits[:10]:
+        title = h.get("title") or h.get("id") or "?"
+        parts.append(f"  • [[{h.get('id', '?')}|{title}]] (alias: `{h['alias_matched']}`, {h['match_type']})")
+    return "\n".join(parts)
+
+
+async def get_outline(rel_path: str, include_tables: bool = False) -> str:
+    """Heading-Outline einer Datei. Token-saver vor edit_file bei grossen Files."""
+    try:
+        r = await mcp.get_outline(path=rel_path, include_tables=include_tables)
+    except MCPError as e:
+        return _err_str("get_outline", e)
+    if not isinstance(r, dict):
+        return f"get_outline: unerwartetes Format {type(r).__name__}"
+    headings = r.get("headings", [])
+    parts = [f"Outline `{rel_path}`:"]
+    if not headings:
+        parts.append("  (keine Headings)")
+    else:
+        for h in headings[:40]:
+            indent = "  " * (h.get("level", 1) - 1)
+            parts.append(f"  {indent}{'#' * h.get('level', 1)} {h.get('text', '')} (L{h.get('line', 0)})")
+    if include_tables:
+        tables = r.get("tables", [])
+        if tables:
+            parts.append("")
+            parts.append(f"Tabellen ({len(tables)}):")
+            for t in tables:
+                cols = ", ".join(t.get("columns", []))
+                parts.append(f"  • L{t.get('line')}: [{cols}] ({t.get('n_data_rows', 0)} Zeilen)")
+    return "\n".join(parts)
+
+
+# ─── X4 Append-Variante fuer Tabellen ──────────────────────────────────────
+
+
+async def append_table_row(
+    rel_path: str,
+    values: list[str],
+    heading: str | None = None,
+) -> str:
+    """Fuegt eine Zeile an eine Markdown-Tabelle. Format-erhaltend."""
+    try:
+        r = await mcp.append_table_row(path=rel_path, values=values, heading=heading)
+    except MCPError as e:
+        return _err_str("append_table_row", e)
+    if not isinstance(r, dict):
+        return f"append_table_row: unerwartetes Format {type(r).__name__}"
+    cols = r.get("columns", "?")
+    rows = r.get("total_data_rows_after", "?")
+    return f"Tabellen-Zeile angefuegt in `{rel_path}` ({cols} Spalten, jetzt {rows} Zeilen)."
+
+
+# ─── X5: Refactoring + Recovery ────────────────────────────────────────────
+
+
+async def append_under_heading(
+    rel_path: str,
+    heading: str,
+    content: str,
+    position: str = "end",
+    create_if_missing: bool = False,
+) -> str:
+    """Haengt Text unter eine bestimmte Heading-Section an."""
+    try:
+        r = await mcp.append_under_heading(
+            path=rel_path, heading=heading, content=content,
+            position=position, create_if_missing=create_if_missing,
+        )
+    except MCPError as e:
+        return _err_str("append_under_heading", e)
+    if not isinstance(r, dict):
+        return f"append_under_heading: unerwartetes Format {type(r).__name__}"
+    h = r.get("heading_matched", heading)
+    n = r.get("lines_inserted", 0)
+    created = " (Heading neu angelegt)" if r.get("created_heading") else ""
+    return f"In `{rel_path}` unter `## {h}` {n} Zeile(n) eingefuegt{created}."
+
+
+async def split_file(
+    rel_path: str,
+    at_heading: str,
+    new_path: str,
+    copy_frontmatter: bool = True,
+) -> str:
+    """Splittet eine Datei: Section unter <at_heading> wandert nach <new_path>."""
+    try:
+        r = await mcp.split_file(
+            path=rel_path, at_heading=at_heading, new_path=new_path,
+            copy_frontmatter=copy_frontmatter,
+        )
+    except MCPError as e:
+        return _err_str("split_file", e)
+    if not isinstance(r, dict):
+        return f"split_file: unerwartetes Format {type(r).__name__}"
+    return (
+        f"Section `{at_heading}` aus `{rel_path}` nach `{new_path}` ausgelagert. "
+        f"Source: {r.get('source_lines_remaining', '?')} Zeilen, "
+        f"Target: {r.get('target_lines', '?')} Zeilen."
+    )
+
+
+async def merge_files(
+    sources: list[str],
+    target: str,
+    mode: str = "append",
+    delete_sources: bool = False,
+) -> str:
+    """Mergt mehrere Files in eines. Tag-Liste deduped gemerged."""
+    try:
+        r = await mcp.merge_files(
+            sources=sources, target=target, mode=mode, delete_sources=delete_sources,
+        )
+    except MCPError as e:
+        return _err_str("merge_files", e)
+    if not isinstance(r, dict):
+        return f"merge_files: unerwartetes Format {type(r).__name__}"
+    n = len(r.get("sources_merged", []))
+    deleted = len(r.get("deleted", []))
+    suffix = f", {deleted} Source(s) geloescht" if deleted else ""
+    return f"{n} File(s) in `{target}` gemerged ({mode}){suffix}."
+
+
+async def apply_template(
+    template_path: str,
+    target_path: str,
+    template_vars: dict[str, Any] | None = None,
+    overwrite: bool = False,
+) -> str:
+    """Kopiert Template mit Variablen-Substitution. Auto-Vars: date,time,title,slug,timestamp."""
+    try:
+        # MCP-Server-Param heisst `vars` — beim Wrapper nennen wir es `template_vars`
+        # damit Python-Builtin nicht geshadowt wird.
+        r = await mcp.apply_template(
+            template_path=template_path, target_path=target_path,
+            vars=template_vars or {}, overwrite=overwrite,
+        )
+    except MCPError as e:
+        return _err_str("apply_template", e)
+    if not isinstance(r, dict):
+        return f"apply_template: unerwartetes Format {type(r).__name__}"
+    used = r.get("vars_used", [])
+    unresolved = r.get("vars_unresolved", [])
+    parts = [f"Template `{template_path}` → `{target_path}` angewendet."]
+    if used:
+        parts.append(f"  Vars: {', '.join(used)}")
+    if unresolved:
+        parts.append(f"  Unresolved: {', '.join(unresolved)} (bleiben als `{{{{var}}}}`)")
+    if r.get("overwritten"):
+        parts.append("  (existing Datei ueberschrieben, Snapshot vorher)")
+    return "\n".join(parts)
+
+
+async def list_snapshots(
+    rel_path: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    op: str | None = None,
+    limit: int = 20,
+) -> str:
+    """Backup-Snapshots durchsuchen. Filter: rel_path/since/until/op."""
+    try:
+        r = await mcp.list_snapshots(
+            rel_path=rel_path, since=since, until=until, op=op, limit=limit,
+        )
+    except MCPError as e:
+        return _err_str("list_snapshots", e)
+    if not isinstance(r, dict):
+        return f"list_snapshots: unerwartetes Format {type(r).__name__}"
+    snaps = r.get("snapshots", [])
+    if not snaps:
+        return "Keine Snapshots gefunden."
+    parts = [f"Snapshots ({r.get('total', 0)}):"]
+    for s in snaps[:15]:
+        sid = s.get("snapshot_id", "?")
+        op_ = s.get("op", "?")
+        time_ = s.get("time", "?")
+        day_ = s.get("day", "?")
+        parts.append(f"  • `{sid}` ({day_} {time_}, {op_})")
+    if len(snaps) > 15:
+        parts.append(f"  • (+{len(snaps)-15} weitere)")
+    return "\n".join(parts)
+
+
+async def restore_snapshot(
+    snapshot_id: str,
+    target_path: str | None = None,
+) -> str:
+    """Stellt Files aus einem Snapshot wieder her. Pre-Restore-Snapshot wird angelegt."""
+    try:
+        r = await mcp.restore_snapshot(snapshot_id=snapshot_id, target_path=target_path)
+    except MCPError as e:
+        return _err_str("restore_snapshot", e)
+    if not isinstance(r, dict):
+        return f"restore_snapshot: unerwartetes Format {type(r).__name__}"
+    n = r.get("total_restored", 0)
+    pre = r.get("pre_restore_snapshot")
+    pre_info = f" (rueckgaengig via `{pre}`)" if pre else ""
+    return f"{n} File(s) aus `{snapshot_id}` wiederhergestellt{pre_info}."
+
+
+# ─── X6: Dashboard / Aggregat / Explore ───────────────────────────────────
+
+
+async def vault_stats(scope: str | None = None, top_n_recent: int = 5) -> str:
+    """Aggregat-Statistiken ueber den Vault."""
+    try:
+        r = await mcp.vault_stats(scope=scope, top_n_recent=top_n_recent)
+    except MCPError as e:
+        return _err_str("vault_stats", e)
+    if not isinstance(r, dict):
+        return f"vault_stats: unerwartetes Format {type(r).__name__}"
+    tasks = r.get("tasks", {})
+    parts = [
+        f"Vault-Stats `{r.get('scope') or '/'}`:",
+        f"  • Files: {r.get('total_files', 0)}, Words: {r.get('total_words', 0)}",
+        f"  • Tasks: {tasks.get('open', 0)} open / {tasks.get('done', 0)} done / {tasks.get('blocked', 0)} blocked / {tasks.get('snoozed', 0)} snoozed",
+    ]
+    by_type = r.get("by_type", {})
+    if by_type:
+        parts.append(f"  • By type: " + ", ".join(f"{k}={v}" for k, v in list(by_type.items())[:6]))
+    recent = r.get("recent_modifications", [])
+    if recent:
+        parts.append(f"  • Recent: " + ", ".join(f"`{x['path']}`" for x in recent[:3]))
+    return "\n".join(parts)
+
+
+async def get_subgraph(
+    start_path: str,
+    depth: int = 2,
+    max_nodes: int = 50,
+    include_incoming: bool = True,
+) -> str:
+    """Verlinkungs-Cluster (BFS) rund um <start_path>."""
+    try:
+        r = await mcp.get_subgraph(
+            start_path=start_path, depth=depth, max_nodes=max_nodes,
+            include_incoming=include_incoming,
+        )
+    except MCPError as e:
+        return _err_str("get_subgraph", e)
+    if not isinstance(r, dict):
+        return f"get_subgraph: unerwartetes Format {type(r).__name__}"
+    n = r.get("total_nodes", 0)
+    e_ = r.get("total_edges", 0)
+    parts = [f"Subgraph von `{start_path}` (depth={depth}): {n} Nodes, {e_} Edges"]
+    if r.get("truncated"):
+        parts.append(f"  (truncated bei max_nodes={max_nodes})")
+    nodes = r.get("nodes", [])
+    for nd in nodes[:15]:
+        parts.append(f"  • `{nd['path']}` (d={nd.get('distance', 0)})")
+    if len(nodes) > 15:
+        parts.append(f"  • (+{len(nodes)-15} weitere)")
+    return "\n".join(parts)
+
+
+async def random_note(
+    scope: str | None = None,
+    tag_filter: str | None = None,
+    exclude_status: list[str] | None = None,
+) -> str:
+    """Liefert eine zufaellige Note. Spaced-Repetition / Anstoss."""
+    try:
+        r = await mcp.random_note(
+            scope=scope, tag_filter=tag_filter, exclude_status=exclude_status,
+        )
+    except MCPError as e:
+        return _err_str("random_note", e)
+    if not isinstance(r, dict):
+        return f"random_note: unerwartetes Format {type(r).__name__}"
+    if r.get("error") == "no candidates":
+        return f"Keine Kandidaten gefunden (scope=`{r.get('scope', '/')}`, tag=`{r.get('tag_filter')}`)."
+    title = r.get("title") or r.get("id") or "?"
+    preview = r.get("body_preview", "")
+    return f"Random Note: [[{r.get('id', '?')}|{title}]]\nPfad: `{r.get('path')}`\n\n{preview}"
+
+
+async def file_audit(rel_path: str, since: str | None = None, limit: int = 20) -> str:
+    """Audit-Log-Eintraege fuer ein bestimmtes File."""
+    try:
+        r = await mcp.file_audit(path=rel_path, since=since, limit=limit)
+    except MCPError as e:
+        return _err_str("file_audit", e)
+    if not isinstance(r, dict):
+        return f"file_audit: unerwartetes Format {type(r).__name__}"
+    events = r.get("events", [])
+    if not events:
+        return f"Keine Audit-Events fuer `{rel_path}`" + (f" seit {since}" if since else ".")
+    parts = [f"Audit `{rel_path}` ({r.get('total', 0)} Events):"]
+    for ev in events[:15]:
+        ts = ev.get("ts", "?")
+        tool = ev.get("tool", "?")
+        err = " ⚠" if ev.get("error") else ""
+        lat = f" {ev.get('latency_ms', 0):.0f}ms" if ev.get("latency_ms") else ""
+        parts.append(f"  • {ts[:19]} `{tool}`{lat}{err}")
+    return "\n".join(parts)
+
+
+async def project_overview(slug: str, recent_n: int = 5) -> str:
+    """1-Call Aggregat fuer ein Projekt: Status, Counts, Hours, Tasks, Recent."""
+    try:
+        r = await mcp.project_overview(slug=slug, recent_n=recent_n)
+    except MCPError as e:
+        return _err_str("project_overview", e)
+    if not isinstance(r, dict):
+        return f"project_overview: unerwartetes Format {type(r).__name__}"
+    if not r.get("exists"):
+        return f"Projekt `{slug}` existiert nicht."
+    counts = r.get("counts", {})
+    parts = [
+        f"Projekt `{slug}` ({r.get('status', '?')}):",
+        f"  • {counts.get('notes', 0)} Notes, {counts.get('meetings', 0)} Meetings, {counts.get('top_level', 0)} Files",
+        f"  • Tasks: {counts.get('tasks_open', 0)} open / {counts.get('tasks_done', 0)} done",
+    ]
+    if "hours_total" in r:
+        parts.append(f"  • Stunden: {r['hours_total']}h")
+    ctx = r.get("context_preview")
+    if ctx:
+        parts.append(f"  • Kontext: {ctx[:200]}")
+    top = r.get("tasks_open_top", [])
+    if top:
+        parts.append("  Top offene Tasks:")
+        for t in top[:5]:
+            due = f" (due {t['due']})" if t.get("due") else ""
+            prio = f" [{t['priority']}]" if t.get("priority") else ""
+            parts.append(f"    • {t.get('title', '?')}{prio}{due}")
+    return "\n".join(parts)
+
+
 # Bot-side state — wird vom Bot importiert + befuellt
 PENDING_DELETIONS: dict = {}
 ALLOWED_USER_ID = 0  # wird vom Bot beim Boot ueberschrieben
@@ -871,5 +1337,11 @@ __all__ = [
     "edit_file", "move",
     "list_open_tasks", "get_today_agenda", "compute_briefing",
     "request_delete", "confirm_delete",
+    # Phase X4-X6
+    "get_backlinks", "get_outgoing_links", "list_tags", "find_by_tag",
+    "find_by_property", "resolve_alias", "get_outline", "append_table_row",
+    "append_under_heading", "split_file", "merge_files", "apply_template",
+    "list_snapshots", "restore_snapshot",
+    "vault_stats", "get_subgraph", "random_note", "file_audit", "project_overview",
     "PENDING_DELETIONS",
 ]

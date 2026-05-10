@@ -646,10 +646,9 @@ PREFERENCES_FILE = BOT_MEMORY_DIR / "preferences.md"
 ACTIVE_PROJECT_FILE = BOT_MEMORY_DIR / "active-project.txt"
 HISTORY_FILE = BOT_MEMORY_DIR / "conversation-history.jsonl"
 CORRECTIONS_FILE = BOT_MEMORY_DIR / "corrections.jsonl"
-PENDING_SUGGESTIONS_FILE = BOT_MEMORY_DIR / "pending-suggestions.json"
-PENDING_GOAL_ANCHOR_FILE = BOT_MEMORY_DIR / "pending-goal-anchor.json"
-# Pending-Anchor TTL: 4 Stunden (Sonntag 19:00 → bis 23:00 reagierbar)
-PENDING_GOAL_ANCHOR_TTL_SEC = 4 * 3600
+# PENDING_SUGGESTIONS_FILE / PENDING_GOAL_ANCHOR_* entfernt 2026-05-10:
+# beide Features sind im Bot v2 Refactor gestrichen worden, die Files-Konstanten
+# waren nur tot rumlagen + machten in _detect_pending_reply_intent NameErrors.
 
 # Pending-Diary: Bot hat 20:00 Tagebuch-Reminder gepusht — User-Reply wird
 # direkt in Daily-Note einsortiert (kein LLM-Roundtrip, keine "wie kann ich
@@ -1688,6 +1687,249 @@ TOOLS = [
             "required": ["reminder_id"]
         }
     }},
+    # ─── Phase X4: Vault-Inhalts-Modell ─────────────────────────────────
+    {"type": "function", "function": {
+        "name": "get_backlinks",
+        "description": "Wer linkt auf <rel_path>? Wikilinks + FM related[]. Statt search_vault mit [[X]].",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "rel_path": {"type": "string"},
+                "scope": {"type": ["string", "null"]},
+            },
+            "required": ["rel_path"],
+        },
+    }},
+    {"type": "function", "function": {
+        "name": "get_outgoing_links",
+        "description": "Auf was linkt <rel_path>? Mit Vault-ID-Resolution (resolved=true/false).",
+        "parameters": {
+            "type": "object",
+            "properties": {"rel_path": {"type": "string"}},
+            "required": ["rel_path"],
+        },
+    }},
+    {"type": "function", "function": {
+        "name": "list_tags",
+        "description": "Tag-Index ueber den Vault. Counts pro Tag (FM + inline).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "scope": {"type": ["string", "null"]},
+                "min_count": {"type": "integer", "minimum": 1, "default": 1},
+            },
+        },
+    }},
+    {"type": "function", "function": {
+        "name": "find_by_tag",
+        "description": "Files mit Tag X (mit oder ohne #). Statt search_vault mit #X.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "tag": {"type": "string"},
+                "scope": {"type": ["string", "null"]},
+            },
+            "required": ["tag"],
+        },
+    }},
+    {"type": "function", "function": {
+        "name": "find_by_property",
+        "description": "Files mit Frontmatter-Property field <op> value. ops: eq|contains|gt|lt|exists|in.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "field": {"type": "string"},
+                "value": {},
+                "op": {"type": "string", "enum": ["eq", "contains", "gt", "lt", "exists", "in"], "default": "eq"},
+                "scope": {"type": ["string", "null"]},
+            },
+            "required": ["field"],
+        },
+    }},
+    {"type": "function", "function": {
+        "name": "resolve_alias",
+        "description": "Findet Files via FM aliases:[]. Exact zuerst, dann substring.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "scope": {"type": ["string", "null"]},
+            },
+            "required": ["query"],
+        },
+    }},
+    {"type": "function", "function": {
+        "name": "get_outline",
+        "description": "Heading-Hierarchie einer Datei. Token-saver vor edit_file bei grossen Files.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "rel_path": {"type": "string"},
+                "include_tables": {"type": "boolean", "default": False},
+            },
+            "required": ["rel_path"],
+        },
+    }},
+    {"type": "function", "function": {
+        "name": "append_table_row",
+        "description": "Fuegt Zeile an Markdown-Tabelle (Format-erhaltend). values muss Spaltenzahl exakt matchen.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "rel_path": {"type": "string"},
+                "values": {"type": "array", "items": {"type": "string"}},
+                "heading": {"type": ["string", "null"], "description": "Heading-Substring fuer Tabellen-Disambiguierung"},
+            },
+            "required": ["rel_path", "values"],
+        },
+    }},
+    # ─── Phase X5: Refactoring + Recovery ────────────────────────────────
+    {"type": "function", "function": {
+        "name": "append_under_heading",
+        "description": "Haengt Text unter eine bestimmte Heading-Section an. Generalisierung von append_to_daily.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "rel_path": {"type": "string"},
+                "heading": {"type": "string"},
+                "content": {"type": "string"},
+                "position": {"type": "string", "enum": ["start", "end"], "default": "end"},
+                "create_if_missing": {"type": "boolean", "default": False},
+            },
+            "required": ["rel_path", "heading", "content"],
+        },
+    }},
+    {"type": "function", "function": {
+        "name": "split_file",
+        "description": "Splittet Datei: Section unter <at_heading> wandert nach <new_path>. Source behaelt Rest.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "rel_path": {"type": "string"},
+                "at_heading": {"type": "string"},
+                "new_path": {"type": "string"},
+                "copy_frontmatter": {"type": "boolean", "default": True},
+            },
+            "required": ["rel_path", "at_heading", "new_path"],
+        },
+    }},
+    {"type": "function", "function": {
+        "name": "merge_files",
+        "description": "Mergt mehrere Files in eines. Tag-Liste deduped gemerged. Optional sources danach loeschen.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "sources": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                "target": {"type": "string"},
+                "mode": {"type": "string", "enum": ["append", "prepend"], "default": "append"},
+                "delete_sources": {"type": "boolean", "default": False},
+            },
+            "required": ["sources", "target"],
+        },
+    }},
+    {"type": "function", "function": {
+        "name": "apply_template",
+        "description": "Kopiert Template mit Var-Substitution. Auto-Vars: {{date}}, {{time}}, {{title}}, {{slug}}, {{timestamp}}. Default-Syntax {{var:default}}.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "template_path": {"type": "string"},
+                "target_path": {"type": "string"},
+                "template_vars": {"type": ["object", "null"], "description": "Custom-Vars als dict, ueberschreibt Auto-Vars"},
+                "overwrite": {"type": "boolean", "default": False},
+            },
+            "required": ["template_path", "target_path"],
+        },
+    }},
+    {"type": "function", "function": {
+        "name": "list_snapshots",
+        "description": "Backup-Snapshots durchsuchen. Filter rel_path/since/until/op. Vor restore_snapshot aufrufen.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "rel_path": {"type": ["string", "null"], "description": "Nur Snapshots die diesen Pfad enthalten"},
+                "since": {"type": ["string", "null"], "description": "ISO-Datum YYYY-MM-DD"},
+                "until": {"type": ["string", "null"], "description": "ISO-Datum YYYY-MM-DD"},
+                "op": {"type": ["string", "null"], "description": "Operation-Filter: edit|edit_replace|move|delete|merge|..."},
+                "limit": {"type": "integer", "default": 20},
+            },
+        },
+    }},
+    {"type": "function", "function": {
+        "name": "restore_snapshot",
+        "description": "Stellt Files aus einem Snapshot wieder her (ueberschreibt aktuelle). Pre-restore-Snapshot wird angelegt.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "snapshot_id": {"type": "string", "description": "Format: YYYY-MM-DD/HH-MM-SS_op_slug.tar.gz"},
+                "target_path": {"type": ["string", "null"], "description": "Wenn gesetzt: nur dieses File aus Snapshot zurueckholen"},
+            },
+            "required": ["snapshot_id"],
+        },
+    }},
+    # ─── Phase X6: Dashboard / Aggregat / Explore ────────────────────────
+    {"type": "function", "function": {
+        "name": "vault_stats",
+        "description": "Aggregat-Statistiken: total_files, words, tasks-Breakdown, by_type, recent_modifications.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "scope": {"type": ["string", "null"]},
+                "top_n_recent": {"type": "integer", "default": 5},
+            },
+        },
+    }},
+    {"type": "function", "function": {
+        "name": "get_subgraph",
+        "description": "Verlinkungs-Cluster (BFS) rund um eine Note. Outgoing + Backlinks bis depth.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "start_path": {"type": "string"},
+                "depth": {"type": "integer", "minimum": 1, "maximum": 5, "default": 2},
+                "max_nodes": {"type": "integer", "default": 50},
+                "include_incoming": {"type": "boolean", "default": True},
+            },
+            "required": ["start_path"],
+        },
+    }},
+    {"type": "function", "function": {
+        "name": "random_note",
+        "description": "Zufallspick fuer Spaced-Repetition / kreativen Anstoss. Filter: scope, tag, exclude_status.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "scope": {"type": ["string", "null"]},
+                "tag_filter": {"type": ["string", "null"]},
+                "exclude_status": {"type": ["array", "null"], "items": {"type": "string"}},
+            },
+        },
+    }},
+    {"type": "function", "function": {
+        "name": "file_audit",
+        "description": "Audit-Log-Ausschnitt fuer ein File. Diagnose 'wer hat heute an X was gemacht'.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "rel_path": {"type": "string"},
+                "since": {"type": ["string", "null"], "description": "ISO-Datum oder ISO-Datetime"},
+                "limit": {"type": "integer", "default": 20},
+            },
+            "required": ["rel_path"],
+        },
+    }},
+    {"type": "function", "function": {
+        "name": "project_overview",
+        "description": "1-Call Aggregat fuer Projekt: Status, Counts (Notes/Meetings/Tasks), hours_total, recent, tasks_open_top.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "slug": {"type": "string"},
+                "recent_n": {"type": "integer", "default": 5},
+            },
+            "required": ["slug"],
+        },
+    }},
 ]
 
 TOOL_HANDLERS = {
@@ -1708,6 +1950,28 @@ TOOL_HANDLERS = {
     "request_delete":   mcp_thin_tools.request_delete,
     "confirm_delete":   mcp_thin_tools.confirm_delete,
     "project_context":  project_context,  # async dispatcher: update→MCP, activate/deactivate→Bot-Memory
+    # Phase X4: Vault-Inhalts-Modell (read-only Lookups)
+    "get_backlinks":      mcp_thin_tools.get_backlinks,
+    "get_outgoing_links": mcp_thin_tools.get_outgoing_links,
+    "list_tags":          mcp_thin_tools.list_tags,
+    "find_by_tag":        mcp_thin_tools.find_by_tag,
+    "find_by_property":   mcp_thin_tools.find_by_property,
+    "resolve_alias":      mcp_thin_tools.resolve_alias,
+    "get_outline":        mcp_thin_tools.get_outline,
+    "append_table_row":   mcp_thin_tools.append_table_row,
+    # Phase X5: Refactoring + Recovery
+    "append_under_heading": mcp_thin_tools.append_under_heading,
+    "split_file":           mcp_thin_tools.split_file,
+    "merge_files":          mcp_thin_tools.merge_files,
+    "apply_template":       mcp_thin_tools.apply_template,
+    "list_snapshots":       mcp_thin_tools.list_snapshots,
+    "restore_snapshot":     mcp_thin_tools.restore_snapshot,
+    # Phase X6: Dashboard / Aggregat / Explore
+    "vault_stats":      mcp_thin_tools.vault_stats,
+    "get_subgraph":     mcp_thin_tools.get_subgraph,
+    "random_note":      mcp_thin_tools.random_note,
+    "file_audit":       mcp_thin_tools.file_audit,
+    "project_overview": mcp_thin_tools.project_overview,
     # Bot-only (Telegram/Memory — keine Vault-Operationen)
     "remember":         remember,
     "forget":           forget,
@@ -2666,53 +2930,12 @@ async def safe_send(bot, chat_id: int, text: str, is_html: bool = False) -> None
     await _send_split_html(_send, text, is_html=is_html)
 
 
-def _detect_pending_reply_intent(text: str) -> Optional[str]:
-    """Erkennt ob User-Message eine Antwort auf pending Memory/Health-Liste ist.
-
-    Returns: 'memory' oder 'health' oder None.
-    Heuristik:
-    - "memory <antwort>" / "memory: <antwort>" → memory
-    - "health <antwort>" → health
-    - Sonst nur wenn EXAKT ein Pending-File existiert (Disambig)
-      UND Text matches typisches Reply-Pattern (Zahlen, "alle", "nein", "0", "ja")
-    """
-    t = (text or "").strip().lower()
-    if not t:
-        return None
-    # Explizite Präfixe
-    if t.startswith(("memory ", "memory:")) or t == "memory":
-        return "memory"
-    if t.startswith(("health ", "health:")) or t == "health":
-        return "health"
-    # Typisches Reply-Pattern: nur Zahlen+Spaces+Komma, "alle", "ja", "nein", "0", "skip", "erkläre N"
-    is_reply_shape = bool(
-        re.fullmatch(r"\s*\d+(\s*[,\s]\s*\d+)*\s*", t)        # "1 2 3" / "1,3"
-        or t in ("alle", "ja", "all", "yes", "y",
-                 "nein", "no", "n", "0", "skip", "verwerfen")
-        or re.match(r"^(erklär|erklar)", t)                    # "erkläre 2"
-    )
-    if not is_reply_shape:
-        return None
-    # Disambig: welches Pending-File existiert?
-    has_mem = PENDING_SUGGESTIONS_FILE.exists()
-    has_health = False  # health-Block entfernt in Bot v2
-    if has_mem and not has_health:
-        return "memory"
-    if has_health and not has_mem:
-        return "health"
-    if has_mem and has_health:
-        # Beide pending — ohne Präfix nicht eindeutig, lass LLM entscheiden
-        return None
-    return None
-
-
-def _strip_intent_prefix(text: str) -> str:
-    """Entfernt 'memory '/'health '-Präfix vom User-Text vor Action-Parser."""
-    t = text.strip()
-    for prefix in ("memory:", "memory ", "memory", "health:", "health ", "health"):
-        if t.lower().startswith(prefix):
-            return t[len(prefix):].strip()
-    return t
+# memory-Suggestions-Job + health-Block sind 2026-05-03 entfernt worden.
+# `_detect_pending_reply_intent` + `_strip_intent_prefix` + die Caller in
+# handle_text wurden 2026-05-10 ausgebaut weil sie in der memory-/health-
+# Branch `apply_memory_suggestion` / `apply_health_action` gerufen haben —
+# beides nicht mehr definiert → NameError bei User-Tippern wie "memory" oder
+# "health". Wenn jemand das je wieder braucht: Funktionen + Job neu bauen.
 
 
 @require_auth
@@ -2720,28 +2943,6 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
     log.info(f"text: {text[:120]}")
     await update.message.chat.send_action(constants.ChatAction.TYPING)
-
-    # Intent-Detection: ist das eine Antwort auf pending Memory/Health-Liste?
-    # Wenn ja: direkt den entsprechenden Action-Parser rufen (kein LLM-Roundtrip).
-    intent = _detect_pending_reply_intent(text)
-    if intent == "memory":
-        action = _strip_intent_prefix(text) or text.strip()
-        try:
-            reply = await asyncio.to_thread(apply_memory_suggestion, action)
-        except Exception as e:
-            log.exception("apply_memory_suggestion failed")
-            reply = _sanitize_error(f"Fehler: {e}")
-        await safe_reply(update, reply)
-        return
-    if intent == "health":
-        action = _strip_intent_prefix(text) or text.strip()
-        try:
-            reply = await asyncio.to_thread(apply_health_action, action)
-        except Exception as e:
-            log.exception("apply_health_action failed")
-            reply = _sanitize_error(f"Fehler: {e}")
-        await safe_reply(update, reply)
-        return
 
     # Pending Tagebuch-Reply (20:00 Tagebuch-Reminder wurde gepingt) — kein LLM nötig
     # User-Reply geht direkt in heutige Daily-Note unter "Abends"
