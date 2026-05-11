@@ -15,7 +15,7 @@ source /etc/restic.env
 # Was wird gesichert
 PATHS_TO_BACKUP=(
     /opt/vault
-    /opt/bot/.env
+    /opt/KI_WIKI_OS/.env
 )
 
 echo "═══ Backup-Start: $(date -Iseconds) ═══"

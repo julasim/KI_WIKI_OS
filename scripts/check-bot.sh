@@ -11,8 +11,8 @@ set -euo pipefail
 
 CONTAINER="ki-wiki-bot"
 STATE_FILE="/var/lib/ki-wiki-bot.state"
-ENV_FILE="/opt/bot/.env"
-COMPOSE_DIR="/opt/bot"
+ENV_FILE="/opt/KI_WIKI_OS/.env"
+COMPOSE_DIR="/opt/KI_WIKI_OS"
 
 # ─── ENV-Check ───
 if [ ! -f "$ENV_FILE" ]; then

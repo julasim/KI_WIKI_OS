@@ -40,7 +40,7 @@ hat zusätzlich Direct-FS-Mount für interne Hot-Paths (Briefing-Aggregation).
 ### Erst-Installation (interaktiv)
 
 ```bash
-cd /opt/bot
+cd /opt/KI_WIKI_OS
 bash install.sh
 ```
 
@@ -51,7 +51,7 @@ Das Skript fragt nach den Credentials, schreibt `.env`, baut & startet den Conta
 ### Updates
 
 ```bash
-cd /opt/bot
+cd /opt/KI_WIKI_OS
 bash update.sh
 ```
 

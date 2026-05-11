@@ -125,7 +125,7 @@ Wenn du ein **komplettes Vault-Restore** auf den VPS machen willst: rsync den Ba
 #### 3. .env auf VPS ergänzen
 ```bash
 ssh -i ~/.ssh/vps_ki_wiki root@76.13.10.79
-cd /opt/bot && nano .env
+cd /opt/KI_WIKI_OS && nano .env
 ```
 
 Ergänzen:
@@ -170,7 +170,7 @@ Setup-Skripte: `scripts/install-backup.sh` + `scripts/backup-vault.sh`.
 ### Setup-Kurzform
 ```bash
 ssh -i ~/.ssh/vps_ki_wiki root@76.13.10.79
-cd /opt/bot
+cd /opt/KI_WIKI_OS
 bash scripts/install-backup.sh
 ```
 Das Skript fragt B2-Credentials + generiert Restic-Password. Anleitung im Skript-Output.

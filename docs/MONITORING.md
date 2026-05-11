@@ -20,7 +20,7 @@ Alle **5 Min** prüft ein Cron-Job auf dem VPS:
 
 ```bash
 ssh -i ~/.ssh/vps_ki_wiki root@76.13.10.79
-cd /opt/bot
+cd /opt/KI_WIKI_OS
 bash update.sh                       # ziehen den scripts-Ordner
 bash scripts/install-monitor.sh
 ```
@@ -82,7 +82,7 @@ rm /usr/local/bin/check-bot.sh /var/lib/ki-wiki-bot.state
 | Problem | Fix |
 |---|---|
 | Keine Telegram-Pings obwohl Bot down | `cat /var/lib/ki-wiki-bot.state` — wenn "down" steht aber kein Ping kam, evtl. Cron läuft nicht. `systemctl status cron` |
-| Auto-Restart hilft nicht | Manueller Check: `cd /opt/bot && docker compose logs --tail 50` |
+| Auto-Restart hilft nicht | Manueller Check: `cd /opt/KI_WIKI_OS && docker compose logs --tail 50` |
 | Spam-Nachrichten | Sollte nicht passieren da nur State-Change triggered. Falls doch: State-File löschen, dann sollte Reset funktionieren |
 | TG_TOKEN-Format-Fehler im Script | `.env` editieren, sicherstellen dass keine Quotes / Spaces drum sind |
 

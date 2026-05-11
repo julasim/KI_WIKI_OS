@@ -9,7 +9,7 @@ verifizieren dass:
   - Phase X1-Tools (read_vision, read_saeulen, ...) erreichbar sind
   - Phase X2-Tools (goal_status_check, ...) erreichbar sind
 
-Run lokal (von /opt/bot/ oder lokal mit MCP_TOKEN gesetzt):
+Run lokal (von /opt/KI_WIKI_OS/ oder lokal mit MCP_TOKEN gesetzt):
     cd ki_wiki_bot && python scripts/smoke_test_mcp_client.py
 
 Run im Container:

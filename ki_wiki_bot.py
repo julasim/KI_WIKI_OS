@@ -2558,7 +2558,7 @@ def require_auth(handler):
                 f"Bot ist noch nicht an einen User gebunden.\n\n"
                 f"Deine Telegram-User-ID: <code>{uid}</code>\n\n"
                 f"Auf VPS:\n"
-                f"<pre><code>nano /opt/bot/.env\n"
+                f"<pre><code>nano /opt/KI_WIKI_OS/.env\n"
                 f"# ALLOWED_USER_ID={uid} setzen\n"
                 f"docker compose restart</code></pre>\n"
                 f"Danach bin ich nur noch für dich da.",
