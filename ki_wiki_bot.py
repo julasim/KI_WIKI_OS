@@ -635,6 +635,14 @@ HISTORY_MAX_MESSAGES = 60       # ca. 30 User+Assistant-Turns
 HISTORY_TIMEOUT = 60 * 60       # 1h Inaktivität → RAM-Cache leeren, beim nächsten Zugriff von Disk lazy-laden
 HISTORY_PERSIST_LIMIT = 1000    # max Lines im JSONL bevor compaction
 HISTORY_COMPACT_KEEP = 200       # nach compact: behalte letzte N Lines
+# Cross-Day-Poisoning verhindern: nur Einträge aus den letzten N Vienna-Tagen
+# laden. Yesterday's "Heute ist Sonntag"-Anker kontaminiert sonst heutigen
+# Kontext und LLM klebt am alten Wochentag trotz korrektem System-Prompt.
+# Default 1 = nur heute (00:00 Vienna). 0 = Filter aus (gesamte History).
+try:
+    HISTORY_MAX_AGE_DAYS = int(os.environ.get("HISTORY_MAX_AGE_DAYS", "1") or "1")
+except ValueError:
+    HISTORY_MAX_AGE_DAYS = 1
 
 # Lock gegen Race-Conditions zwischen User-Messages und nightly_suggestion_job
 # (asyncio-cooperative — kein echtes Threading, aber sauber)
@@ -1108,16 +1116,34 @@ def _sanitize_loaded_history(msgs: list) -> list:
     return out
 
 
+def _history_cutoff_ts() -> float:
+    """Unix-Timestamp ab dem Einträge in die geladene History fallen.
+
+    Default-Verhalten (HISTORY_MAX_AGE_DAYS=1): heute 00:00 Vienna —
+    verhindert dass gestriger Wochentag-Kontext heutigen System-Prompt
+    überschreibt. 0 = Filter aus.
+    """
+    if HISTORY_MAX_AGE_DAYS <= 0:
+        return 0.0
+    now = datetime.now(TIMEZONE)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    cutoff_day = today_start - timedelta(days=HISTORY_MAX_AGE_DAYS - 1)
+    return cutoff_day.timestamp()
+
+
 def _load_persistent_history(user_id: int) -> list:
     """Letzte HISTORY_MAX_MESSAGES Messages für User aus JSONL laden.
 
     Memory-safe via _read_tail_lines: bei riesigen Files nur die letzten
-    2MB lesen (immer noch 1000+ Records typisch).
+    2MB lesen (immer noch 1000+ Records typisch). Filtert zusätzlich
+    Einträge älter als HISTORY_MAX_AGE_DAYS (Vienna-Tag-Cutoff) aus —
+    siehe Comment dort, plus README/.env.example.
     """
     if not HISTORY_FILE.exists():
         return []
     try:
         lines = _read_tail_lines(HISTORY_FILE, HISTORY_TAIL_READ_BYTES)
+        cutoff = _history_cutoff_ts()
         records = []
         for line in lines:
             line = line.strip()
@@ -1125,8 +1151,11 @@ def _load_persistent_history(user_id: int) -> list:
                 continue
             try:
                 rec = json.loads(line)
-                if rec.get("user_id") == user_id:
-                    records.append(rec)
+                if rec.get("user_id") != user_id:
+                    continue
+                if rec.get("ts", 0) < cutoff:
+                    continue
+                records.append(rec)
             except json.JSONDecodeError:
                 continue
         msgs = [r["msg"] for r in records[-HISTORY_MAX_MESSAGES:]]
