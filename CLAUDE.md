@@ -40,6 +40,14 @@ LLMs (auch Sonnet 4.5) berechnen Datum→Wochentag oft falsch. `dynamic_block` (
 - `TZ` nicht im Container — Python-Code nutzt `ZoneInfo("Europe/Vienna")` explizit
 - Whisper-Modell wird beim ersten Start ~2-3 min geladen (faster-whisper-medium, ~500MB)
 
+## Edge-Proxy / Public-Reachability
+
+Bot hat **keine Public-Domain** — er polled Telegram outbound. Verbindung zum MCP läuft **intern** über das Docker-Netzwerk `default` als `http://ki-os-mcp:5002/mcp/` (siehe `.env`-Default `MCP_URL`). **Nicht** über `https://wiki-mcp.sima.business/mcp/` — das wäre Hairpin-NAT-Selbstmord (Container kann eigene VPS-Public-IP nicht loopback'en).
+
+Der Edge-Caddy (Repo `julasim/Proxy`, deployed `/opt/Proxy/`) ist trotzdem relevant: er terminiert TLS für MCP (das vom Bot via interne URL gesprochen wird) UND für externe Clients (Claude Desktop o.ä.). Der MCP-Container hängt sowohl am `default`-Netz (Bot erreicht ihn intern) als auch am externen `proxy`-Netz (Edge-Caddy erreicht ihn für externe Domains).
+
+**Goldene Regel:** Kein eigener Caddy/Nginx mit `ports: "80:80"` im Bot-Compose — Single-Entry bleibt edge-caddy.
+
 ## Häufige Fallen
 
 - **`docker compose restart bot` lädt `.env` NICHT neu** — für ENV-Änderungen `up -d --force-recreate bot`
