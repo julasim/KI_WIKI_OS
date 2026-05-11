@@ -25,7 +25,7 @@ Drei Optionen, von simpel zu robust. Du kannst auch mehrere parallel nutzen.
 
 In PowerShell:
 ```powershell
-cd "C:\Users\juliu\OneDrive - Mag. Georg Sima\3_Unternehmen\KI-OS\KI_WIKI_Bot"
+cd "C:\Users\juliu\OneDrive - Mag. Georg Sima\3_Unternehmen\KI-OS\KI_WIKI\KI_WIKI_OS"
 git pull
 ```
 
